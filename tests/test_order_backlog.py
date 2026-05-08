@@ -1,6 +1,8 @@
 import unittest
 
 from dartlens._document_tables import extract_document_tables
+from dartlens._document_tables import DocumentTable
+from dartlens._order_backlog import extract_order_backlog_series, format_order_backlog_series
 
 
 class DocumentTableTests(unittest.TestCase):
@@ -38,6 +40,49 @@ class DocumentTableTests(unittest.TestCase):
                 ["수주잔고", "3.2조", "4.1조", "5.6조"],
             ],
         )
+
+
+class OrderBacklogParserTests(unittest.TestCase):
+    def test_extract_order_backlog_series_from_year_columns(self) -> None:
+        table = DocumentTable(
+            caption="수주상황",
+            rows=[
+                ["구분", "2022", "2023", "2024"],
+                ["수주잔고", "3.2조", "4,100억원", "-"],
+                ["신규수주", "1.1조", "2.2조", "3.3조"],
+            ],
+        )
+
+        series = extract_order_backlog_series([table], limit=3)
+
+        self.assertIsNotNone(series)
+        assert series is not None
+        self.assertEqual(series.metric, "수주잔고")
+        self.assertEqual(series.unit, "억원")
+        self.assertEqual([(p.period, p.value) for p in series.points], [("2022", 32000.0), ("2023", 4100.0)])
+
+    def test_format_order_backlog_series_includes_source(self) -> None:
+        table = DocumentTable(
+            caption="수주상황",
+            rows=[
+                ["구분", "2022", "2023", "2024"],
+                ["수주잔고", "3.2조", "4.1조", "5.6조"],
+            ],
+        )
+        series = extract_order_backlog_series([table], limit=3)
+        assert series is not None
+
+        text = format_order_backlog_series(
+            corp_code="00126380",
+            report_name="2024 사업보고서",
+            rcept_no="20260318000001",
+            series=series,
+        )
+
+        self.assertIn("# 수주잔고 추이 (corp_code=00126380)", text)
+        self.assertIn("단위: 억원", text)
+        self.assertIn("출처: 2024 사업보고서 rcept_no=20260318000001", text)
+        self.assertIn("[연간] 2022=32,000 | 2023=41,000 | 2024=56,000", text)
 
 
 if __name__ == "__main__":
