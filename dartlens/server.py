@@ -10,8 +10,10 @@ from dartlens._corp_code import (
     resolve_identifier,
     search_by_name,
 )
+from dartlens._document_tables import extract_document_tables
 from dartlens._http import get_bytes, get_json
 from dartlens._metrics import track_metrics
+from dartlens._order_backlog import extract_order_backlog_series, format_order_backlog_series
 from dartlens._safe import DartApiError, safe_tool
 from dartlens._validate import (
     days_to_range,
@@ -51,6 +53,7 @@ Claude가 조정자입니다.
   인덱스+viewer URL만. `find="키워드"` 인자로 본문 키워드 검색 가능.
 - `get_major_accounts`: 정기보고서의 핵심 재무 (매출/영업이익/순이익/자산/부채/자본 등) — 당기·전기·전전기 비교
 - `get_full_financial`: 전체 재무제표. sj_div(BS/IS/CIS/CF/SCE) 필수 — 토큰 폭발 방지
+- `get_order_backlog`: 사업/분기/반기보고서 표에서 수주잔고·계약잔액 추이를 구조화
 - `get_major_holders`: 5%룰 대량보유 변동 — 외국인/펀드/행동주의 진입 추적 (시세에 안 나오는 자본 흐름)
 - `get_insider_trades`: 임원·주요주주 특정증권 소유 — 내부자 매매 시그널
 
@@ -1195,6 +1198,102 @@ async def get_disclosure_detail(rcept_no: str, find: str | None = None) -> str:
     if len(text) > _LONG_REPORT_THRESHOLD:
         return _format_long_report(no=no, names=names, text=text)
     return _format_short_disclosure(no=no, names=names, text=text)
+
+
+# ---------------------------------------------------------------------------
+# get_order_backlog — DART report table parser
+# ---------------------------------------------------------------------------
+
+_ORDER_BACKLOG_SCAN_LIMIT = 50
+_ORDER_BACKLOG_MAX_REPORTS = 10
+
+
+def _order_backlog_report_candidates(items: list[dict]) -> list[dict]:
+    reports = [item for item in items if (item.get("rcept_no") or "").strip()]
+    return sorted(reports, key=_order_backlog_report_sort_key)
+
+
+def _order_backlog_report_sort_key(item: dict) -> tuple[int, int]:
+    report_name = item.get("report_nm") or ""
+    rcept_dt = item.get("rcept_dt") or "0"
+    if "사업보고서" in report_name:
+        priority = 0
+    elif "반기보고서" in report_name:
+        priority = 1
+    elif "분기보고서" in report_name:
+        priority = 2
+    else:
+        priority = 3
+    try:
+        date_key = -int(rcept_dt)
+    except ValueError:
+        date_key = 0
+    return priority, date_key
+
+
+def _order_backlog_report_name(item: dict) -> str:
+    return str(item.get("report_nm") or "정기보고서").replace("|", "·")
+
+
+@mcp.tool()
+@safe_tool
+@track_metrics("get_order_backlog")
+async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) -> str:
+    """수주잔고 추이 — 사업/반기/분기보고서 원문 표에서 수주잔고·계약잔액을 구조화.
+
+    이 도구는 증권사 리포트가 아니라 DART 원문을 1차 출처로 사용합니다. 조선·방산·건설·장비주처럼
+    수주잔고가 중요한 업종에서 유용하며, 표 구조가 회사마다 달라 추정이 필요한 값은 건너뜁니다.
+
+    Args:
+        corp_code: DART 8자리 고유번호.
+        years: 반환할 최근 기간 수. 1~5.
+        days: 최근 정기보고서 검색 범위. 기본 1200일, 최대 3650일.
+
+    Returns:
+        그래프화하기 쉬운 수주잔고 시계열 텍스트와 DART rcept_no 출처.
+    """
+    cc = normalize_corp_code(corp_code)
+    if not isinstance(years, int) or years < 1 or years > 5:
+        raise ValueError(f"years는 1~5 사이의 정수여야 합니다 (받음: {years}).")
+
+    bgn, end = days_to_range(days)
+    data = await _fetch_disclosure_list(cc, bgn, end, "A", _ORDER_BACKLOG_SCAN_LIMIT)
+    candidates = _order_backlog_report_candidates(data.get("list") or [])
+    if not candidates:
+        return f"# 수주잔고 추이 (corp_code={cc})\n\n최근 {days}일 정기보고서를 찾지 못했습니다."
+
+    attempted: list[str] = []
+    for report in candidates[:_ORDER_BACKLOG_MAX_REPORTS]:
+        rcept_no = normalize_rcept_no(str(report.get("rcept_no") or ""))
+        report_name = _order_backlog_report_name(report)
+        attempted.append(f"{report_name} rcept_no={rcept_no}")
+        raw = await _fetch_document_zip(rcept_no)
+        tables = extract_document_tables(raw)
+        series = extract_order_backlog_series(tables, limit=years)
+        if series is not None and series.points:
+            return format_order_backlog_series(
+                corp_code=cc,
+                report_name=report_name,
+                rcept_no=rcept_no,
+                series=series,
+            )
+
+    lines = [
+        f"# 수주잔고 추이 (corp_code={cc})",
+        "",
+        "정기보고서에서 구조화 가능한 수주잔고 표를 찾지 못했습니다.",
+        "",
+        "확인한 보고서:",
+    ]
+    lines.extend(f"- {item}" for item in attempted)
+    lines.extend(
+        [
+            "",
+            "원문 키워드 검색으로 확인하려면 `get_disclosure_detail(rcept_no=..., find='수주잔고')` 또는",
+            "`find='계약잔액'`, `find='수주상황'`을 사용하세요.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

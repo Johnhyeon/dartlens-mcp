@@ -142,6 +142,7 @@ dartlens-setup --plaintext <KEY>
 | `get_disclosure_detail` | 짧은 공시는 본문 발췌, 긴 보고서는 인덱스 + viewer URL. `find="키워드"`로 본문 검색 |
 | `get_major_accounts` | 정기보고서 핵심 재무 (매출/영업이익/순이익/자산/부채/자본 — 당기·전기·전전기 비교) |
 | `get_full_financial` | 전체 재무제표. sj_div(BS/IS/CIS/CF/SCE) 필수 |
+| `get_order_backlog` | 사업/분기/반기보고서 표에서 수주잔고·계약잔액 추이를 구조화 |
 | `get_major_holders` | 5%룰 대량보유 변동 — 외인/펀드/행동주의 진입 추적 |
 | `get_insider_trades` | 임원·주요주주 특정증권 소유 — 내부자 매매 시그널 |
 
@@ -159,6 +160,7 @@ search_company("삼성전자") → corp_code
 get_major_accounts(corp_code, bsns_year=2024, reprt_code="annual") → 핵심 수치
 get_full_financial(corp_code, bsns_year=2024, reprt_code="annual",
                    fs_div="CFS", sj_div="IS") → 손익 전체
+get_order_backlog(corp_code, years=3) → 수주잔고/계약잔액 추이
 
 # 지분 흐름 (시세에 안 나오는 자본 움직임)
 search_company("삼성전자") → corp_code

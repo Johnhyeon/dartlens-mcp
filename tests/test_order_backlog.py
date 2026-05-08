@@ -1,7 +1,9 @@
 import unittest
 import zipfile
 from io import BytesIO
+from unittest.mock import AsyncMock, patch
 
+from dartlens import server
 from dartlens._document_tables import extract_document_tables
 from dartlens._document_tables import DocumentTable
 from dartlens._order_backlog import extract_order_backlog_series, format_order_backlog_series
@@ -102,6 +104,41 @@ class OrderBacklogParserTests(unittest.TestCase):
         self.assertIn("# 수주잔고 추이 (corp_code=00126380)", text)
         self.assertIn("단위: 억원", text)
         self.assertIn("출처: 2024 사업보고서 rcept_no=20260318000001", text)
+        self.assertIn("[연간] 2022=32,000 | 2023=41,000 | 2024=56,000", text)
+
+
+class OrderBacklogToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_order_backlog_prefers_annual_report_and_formats_series(self) -> None:
+        xml = """
+        <DOCUMENT>
+          <SECTION>
+            <TITLE>수주상황</TITLE>
+            <TABLE>
+              <TR><TH>구분</TH><TH>2022</TH><TH>2023</TH><TH>2024</TH></TR>
+              <TR><TD>수주잔고</TD><TD>3.2조</TD><TD>4.1조</TD><TD>5.6조</TD></TR>
+            </TABLE>
+          </SECTION>
+        </DOCUMENT>
+        """.encode("utf-8")
+        payload = BytesIO()
+        with zipfile.ZipFile(payload, "w") as zf:
+            zf.writestr("report.xml", xml)
+
+        disclosure_list = {
+            "list": [
+                {"report_nm": "분기보고서 (2025.09)", "rcept_no": "20251114000111", "rcept_dt": "20251114"},
+                {"report_nm": "사업보고서 (2024.12)", "rcept_no": "20260318000001", "rcept_dt": "20260318"},
+            ]
+        }
+        fetch_list = AsyncMock(return_value=disclosure_list)
+        fetch_doc = AsyncMock(return_value=payload.getvalue())
+
+        with patch.object(server, "_fetch_disclosure_list", fetch_list), patch.object(server, "_fetch_document_zip", fetch_doc):
+            text = await server.get_order_backlog("00126380", years=3, days=1200)
+
+        fetch_doc.assert_awaited_once_with("20260318000001")
+        self.assertIn("# 수주잔고 추이 (corp_code=00126380)", text)
+        self.assertIn("출처: 사업보고서 (2024.12) rcept_no=20260318000001", text)
         self.assertIn("[연간] 2022=32,000 | 2023=41,000 | 2024=56,000", text)
 
 
