@@ -13,7 +13,12 @@ from dartlens._corp_code import (
 from dartlens._document_tables import extract_document_tables
 from dartlens._http import get_bytes, get_json
 from dartlens._metrics import track_metrics
-from dartlens._order_backlog import extract_order_backlog_series, format_order_backlog_series
+from dartlens._order_backlog import (
+    OrderBacklogSeries,
+    extract_order_backlog_point,
+    extract_order_backlog_series,
+    format_order_backlog_series,
+)
 from dartlens._safe import DartApiError, safe_tool
 from dartlens._validate import (
     days_to_range,
@@ -1235,6 +1240,17 @@ def _order_backlog_report_name(item: dict) -> str:
     return str(item.get("report_nm") or "정기보고서").replace("|", "·")
 
 
+def _order_backlog_report_period(item: dict) -> str | None:
+    report_name = item.get("report_nm") or ""
+    match = re.search(r"(20\d{2})(?:[.년/-]?\s*(?:12|06|03|09))?", report_name)
+    if match:
+        return match.group(1)
+    rcept_dt = item.get("rcept_dt") or ""
+    if len(rcept_dt) >= 4 and rcept_dt[:4].isdigit():
+        return str(int(rcept_dt[:4]) - 1)
+    return None
+
+
 @mcp.tool()
 @safe_tool
 @track_metrics("get_order_backlog")
@@ -1263,6 +1279,9 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
         return f"# 수주잔고 추이 (corp_code={cc})\n\n최근 {days}일 정기보고서를 찾지 못했습니다."
 
     attempted: list[str] = []
+    yearly_points = []
+    sources: list[str] = []
+    seen_periods: set[str] = set()
     for report in candidates[:_ORDER_BACKLOG_MAX_REPORTS]:
         rcept_no = normalize_rcept_no(str(report.get("rcept_no") or ""))
         report_name = _order_backlog_report_name(report)
@@ -1270,13 +1289,34 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
         raw = await _fetch_document_zip(rcept_no)
         tables = extract_document_tables(raw)
         series = extract_order_backlog_series(tables, limit=years)
-        if series is not None and series.points:
+        if series is not None and len(series.points) >= 2:
             return format_order_backlog_series(
                 corp_code=cc,
                 report_name=report_name,
                 rcept_no=rcept_no,
                 series=series,
             )
+        period = _order_backlog_report_period(report)
+        if period is None or period in seen_periods:
+            continue
+        point = extract_order_backlog_point(tables, period=period)
+        if point is None:
+            continue
+        seen_periods.add(period)
+        yearly_points.append(point)
+        sources.append(f"{period}: {report_name} rcept_no={rcept_no}")
+        if len(yearly_points) >= years:
+            break
+
+    if yearly_points:
+        yearly_points = sorted(yearly_points, key=lambda point: point.period)[-years:]
+        return format_order_backlog_series(
+            corp_code=cc,
+            report_name="복수 정기보고서",
+            rcept_no=", ".join(point.period for point in yearly_points),
+            series=OrderBacklogSeries(metric="수주잔고", unit="억원", points=yearly_points),
+            sources=sources[-len(yearly_points):],
+        )
 
     lines = [
         f"# 수주잔고 추이 (corp_code={cc})",

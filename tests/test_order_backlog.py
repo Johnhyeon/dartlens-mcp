@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, patch
 from dartlens import server
 from dartlens._document_tables import extract_document_tables
 from dartlens._document_tables import DocumentTable
-from dartlens._order_backlog import extract_order_backlog_series, format_order_backlog_series
+from dartlens._order_backlog import (
+    extract_order_backlog_point,
+    extract_order_backlog_series,
+    format_order_backlog_series,
+)
 
 
 class DocumentTableTests(unittest.TestCase):
@@ -106,6 +110,110 @@ class OrderBacklogParserTests(unittest.TestCase):
         self.assertIn("출처: 2024 사업보고서 rcept_no=20260318000001", text)
         self.assertIn("[연간] 2022=32,000 | 2023=41,000 | 2024=56,000", text)
 
+    def test_extract_order_backlog_point_from_contract_balance_total_row(self) -> None:
+        table = DocumentTable(
+            caption="당기 중 선박 건조 등과 관련하여 수주한 계약 등의 변동내역은 다음과 같습니다.",
+            rows=[
+                ["(단위:백만원)"],
+                ["구분", "조선", "해양플랜트", "기타", "합계"],
+                ["기초계약잔액", "33,937,341", "3,629,748", "9,355,847", "46,922,936"],
+                ["기말계약잔액", "44,350,193", "2,445,087", "9,586,022", "56,381,302"],
+            ],
+        )
+
+        point = extract_order_backlog_point([table], period="2025")
+
+        self.assertIsNotNone(point)
+        assert point is not None
+        self.assertEqual(point.period, "2025")
+        self.assertAlmostEqual(point.value, 563813.02)
+
+    def test_extract_order_backlog_point_from_single_backlog_value_table(self) -> None:
+        table = DocumentTable(
+            caption="(단위 : 억원)",
+            rows=[
+                ["구분", "수주잔액"],
+                ["제24기(2025년)", "262,526"],
+            ],
+        )
+
+        point = extract_order_backlog_point([table], period="2025")
+
+        self.assertIsNotNone(point)
+        assert point is not None
+        self.assertEqual(point.value, 262526.0)
+
+    def test_extract_order_backlog_point_ignores_intangible_asset_backlog_columns(self) -> None:
+        table = DocumentTable(
+            caption="(당기말)",
+            rows=[
+                ["(단위: 백만원)"],
+                ["구분", "영업권", "수주잔고", "고객관계", "합계"],
+                ["기초", "352,606", "15,314", "15,441", "394,140"],
+                ["상각", "-", "(8,132)", "(3,860)", "(25,118)"],
+            ],
+        )
+
+        point = extract_order_backlog_point([table], period="2025")
+
+        self.assertIsNone(point)
+
+    def test_extract_order_backlog_point_ignores_generic_ending_balance_tables(self) -> None:
+        table = DocumentTable(
+            caption="(당기)",
+            rows=[
+                ["(단위 : 백만원)"],
+                ["구분", "기초잔액", "추가", "감가상각비", "기말잔액"],
+                ["리스-건물", "35,104", "9,057", "(13,987)", "38,230"],
+                ["합계", "133,041", "31,524", "(45,042)", "138,174"],
+            ],
+        )
+
+        point = extract_order_backlog_point([table], period="2025")
+
+        self.assertIsNone(point)
+
+    def test_extract_order_backlog_point_sums_itemized_order_backlog_amount_column(self) -> None:
+        table = DocumentTable(
+            caption="(단위 :백만원)",
+            rows=[
+                ["품목", "수주일자", "납기", "수주총액", "기납품액", "수주잔고"],
+                ["수량", "금액", "수량", "금액", "수량", "금액"],
+                ["철도A", "2024-01-01", "2028-12-31", "-", "100,000", "-", "10,000", "-", "90,000"],
+                ["철도B", "2024-02-01", "2029-12-31", "-", "200,000", "-", "50,000", "-", "150,000"],
+            ],
+        )
+
+        point = extract_order_backlog_point([table], period="2025")
+
+        self.assertIsNotNone(point)
+        assert point is not None
+        self.assertEqual(point.value, 2400.0)
+
+    def test_extract_order_backlog_point_prefers_contract_balance_over_itemized_table(self) -> None:
+        itemized = DocumentTable(
+            caption="(단위 :백만원)",
+            rows=[
+                ["품목", "수주일자", "납기", "수주총액", "기납품액", "수주잔고"],
+                ["수량", "금액", "수량", "금액", "수량", "금액"],
+                ["철도A", "2024-01-01", "2028-12-31", "-", "100,000", "-", "10,000", "-", "90,000"],
+            ],
+        )
+        ending = DocumentTable(
+            caption="수주한 계약 등의 변동내역",
+            rows=[
+                ["(단위:백만원)"],
+                ["구분", "조선", "합계"],
+                ["기말계약잔액", "10,000", "56,000,000"],
+            ],
+        )
+
+        point = extract_order_backlog_point([itemized, ending], period="2025")
+
+        self.assertIsNotNone(point)
+        assert point is not None
+        self.assertEqual(point.value, 560000.0)
+
 
 class OrderBacklogToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_order_backlog_prefers_annual_report_and_formats_series(self) -> None:
@@ -140,6 +248,44 @@ class OrderBacklogToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("# 수주잔고 추이 (corp_code=00126380)", text)
         self.assertIn("출처: 사업보고서 (2024.12) rcept_no=20260318000001", text)
         self.assertIn("[연간] 2022=32,000 | 2023=41,000 | 2024=56,000", text)
+
+    async def test_get_order_backlog_builds_trend_from_multiple_annual_reports(self) -> None:
+        def payload(amount: str) -> bytes:
+            xml = f"""
+            <DOCUMENT>
+              <TABLE>
+                <TR><TD>(단위:백만원)</TD></TR>
+                <TR><TH>구분</TH><TH>조선</TH><TH>합계</TH></TR>
+                <TR><TD>기말계약잔액</TD><TD>10,000</TD><TD>{amount}</TD></TR>
+              </TABLE>
+            </DOCUMENT>
+            """.encode("utf-8")
+            out = BytesIO()
+            with zipfile.ZipFile(out, "w") as zf:
+                zf.writestr("report.xml", xml)
+            return out.getvalue()
+
+        disclosure_list = {
+            "list": [
+                {"report_nm": "사업보고서 (2025.12)", "rcept_no": "20260318000003", "rcept_dt": "20260318"},
+                {"report_nm": "사업보고서 (2024.12)", "rcept_no": "20250318000002", "rcept_dt": "20250318"},
+                {"report_nm": "사업보고서 (2023.12)", "rcept_no": "20240318000001", "rcept_dt": "20240318"},
+            ]
+        }
+        docs = {
+            "20260318000003": payload("56,000,000"),
+            "20250318000002": payload("41,000,000"),
+            "20240318000001": payload("32,000,000"),
+        }
+        fetch_list = AsyncMock(return_value=disclosure_list)
+        fetch_doc = AsyncMock(side_effect=lambda rcept_no: docs[rcept_no])
+
+        with patch.object(server, "_fetch_disclosure_list", fetch_list), patch.object(server, "_fetch_document_zip", fetch_doc):
+            text = await server.get_order_backlog("00126380", years=3, days=1200)
+
+        self.assertIn("[연간] 2023=320,000 | 2024=410,000 | 2025=560,000", text)
+        self.assertIn("출처:", text)
+        self.assertIn("2025: 사업보고서 (2025.12) rcept_no=20260318000003", text)
 
 
 if __name__ == "__main__":
