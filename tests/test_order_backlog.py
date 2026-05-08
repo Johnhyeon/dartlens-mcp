@@ -1,4 +1,6 @@
 import unittest
+import zipfile
+from io import BytesIO
 
 from dartlens._document_tables import extract_document_tables
 from dartlens._document_tables import DocumentTable
@@ -40,6 +42,24 @@ class DocumentTableTests(unittest.TestCase):
                 ["수주잔고", "3.2조", "4.1조", "5.6조"],
             ],
         )
+
+    def test_extract_document_tables_accepts_dart_zip_payload(self) -> None:
+        xml = """
+        <DOCUMENT>
+          <TABLE>
+            <TR><TH>구분</TH><TH>2024</TH></TR>
+            <TR><TD>수주잔고</TD><TD>5.6조</TD></TR>
+          </TABLE>
+        </DOCUMENT>
+        """.encode("utf-8")
+        payload = BytesIO()
+        with zipfile.ZipFile(payload, "w") as zf:
+            zf.writestr("report.xml", xml)
+
+        tables = extract_document_tables(payload.getvalue())
+
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0].rows[1], ["수주잔고", "5.6조"])
 
 
 class OrderBacklogParserTests(unittest.TestCase):

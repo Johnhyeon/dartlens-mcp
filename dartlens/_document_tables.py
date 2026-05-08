@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
 from dataclasses import dataclass
 
 from lxml import etree
@@ -15,18 +17,29 @@ class DocumentTable:
 
 def extract_document_tables(xml_bytes: bytes) -> list[DocumentTable]:
     """Extract table rows/cells from a DART document XML payload."""
-    root = _parse_xml(xml_bytes)
-    if root is None:
-        return []
-
     tables: list[DocumentTable] = []
-    for element in root.iter():
-        if _tag_name(element) != "table":
+    for payload in _xml_payloads(xml_bytes):
+        root = _parse_xml(payload)
+        if root is None:
             continue
-        rows = _extract_rows(element)
-        if rows:
-            tables.append(DocumentTable(caption=_table_caption(element), rows=rows))
+        for element in root.iter():
+            if _tag_name(element) != "table":
+                continue
+            rows = _extract_rows(element)
+            if rows:
+                tables.append(DocumentTable(caption=_table_caption(element), rows=rows))
     return tables
+
+
+def _xml_payloads(raw: bytes) -> list[bytes]:
+    if raw[:2] != b"PK":
+        return [raw]
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            xml_names = [name for name in zf.namelist() if name.lower().endswith(".xml")]
+            return [zf.read(name) for name in xml_names]
+    except Exception:
+        return []
 
 
 def _parse_xml(xml_bytes: bytes):
