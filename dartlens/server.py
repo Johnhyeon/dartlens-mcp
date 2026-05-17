@@ -1362,8 +1362,8 @@ async def scan_earnings_season(
     Args:
         period: "YYYYQ1"(1분기) / "YYYYH1"(반기) / "YYYYQ3"(3분기) / "YYYY"(연간).
                 Q2/Q4/H2는 정기보고서가 없어 v1 미지원 — ValueError(v2 잠정실적과 함께).
-        universe: "all"/"kospi"/"kosdaq"(상장사 전체 — corpCode.xml에 시장 구분이
-                없어 kospi/kosdaq는 전체 폴백 + footer 경고), 또는 corp_code 콤마 리스트.
+        universe: "all"(상장사 전체), "kospi"/"kosdaq"(KRX 시장구분으로 필터 —
+                매핑 fetch 실패 시에만 전체 폴백 + footer 경고), 또는 corp_code 콤마 리스트.
         sort_by: rev_yoy/op_yoy/ni_yoy(전년동기 대비 %), op_margin(영업이익률),
                 rev/op/ni(절댓값). 기본 op_yoy.
         direction: desc / asc. 결측(N/A)은 방향 무관 항상 맨 뒤.

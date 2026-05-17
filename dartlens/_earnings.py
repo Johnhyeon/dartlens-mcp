@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from dartlens._cache import EarningsCache, get_earnings_cache
 from dartlens._corp_code import all_listed, corp_name_map
 from dartlens._http import get_multi_acnt
+from dartlens._market import market_stock_codes
 from dartlens._safe import DartApiError
 from dartlens._validate import normalize_bsns_year, normalize_corp_code
 
@@ -73,8 +74,9 @@ def period_label(year: int, reprt_code: str) -> str:
 async def resolve_universe(universe: str) -> tuple[list[str], str | None]:
     """universe 문자열 → (corp_code 리스트, 경고 메시지|None).
 
-    "all"/"kospi"/"kosdaq" → 상장사 전체 (corpCode.xml에 시장 구분이 없어
-    kospi/kosdaq는 전체 폴백 + 경고). 콤마 리스트 또는 단일 corp_code → 그대로.
+    "all" → 상장사 전체. "kospi"/"kosdaq" → KRX 시장구분 매핑으로 필터
+    (매핑 fetch 실패 + 캐시 없음 시에만 전체 폴백 + 경고). 콤마 리스트
+    또는 단일 corp_code → 그대로.
     """
     u = (universe or "").strip()
     if not u:
@@ -82,17 +84,31 @@ async def resolve_universe(universe: str) -> tuple[list[str], str | None]:
 
     low = u.lower()
     if low in ("all", "kospi", "kosdaq"):
-        entries = await all_listed()
-        codes = sorted({e.corp_code for e in entries if e.is_listed})
-        if not codes:
+        entries = [e for e in await all_listed() if e.is_listed]
+        if not entries:
             raise ValueError("corpCode.xml에서 상장사를 찾지 못했습니다 (캐시 손상?).")
-        warn = None
-        if low in ("kospi", "kosdaq"):
-            warn = (
-                f"corpCode.xml에 시장 구분이 없어 '{low}' 요청을 전체 상장사 "
-                f"{len(codes)}개로 폴백했습니다 (v2에서 KRX 매핑 예정)."
+
+        if low == "all":
+            return sorted({e.corp_code for e in entries}), None
+
+        # kospi/kosdaq — KRX 시장구분으로 stock_code 필터
+        codes_set = await market_stock_codes(low)
+        if not codes_set:
+            # KRX fetch 실패 + 캐시 없음 → 전체 상장사 폴백
+            return (
+                sorted({e.corp_code for e in entries}),
+                f"KRX 시장구분을 가져오지 못해 '{low}' 요청을 전체 상장사로 "
+                f"폴백했습니다 (네트워크/캐시 확인).",
             )
-        return codes, warn
+        filtered = sorted(
+            {e.corp_code for e in entries if e.stock_code in codes_set}
+        )
+        if not filtered:
+            return (
+                sorted({e.corp_code for e in entries}),
+                f"'{low}' 교집합이 비어 전체 상장사로 폴백 (KRX↔corpCode 종목코드 불일치?).",
+            )
+        return filtered, None
 
     # corp_code 콤마 리스트 (단일도 허용)
     raw = [c.strip() for c in u.split(",") if c.strip()]

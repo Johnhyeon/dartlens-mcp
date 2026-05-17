@@ -23,6 +23,7 @@ if sys.platform == "win32":
 from dartlens import _earnings
 from dartlens._cache import EarningsCache
 from dartlens._corp_code import CorpEntry
+from dartlens._market import parse_corp_list
 from dartlens._earnings import (
     compute_row,
     extract_accounts,
@@ -87,21 +88,17 @@ class ResolveUniverseTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await _earnings.resolve_universe("123")  # 8자리 아님
 
-    async def test_all_and_kospi_fallback(self):
+    async def test_all_returns_all_listed(self):
         entries = [
             CorpEntry("00126380", "삼성전자", "", "005930", "20250101"),
-            CorpEntry("00164742", "SK하이닉스", "", "000660", "20250101"),
+            CorpEntry("00164742", "현대차", "", "005380", "20250101"),
             CorpEntry("00999999", "비상장사", "", "", "20250101"),
         ]
-        with patch.object(_earnings, "all_listed", AsyncMock(return_value=entries)):
+        with patch.object(_earnings, "all_listed", AsyncMock(return_value=entries)), \
+             patch.object(_earnings, "market_stock_codes", AsyncMock(return_value={"005930"})):
             codes, warn = await _earnings.resolve_universe("all")
-            self.assertEqual(set(codes), {"00126380", "00164742"})
-            self.assertIsNone(warn)
-
-            codes, warn = await _earnings.resolve_universe("kospi")
-            self.assertEqual(set(codes), {"00126380", "00164742"})
-            self.assertIsNotNone(warn)
-            self.assertIn("폴백", warn)
+            self.assertEqual(set(codes), {"00126380", "00164742"})  # 비상장 제외
+            self.assertIsNone(warn)  # all은 시장맵 무시
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +274,61 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
             body_rows = [l for l in out.splitlines() if l.startswith("| ") and "순위" not in l and "---" not in l]
             self.assertEqual(len(body_rows), 3)
             cache.close()
+
+
+# ---------------------------------------------------------------------------
+# KRX 시장구분 — 파서 + universe 필터 + 폴백
+# ---------------------------------------------------------------------------
+
+_KRX_HTML = """
+<html><body><table class="bbs_tb">
+<tr><th>회사명</th><th>시장구분</th><th>종목코드</th><th>업종</th></tr>
+<tr><td>삼성전자</td><td>유가</td><td>005930</td><td>전자</td></tr>
+<tr><td>리딩제로</td><td>유가</td><td>60310</td><td>소프트웨어</td></tr>
+</table></body></html>
+"""
+
+
+class KrxParserTests(unittest.TestCase):
+    def test_parse_corp_list_zfills_code(self):
+        m = parse_corp_list(_KRX_HTML, "KOSPI")
+        self.assertEqual(m["005930"], "KOSPI")
+        self.assertEqual(m["060310"], "KOSPI")  # 5자리 → zfill(6)
+        self.assertEqual(len(m), 2)
+
+    def test_parse_corp_list_empty_on_garbage(self):
+        self.assertEqual(parse_corp_list("<html><body>no table</body></html>", "KOSPI"), {})
+
+
+class UniverseMarketFilterTests(unittest.IsolatedAsyncioTestCase):
+    def _entries(self):
+        return [
+            CorpEntry("00126380", "삼성전자", "", "005930", "20250101"),   # KOSPI
+            CorpEntry("00164779", "SK하이닉스", "", "000660", "20250101"),  # KOSDAQ(가정)
+            CorpEntry("00999999", "코넥스사", "", "111111", "20250101"),     # 미분류
+        ]
+
+    async def test_kospi_filters_by_krx_map(self):
+        with patch.object(_earnings, "all_listed", AsyncMock(return_value=self._entries())), \
+             patch.object(_earnings, "market_stock_codes", AsyncMock(return_value={"005930"})):
+            codes, warn = await _earnings.resolve_universe("kospi")
+            self.assertEqual(codes, ["00126380"])
+            self.assertIsNone(warn)
+
+    async def test_empty_krx_map_falls_back_with_warning(self):
+        with patch.object(_earnings, "all_listed", AsyncMock(return_value=self._entries())), \
+             patch.object(_earnings, "market_stock_codes", AsyncMock(return_value=set())):
+            codes, warn = await _earnings.resolve_universe("kosdaq")
+            self.assertEqual(set(codes), {"00126380", "00164779", "00999999"})
+            self.assertIsNotNone(warn)
+            self.assertIn("폴백", warn)
+
+    async def test_all_ignores_market_map(self):
+        with patch.object(_earnings, "all_listed", AsyncMock(return_value=self._entries())), \
+             patch.object(_earnings, "market_stock_codes", AsyncMock(return_value={"005930"})):
+            codes, warn = await _earnings.resolve_universe("all")
+            self.assertEqual(set(codes), {"00126380", "00164779", "00999999"})
+            self.assertIsNone(warn)
 
 
 if __name__ == "__main__":
