@@ -238,8 +238,8 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
             cache = EarningsCache(Path(td) / "earnings.sqlite")
             mock = self._fake_multi_acnt()
             with patch.object(_earnings, "get_multi_acnt", mock), patch.object(
-                _earnings, "corp_name_map", AsyncMock(return_value={})
-            ):
+                _earnings, "corp_basic_map", AsyncMock(return_value={})
+            ), patch.object(_earnings, "meta_map", AsyncMock(return_value={})):
                 # 1차 호출 — API 호출 발생
                 out1 = await run_scan(
                     period="2026Q1",
@@ -282,7 +282,9 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
             codes = ",".join(f"{i:08d}" for i in range(1, 6))
             with patch.object(
                 _earnings, "get_multi_acnt", self._fake_multi_acnt()
-            ), patch.object(_earnings, "corp_name_map", AsyncMock(return_value={})):
+            ), patch.object(
+                _earnings, "corp_basic_map", AsyncMock(return_value={})
+            ), patch.object(_earnings, "meta_map", AsyncMock(return_value={})):
                 out = await run_scan(
                     period="2024",
                     universe=codes,
@@ -301,18 +303,20 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 _KRX_HTML = """
 <html><body><table class="bbs_tb">
-<tr><th>회사명</th><th>시장구분</th><th>종목코드</th><th>업종</th></tr>
-<tr><td>삼성전자</td><td>유가</td><td>005930</td><td>전자</td></tr>
-<tr><td>리딩제로</td><td>유가</td><td>60310</td><td>소프트웨어</td></tr>
+<tr><th>회사명</th><th>시장구분</th><th>종목코드</th><th>업종</th><th>주요제품</th></tr>
+<tr><td>삼성전자</td><td>유가</td><td>005930</td><td>통신 및 방송 장비 제조업</td><td>반도체, 디스플레이</td></tr>
+<tr><td>리딩제로</td><td>유가</td><td>60310</td><td>소프트웨어 개발 및 공급업</td><td>SW</td></tr>
 </table></body></html>
 """
 
 
 class KrxParserTests(unittest.TestCase):
-    def test_parse_corp_list_zfills_code(self):
+    def test_parse_corp_list_extracts_meta_and_zfills(self):
         m = parse_corp_list(_KRX_HTML, "KOSPI")
-        self.assertEqual(m["005930"], "KOSPI")
-        self.assertEqual(m["060310"], "KOSPI")  # 5자리 → zfill(6)
+        self.assertEqual(m["005930"]["market"], "KOSPI")
+        self.assertEqual(m["005930"]["sector"], "통신 및 방송 장비 제조업")
+        self.assertEqual(m["005930"]["product"], "반도체, 디스플레이")
+        self.assertIn("060310", m)  # 5자리 → zfill(6)
         self.assertEqual(len(m), 2)
 
     def test_parse_corp_list_empty_on_garbage(self):
@@ -348,6 +352,99 @@ class UniverseMarketFilterTests(unittest.IsolatedAsyncioTestCase):
             codes, warn = await _earnings.resolve_universe("all")
             self.assertEqual(set(codes), {"00126380", "00164779", "00999999"})
             self.assertIsNone(warn)
+
+
+# ---------------------------------------------------------------------------
+# 섹터 집계 (group_by="sector")
+# ---------------------------------------------------------------------------
+
+
+class SectorAggregateTests(unittest.TestCase):
+    def _row(self, sector, op_yoy, note="-"):
+        r = compute_row(
+            "0" * 8,
+            {
+                "corp_name": "x",
+                "rev_cur": 100.0,
+                "rev_prev": 80.0,
+                "op_cur": 10.0,
+                "op_prev": (10.0 / (1 + op_yoy / 100)) if op_yoy is not None else None,
+                "ni_cur": 5.0,
+                "ni_prev": 4.0,
+            },
+        )
+        r.sector = sector
+        if note != "-":
+            r.note = note
+        return r
+
+    def test_min_firms_threshold_and_median(self):
+        rows = (
+            [self._row("정유", 100), self._row("정유", 300), self._row("정유", 200)]
+            + [self._row("소형업종", 999), self._row("소형업종", 5)]  # 2개 → 제외
+        )
+        aggs = {a.sector: a for a in _earnings.aggregate_sectors(rows)}
+        self.assertIn("정유", aggs)
+        self.assertNotIn("소형업종", aggs)  # 3개 미만 제외
+        self.assertEqual(aggs["정유"].n, 3)
+        self.assertAlmostEqual(aggs["정유"].op_yoy_median, 200, places=4)  # 중앙값
+
+    def test_turnaround_ratio_counts_흑전(self):
+        rows = [
+            self._row("화학", 50, note="영업 흑전"),
+            self._row("화학", 60, note="순익 흑전"),
+            self._row("화학", 70, note="-"),
+            self._row("화학", 80, note="-"),
+        ]
+        a = _earnings.aggregate_sectors(rows)[0]
+        self.assertEqual(a.turnaround, 2)
+        self.assertAlmostEqual(a.turn_ratio, 0.5)
+
+    def test_median_immune_to_implausible_outlier(self):
+        # 87,243조급 이상치가 섞여도 중앙값은 정상
+        rows = [
+            self._row("정유", 10),
+            self._row("정유", 20),
+            self._row("정유", 30),
+        ]
+        rows.append(self._row("정유", 163349))  # 전년바닥 폭증 노이즈
+        a = _earnings.aggregate_sectors(rows)[0]
+        self.assertAlmostEqual(a.op_yoy_median, 25, places=4)  # (20+30)/2, 이상치 무영향
+
+
+class SectorMarkdownSmokeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_by_sector_output(self):
+        def _impl(corp_codes, bsns_year, reprt_code):
+            out = []
+            for cc in corp_codes:
+                out.append(_row(cc, f"회사{cc}", "매출액", "10,000,000,000", "8,000,000,000"))
+                out.append(_row(cc, f"회사{cc}", "영업이익", "2,000,000,000", "1,000,000,000"))
+                out.append(_row(cc, f"회사{cc}", "당기순이익", "1,500,000,000", "900,000,000"))
+            return out
+
+        codes = ",".join(f"{i:08d}" for i in range(1, 5))
+        basic = {f"{i:08d}": (f"회사{i}", f"00000{i}") for i in range(1, 5)}
+        metas = {
+            f"00000{i}": {"market": "KOSPI", "sector": "석유 정제품 제조업", "product": "정유"}
+            for i in range(1, 5)
+        }
+        with tempfile.TemporaryDirectory() as td:
+            cache = EarningsCache(Path(td) / "e.sqlite")
+            with patch.object(_earnings, "get_multi_acnt", AsyncMock(side_effect=_impl)), \
+                 patch.object(_earnings, "corp_basic_map", AsyncMock(return_value=basic)), \
+                 patch.object(_earnings, "meta_map", AsyncMock(return_value=metas)):
+                out = await run_scan(
+                    period="2026Q1", universe=codes, group_by="sector", cache=cache
+                )
+            cache.close()
+        self.assertIn("# 섹터 실적 스캐닝 — 2026Q1", out)
+        self.assertIn("석유 정제품 제조업", out)
+        self.assertIn("흑전비율", out)
+        self.assertIn("중앙값", out)
+
+    async def test_invalid_group_by_rejected(self):
+        with self.assertRaises(ValueError):
+            await run_scan(period="2024", universe="00000001", group_by="bogus")
 
 
 if __name__ == "__main__":

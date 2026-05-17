@@ -215,6 +215,20 @@ async def corp_name_map(corp_codes: list[str]) -> dict[str, str]:
     return out
 
 
+async def corp_basic_map(corp_codes: list[str]) -> dict[str, tuple[str, str]]:
+    """corp_code 리스트 → {corp_code: (corp_name, stock_code)}. 없는 코드 생략.
+
+    scan 결과에 회사명 + KRX 메타(시장/업종/주요제품, stock_code 키) 조인용.
+    """
+    await ensure_loaded()
+    out: dict[str, tuple[str, str]] = {}
+    for cc in corp_codes:
+        e = _by_corp_code.get(cc.strip())
+        if e:
+            out[cc] = (e.corp_name, e.stock_code)
+    return out
+
+
 async def resolve_identifier(identifier: str) -> CorpEntry | None:
     """입력이 corp_code(8자리)인지 stock_code(6자리)인지 자동 판정해서 1건 반환."""
     s = identifier.strip()

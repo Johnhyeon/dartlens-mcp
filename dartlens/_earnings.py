@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import re
+import statistics
 from dataclasses import dataclass
 
 from dartlens._cache import EarningsCache, get_earnings_cache
-from dartlens._corp_code import all_listed, corp_name_map
+from dartlens._corp_code import all_listed, corp_basic_map
 from dartlens._http import get_multi_acnt
-from dartlens._market import market_stock_codes
+from dartlens._market import market_stock_codes, meta_map
 from dartlens._safe import DartApiError
 from dartlens._validate import normalize_bsns_year, normalize_corp_code
 
@@ -171,6 +172,14 @@ def fmt_pct(value: float | None) -> str:
     return f"{'+' if value >= 0 else ''}{value:.1f}%"
 
 
+def _short(s: str, n: int) -> str:
+    """마크다운 셀용 절단. 파이프(|)는 표 깨지므로 / 로 치환."""
+    s = (s or "").replace("|", "/").replace("\n", " ").strip()
+    if not s:
+        return "-"
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 # ---------------------------------------------------------------------------
 # 계정 추출
 # ---------------------------------------------------------------------------
@@ -252,6 +261,8 @@ class ScanRow:
     op_margin: float | None
     note: str
     flagged: bool = False
+    sector: str = ""   # KRX 업종(KSIC)
+    product: str = ""  # KRX 주요제품(free-text)
 
 
 # 비현실적 금액 임계 = 1,000조(원). 한국 최대 기업(삼성전자) 연 매출도
@@ -430,10 +441,17 @@ async def run_scan(
     direction: str = "desc",
     top_n: int = 30,
     fs_div: str = "CFS",
+    group_by: str | None = None,
     cache: EarningsCache | None = None,
 ) -> str:
-    """scan_earnings_season 본체. 마크다운 str 반환."""
+    """scan_earnings_season 본체. 마크다운 str 반환.
+
+    group_by="sector"면 KSIC 업종별 집계(중앙값) 테이블, 그 외엔
+    종목별 테이블(주요제품 컬럼 포함).
+    """
     year, reprt_code = parse_period(period)
+    if group_by not in (None, "", "sector"):
+        raise ValueError(f"group_by는 None 또는 'sector'여야 합니다 (받음: '{group_by}').")
 
     if fs_div not in ("CFS", "OFS"):
         raise ValueError(f"fs_div는 CFS 또는 OFS여야 합니다 (받음: '{fs_div}').")
@@ -482,22 +500,49 @@ async def run_scan(
                     acc[f"{bucket}_prev"] = prev_acc.get(f"{bucket}_cur")
         rows.append(compute_row(cc, acc))
 
-    # fnlttMultiAcnt 응답에는 corp_name이 없다 → corpCode.xml에서 일괄 해석
-    name_map = await corp_name_map([r.corp_code for r in rows])
+    # fnlttMultiAcnt엔 corp_name이 없다 → corpCode.xml에서 name+stock_code,
+    # stock_code로 KRX 메타(시장/업종/주요제품) 일괄 조인
+    basic = await corp_basic_map([r.corp_code for r in rows])
+    stock_codes = [sc for _, sc in basic.values() if sc]
+    metas = await meta_map(stock_codes)
     for r in rows:
+        name, sc = basic.get(r.corp_code, ("", ""))
         if not r.corp_name:
-            r.corp_name = name_map.get(r.corp_code, r.corp_code)
+            r.corp_name = name or r.corp_code
+        m = metas.get(sc) if sc else None
+        if m:
+            r.sector = m.get("sector", "")
+            r.product = m.get("product", "")
 
     data_count = len(rows)
     flagged_count = sum(1 for r in rows if r.flagged)
-    sorted_rows = sort_rows(rows, sort_by, direction)
-    top = sorted_rows[:top_n]
 
     missing = universe_size - data_count
     total_api = cur_calls + prev_calls
     total_hits = cur_hits + prev_hits
     total_fetched = cur_fetched + prev_fetched
+    warnings = [w for w in (universe_warn, big_universe_warn) if w]
 
+    if group_by == "sector":
+        return _format_sector_markdown(
+            rows=rows,
+            period=period,
+            universe=universe,
+            fs_div=fs_div,
+            direction=direction,
+            top_n=top_n,
+            universe_size=universe_size,
+            data_count=data_count,
+            missing=missing,
+            flagged_count=flagged_count,
+            api_calls=total_api,
+            cache_hits=total_hits,
+            api_fetched=total_fetched,
+            warnings=warnings,
+        )
+
+    sorted_rows = sort_rows(rows, sort_by, direction)
+    top = sorted_rows[:top_n]
     return _format_markdown(
         top=top,
         period=period,
@@ -515,8 +560,136 @@ async def run_scan(
         api_calls=total_api,
         cache_hits=total_hits,
         api_fetched=total_fetched,
-        warnings=[w for w in (universe_warn, big_universe_warn) if w],
+        warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# 섹터 집계 (group_by="sector")
+# ---------------------------------------------------------------------------
+
+# 통계적으로 "섹터가 잘 나왔다"가 의미 있으려면 표본이 필요.
+_MIN_SECTOR_FIRMS = 3
+
+
+@dataclass
+class SectorAgg:
+    sector: str
+    n: int                       # 데이터 보유 회사 수
+    turnaround: int              # 흑전(영업/순익) 회사 수
+    turn_ratio: float            # turnaround / n
+    op_yoy_median: float | None  # 영익 YoY 중앙값 (이상치 면역)
+    rev_yoy_median: float | None
+
+
+def aggregate_sectors(rows: list[ScanRow]) -> list[SectorAgg]:
+    """KSIC 업종별 집계. 평균이 아닌 **중앙값** — 87,243조 오기재나
+    전년바닥 +16만% 같은 이상치가 섹터 통계를 망치지 않게.
+    회사 _MIN_SECTOR_FIRMS개 미만 업종은 통계 무의미라 제외(footer에 안내).
+    """
+    by_sector: dict[str, list[ScanRow]] = {}
+    for r in rows:
+        sec = r.sector.strip() if r.sector else ""
+        if not sec:
+            continue
+        by_sector.setdefault(sec, []).append(r)
+
+    out: list[SectorAgg] = []
+    for sec, group in by_sector.items():
+        if len(group) < _MIN_SECTOR_FIRMS:
+            continue
+        turn = sum(1 for r in group if "흑전" in r.note)
+        op_yoys = [r.op_yoy for r in group if r.op_yoy is not None]
+        rev_yoys = [r.rev_yoy for r in group if r.rev_yoy is not None]
+        out.append(
+            SectorAgg(
+                sector=sec,
+                n=len(group),
+                turnaround=turn,
+                turn_ratio=turn / len(group),
+                op_yoy_median=statistics.median(op_yoys) if op_yoys else None,
+                rev_yoy_median=statistics.median(rev_yoys) if rev_yoys else None,
+            )
+        )
+    return out
+
+
+def _format_sector_markdown(
+    *,
+    rows: list[ScanRow],
+    period: str,
+    universe: str,
+    fs_div: str,
+    direction: str,
+    top_n: int,
+    universe_size: int,
+    data_count: int,
+    missing: int,
+    flagged_count: int,
+    api_calls: int,
+    cache_hits: int,
+    api_fetched: int,
+    warnings: list[str],
+) -> str:
+    fs_label = {"CFS": "연결", "OFS": "별도"}.get(fs_div, fs_div)
+    uni_label = (
+        universe.upper()
+        if universe.lower() in ("all", "kospi", "kosdaq")
+        else "지정 리스트"
+    )
+    aggs = aggregate_sectors(rows)
+    # 흑전비율 desc, 동률이면 영익YoY 중앙값 desc (None은 맨 뒤)
+    reverse = direction != "asc"
+    aggs.sort(
+        key=lambda a: (
+            a.turn_ratio,
+            a.op_yoy_median if a.op_yoy_median is not None else float("-inf"),
+        ),
+        reverse=reverse,
+    )
+    top = aggs[:top_n]
+    sectors_with_data = {r.sector for r in rows if r.sector}
+    excluded = len(sectors_with_data) - len(aggs)
+
+    lines = [
+        f"# 섹터 실적 스캐닝 — {period} ({uni_label}, {fs_label} 기준)",
+        "",
+        f"조회 회사: {universe_size} / 데이터 보유: {data_count} / "
+        f"집계 섹터: {len(aggs)}개(회사 {_MIN_SECTOR_FIRMS}+ 기준) / "
+        f"정렬: 흑전비율 {direction} / Top {min(top_n, len(top))}",
+        "",
+        "| 순위 | 섹터 (KSIC 업종) | 회사수 | 흑전 | 흑전비율 | "
+        "영익 YoY 중앙 | 매출 YoY 중앙 |",
+        "|---:|---|---:|---:|---:|---:|---:|",
+    ]
+    for i, a in enumerate(top, 1):
+        lines.append(
+            f"| {i} | {_short(a.sector, 28)} | {a.n} | {a.turnaround} "
+            f"| {a.turn_ratio * 100:.0f}% "
+            f"| {fmt_pct(a.op_yoy_median)} | {fmt_pct(a.rev_yoy_median)} |"
+        )
+    if not top:
+        lines.append("| - | (집계 가능 섹터 없음) | - | - | - | - | - |")
+
+    lines.append("")
+    lines.append(
+        "_흑전비율 = (영업/순익 흑전 회사) / (섹터 내 데이터 보유 회사). "
+        "YoY는 **중앙값**(이상치 면역). 테마(원전·AI반도체 등)는 KSIC를 "
+        "가로질러 안 잡힘 — 개별 종목·사업보고서로 확인._"
+    )
+    lines.append(
+        f"_데이터 결측 {missing}건 · 회사 {_MIN_SECTOR_FIRMS}개 미만 "
+        f"제외 섹터 {excluded}개 · 캐시 hit {cache_hits} / API fetch "
+        f"{api_fetched} · API 호출 {api_calls}회._"
+    )
+    if flagged_count:
+        lines.append(
+            f"_⚠원본확인 {flagged_count}건: 비현실적 규모 원본 오류 의심 "
+            "(중앙값 집계라 섹터 통계엔 영향 미미)._"
+        )
+    for w in warnings:
+        lines.append(f"_⚠️ {w}_")
+    return "\n".join(lines)
 
 
 def _format_markdown(
@@ -549,13 +722,14 @@ def _format_markdown(
         f"조회 회사: {universe_size} / 데이터 보유: {data_count} / "
         f"정렬: {sort_by} {direction} / Top {min(top_n, len(top))}",
         "",
-        "| 순위 | 회사 (corp_code) | 매출 | 매출 YoY | 영업이익 | OP YoY | "
+        "| 순위 | 회사 (corp_code) | 주요제품 | 매출 | 매출 YoY | 영업이익 | OP YoY | "
         "순이익 | NI YoY | OP 마진 | 비고 |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for i, r in enumerate(top, 1):
         lines.append(
             f"| {i} | {r.corp_name} ({r.corp_code}) "
+            f"| {_short(r.product, 28)} "
             f"| {fmt_won(r.rev)} | {fmt_pct(r.rev_yoy)} "
             f"| {fmt_won(r.op)} | {fmt_pct(r.op_yoy)} "
             f"| {fmt_won(r.ni)} | {fmt_pct(r.ni_yoy)} "
@@ -563,7 +737,7 @@ def _format_markdown(
             f"| {r.note} |"
         )
     if not top:
-        lines.append("| - | (데이터 없음) | - | - | - | - | - | - | - | - |")
+        lines.append("| - | (데이터 없음) | - | - | - | - | - | - | - | - | - |")
 
     lines.append("")
     lines.append(

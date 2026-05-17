@@ -1351,6 +1351,7 @@ async def scan_earnings_season(
     direction: str = "desc",
     top_n: int = 30,
     fs_div: str = "CFS",
+    group_by: str | None = None,
 ) -> str:
     """분기/연간 실적 스캐닝. fnlttMultiAcnt 다중회사 API로 유니버스 전체의 당기·전년동기
     핵심계정을 일괄 조회한 뒤 YoY 계산, 정렬·필터해 top_n만 마크다운 테이블로 반환.
@@ -1367,13 +1368,20 @@ async def scan_earnings_season(
         sort_by: rev_yoy/op_yoy/ni_yoy(전년동기 대비 %), op_margin(영업이익률),
                 rev/op/ni(절댓값). 기본 op_yoy.
         direction: desc / asc. 결측(N/A)은 방향 무관 항상 맨 뒤.
-        top_n: 1~100. 기본 30.
+                group_by="sector"일 땐 흑전비율 정렬의 방향.
+        top_n: 1~100. 기본 30. (group_by="sector"면 섹터 개수 상한)
         fs_div: "CFS"(연결, 기본) / "OFS"(별도). v1은 OFS 폴백 없음.
+        group_by: None(기본)이면 종목별 표(주요제품 컬럼 포함). "sector"면
+                KSIC 업종별 집계 — 회사수·흑전비율·영익/매출 YoY **중앙값**
+                (이상치 면역). "어느 섹터가 전반적으로 잘 나왔나"용. 단
+                테마(원전·AI반도체 등)는 KSIC를 가로질러 안 잡힘 — 그건
+                개별 종목·사업보고서로 확인.
 
     Returns:
-        마크다운 테이블 — 순위 | 회사(corp_code) | 매출 | 매출 YoY | 영업이익 |
-        OP YoY | 순이익 | NI YoY | OP 마진 | 비고(흑전/적전). 헤더에 모집단/유효수,
-        footer에 결측·캐시·API 통계.
+        group_by=None: 순위|회사(corp_code)|주요제품|매출|매출YoY|영업이익|
+        OP YoY|순이익|NI YoY|OP 마진|비고(흑전/적전).
+        group_by="sector": 순위|섹터(KSIC)|회사수|흑전|흑전비율|영익YoY중앙|
+        매출YoY중앙. 헤더에 모집단/유효수, footer에 결측·캐시·API 통계.
     """
     return await run_scan(
         period=period,
@@ -1382,6 +1390,7 @@ async def scan_earnings_season(
         direction=direction,
         top_n=top_n,
         fs_div=fs_div,
+        group_by=group_by,
     )
 
 
