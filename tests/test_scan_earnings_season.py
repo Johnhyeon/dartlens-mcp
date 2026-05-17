@@ -152,6 +152,25 @@ class YoYTests(unittest.TestCase):
         self.assertIsNone(r.rev_yoy)  # 전년 0
         self.assertIsNone(r.op_yoy)  # 전년 결측
 
+    def test_implausible_value_flagged_not_clamped(self):
+        rows = [
+            _row("00415628", "세진중공업", "매출액", "87,243,092,705,000,000", "98,495,969,479,000,000"),
+            _row("00415628", "세진중공업", "영업이익", "13,638,834,006,000,000", "17,800,868,936,000,000"),
+        ]
+        r = compute_row("00415628", extract_accounts(rows, "00415628", "CFS"))
+        self.assertTrue(r.flagged)
+        self.assertIn("⚠원본확인", r.note)
+        # 값은 조작/클램프하지 않고 그대로 보존
+        self.assertEqual(r.rev, 87243092705000000.0)
+
+    def test_normal_value_not_flagged(self):
+        rows = [
+            _row("00126380", "삼성전자", "매출액", "133,873,444,000,000", "79,140,503,000,000"),
+        ]
+        r = compute_row("00126380", extract_accounts(rows, "00126380", "CFS"))
+        self.assertFalse(r.flagged)
+        self.assertNotIn("⚠", r.note)
+
     def test_fs_div_filter(self):
         rows = [
             _row("00444444", "별도만", "매출액", "100", "90", fs_div="OFS"),

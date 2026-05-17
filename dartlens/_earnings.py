@@ -251,6 +251,14 @@ class ScanRow:
     ni_yoy: float | None
     op_margin: float | None
     note: str
+    flagged: bool = False
+
+
+# 비현실적 금액 임계 = 1,000조(원). 한국 최대 기업(삼성전자) 연 매출도
+# ~300조, 분기 ~130조 수준이라 정상 필링은 절대 도달 불가. 관측된 오류
+# 필링은 ~87,000조(천원/원 단위 오기재 추정)라 1e15에서 깨끗이 분리.
+# 정책: 값을 조작·클램프하지 않고 비고에 ⚠원본확인 플래그만 — 출처 충실 반영.
+_IMPLAUSIBLE_WON = 1_000_000_000_000_000
 
 
 def _yoy(cur: float | None, prev: float | None) -> float | None:
@@ -278,6 +286,13 @@ def compute_row(corp_code: str, acc: dict) -> ScanRow:
         elif ni_prev > 0 >= ni:
             notes.append("순익 적전")
 
+    # 비현실적 규모 → DART 원본 기재 오류 의심. 값은 그대로 두고 플래그만.
+    flagged = any(
+        v is not None and abs(v) >= _IMPLAUSIBLE_WON for v in (rev, op, ni)
+    )
+    if flagged:
+        notes.insert(0, "⚠원본확인")
+
     return ScanRow(
         corp_code=corp_code,
         corp_name=acc.get("corp_name") or "",
@@ -289,6 +304,7 @@ def compute_row(corp_code: str, acc: dict) -> ScanRow:
         ni_yoy=_yoy(ni, ni_prev),
         op_margin=op_margin,
         note=", ".join(notes) if notes else "-",
+        flagged=flagged,
     )
 
 
@@ -473,6 +489,7 @@ async def run_scan(
             r.corp_name = name_map.get(r.corp_code, r.corp_code)
 
     data_count = len(rows)
+    flagged_count = sum(1 for r in rows if r.flagged)
     sorted_rows = sort_rows(rows, sort_by, direction)
     top = sorted_rows[:top_n]
 
@@ -494,6 +511,7 @@ async def run_scan(
         universe_size=universe_size,
         data_count=data_count,
         missing=missing,
+        flagged_count=flagged_count,
         api_calls=total_api,
         cache_hits=total_hits,
         api_fetched=total_fetched,
@@ -515,6 +533,7 @@ def _format_markdown(
     universe_size: int,
     data_count: int,
     missing: int,
+    flagged_count: int,
     api_calls: int,
     cache_hits: int,
     api_fetched: int,
@@ -555,6 +574,11 @@ def _format_markdown(
         f"_데이터 결측 {missing}건 · 캐시 hit {cache_hits} / API fetch {api_fetched} "
         f"· API 호출 {api_calls}회._"
     )
+    if flagged_count:
+        lines.append(
+            f"_⚠원본확인 {flagged_count}건: 매출/이익이 비현실적 규모 "
+            "(1,000조↑) — DART 원본 기재 오류 의심. 값은 미가공, corp_code로 원문 대조 권장._"
+        )
     for w in warnings:
         lines.append(f"_⚠️ {w}_")
     return "\n".join(lines)
