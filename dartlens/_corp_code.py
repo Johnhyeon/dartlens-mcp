@@ -190,6 +190,31 @@ async def search_by_name(
     return out
 
 
+async def all_listed() -> list[CorpEntry]:
+    """상장사(stock_code 보유) 전체 엔트리. universe='all' 해석용.
+
+    corpCode.xml에는 시장 구분(KOSPI/KOSDAQ)이 없으므로 호출 측에서
+    kospi/kosdaq 요청 시 이 함수로 폴백하고 footer에 경고를 남긴다.
+    """
+    await ensure_loaded()
+    return [e for e in _by_corp_code.values() if e.is_listed]
+
+
+async def corp_name_map(corp_codes: list[str]) -> dict[str, str]:
+    """corp_code 리스트 → {corp_code: corp_name}. 없는 코드는 생략.
+
+    fnlttMultiAcnt 응답에는 corp_name이 없어 스캐닝 결과의 회사명을
+    corpCode.xml 인덱스에서 일괄 해석하는 데 쓴다 (코드당 dict 조회 O(1)).
+    """
+    await ensure_loaded()
+    out: dict[str, str] = {}
+    for cc in corp_codes:
+        e = _by_corp_code.get(cc.strip())
+        if e and e.corp_name:
+            out[cc] = e.corp_name
+    return out
+
+
 async def resolve_identifier(identifier: str) -> CorpEntry | None:
     """입력이 corp_code(8자리)인지 stock_code(6자리)인지 자동 판정해서 1건 반환."""
     s = identifier.strip()

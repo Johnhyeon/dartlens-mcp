@@ -11,6 +11,7 @@ from dartlens._corp_code import (
     search_by_name,
 )
 from dartlens._document_tables import extract_document_tables
+from dartlens._earnings import run_scan
 from dartlens._http import get_bytes, get_json
 from dartlens._metrics import track_metrics
 from dartlens._order_backlog import (
@@ -1334,6 +1335,54 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
         ]
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# scan_earnings_season (fnlttMultiAcnt.json) — 어닝 시즌 일괄 스캐닝
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@safe_tool
+@track_metrics("scan_earnings_season")
+async def scan_earnings_season(
+    period: str,
+    universe: str = "kospi",
+    sort_by: str = "op_yoy",
+    direction: str = "desc",
+    top_n: int = 30,
+    fs_div: str = "CFS",
+) -> str:
+    """분기/연간 실적 스캐닝. fnlttMultiAcnt 다중회사 API로 유니버스 전체의 당기·전년동기
+    핵심계정을 일괄 조회한 뒤 YoY 계산, 정렬·필터해 top_n만 마크다운 테이블로 반환.
+
+    "이번 분기 실적 다 뒤져서 두드러진 회사 추려줘"를 한 번의 호출로 처리합니다.
+    get_major_accounts/get_full_financial 단건 fan-out 대신 이걸 쓰세요. 결과의
+    corp_code로 후속 단건 도구(get_full_financial 등)를 호출하면 됩니다.
+
+    Args:
+        period: "YYYYQ1"(1분기) / "YYYYH1"(반기) / "YYYYQ3"(3분기) / "YYYY"(연간).
+                Q2/Q4/H2는 정기보고서가 없어 v1 미지원 — ValueError(v2 잠정실적과 함께).
+        universe: "all"/"kospi"/"kosdaq"(상장사 전체 — corpCode.xml에 시장 구분이
+                없어 kospi/kosdaq는 전체 폴백 + footer 경고), 또는 corp_code 콤마 리스트.
+        sort_by: rev_yoy/op_yoy/ni_yoy(전년동기 대비 %), op_margin(영업이익률),
+                rev/op/ni(절댓값). 기본 op_yoy.
+        direction: desc / asc. 결측(N/A)은 방향 무관 항상 맨 뒤.
+        top_n: 1~100. 기본 30.
+        fs_div: "CFS"(연결, 기본) / "OFS"(별도). v1은 OFS 폴백 없음.
+
+    Returns:
+        마크다운 테이블 — 순위 | 회사(corp_code) | 매출 | 매출 YoY | 영업이익 |
+        OP YoY | 순이익 | NI YoY | OP 마진 | 비고(흑전/적전). 헤더에 모집단/유효수,
+        footer에 결측·캐시·API 통계.
+    """
+    return await run_scan(
+        period=period,
+        universe=universe,
+        sort_by=sort_by,
+        direction=direction,
+        top_n=top_n,
+        fs_div=fs_div,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -134,6 +134,38 @@ async def get_json(endpoint: str, params: dict[str, Any] | None = None) -> dict:
     return data
 
 
+async def get_multi_acnt(
+    corp_codes: list[str],
+    bsns_year: int | str,
+    reprt_code: str,
+) -> list[dict]:
+    """fnlttMultiAcnt.json — 다중회사 주요계정 일괄 조회.
+
+    corp_codes는 호출 측에서 ≤100개로 chunk해서 넘긴다 (DART status 021 한도).
+    status "013"(조회 결과 없음)은 빈 리스트로 흡수 — 아직 미접수한 회사들이
+    섞인 chunk는 정상 케이스다. "020"(요청 제한)은 지수 backoff 3회 재시도.
+    그 외 status는 DartApiError로 전파해 호출 측 footer에서 실패 카운트.
+    """
+    params = {
+        "corp_code": ",".join(corp_codes),
+        "bsns_year": str(bsns_year),
+        "reprt_code": reprt_code,
+    }
+    for attempt in range(3):
+        try:
+            data = await get_json("/fnlttMultiAcnt.json", params=params)
+            return data.get("list") or []
+        except DartApiError as e:
+            if e.status == "013":
+                return []
+            if e.status == "020" and attempt < 2:
+                backoff = (2 ** attempt) * 0.5 + random.uniform(0, 0.3)
+                await asyncio.sleep(backoff)
+                continue
+            raise
+    return []
+
+
 async def get_bytes(endpoint: str, params: dict[str, Any] | None = None) -> bytes:
     """바이너리 엔드포인트 호출 (corpCode.xml zip, document.xml zip 등)."""
     resp = await _request(endpoint, params=params)
