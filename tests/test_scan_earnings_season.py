@@ -7,11 +7,14 @@
 
 from __future__ import annotations
 
+import csv
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from xml.etree import ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if sys.platform == "win32":
@@ -31,6 +34,8 @@ from dartlens._earnings import (
     run_scan,
     sort_rows,
 )
+
+_XLSX_NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
 
 def _row(corp_code, name, account, ths, frm, fs_div="CFS", rcept_no="20260515000001"):
@@ -300,6 +305,140 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("캐시 hit", out2)
             cache.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. spreadsheet export (xlsx/csv)
+# ---------------------------------------------------------------------------
+
+
+class EarningsExportTests(unittest.IsolatedAsyncioTestCase):
+    def _fake_multi_acnt(self):
+        async def _impl(corp_codes, bsns_year, reprt_code):
+            out = []
+            for idx, cc in enumerate(corp_codes, 1):
+                revenue = 10_000_000_000 + idx * 100_000_000
+                op = 2_000_000_000 + idx * 10_000_000
+                ni = 1_500_000_000 + idx * 5_000_000
+                out.append(_row(cc, f"회사{cc}", "매출액", f"{revenue:,}", "8,000,000,000"))
+                out.append(_row(cc, f"회사{cc}", "영업이익", f"{op:,}", "1,000,000,000"))
+                out.append(_row(cc, f"회사{cc}", "당기순이익", f"{ni:,}", "900,000,000"))
+            return out
+        return AsyncMock(side_effect=_impl)
+
+    def _basic_and_meta(self, count: int):
+        basic = {f"{i:08d}": (f"회사{i}", f"{i:06d}") for i in range(1, count + 1)}
+        metas = {
+            f"{i:06d}": {
+                "market": "KOSPI",
+                "sector": "통신 및 방송 장비 제조업",
+                "product": "반도체, 디스플레이",
+            }
+            for i in range(1, count + 1)
+        }
+        return basic, metas
+
+    def _xlsx_rows(self, path: Path) -> list[list[tuple[str | None, str]]]:
+        with zipfile.ZipFile(path) as zf:
+            xml = zf.read("xl/worksheets/sheet1.xml")
+        root = ET.fromstring(xml)
+        rows = []
+        for row in root.findall(".//main:sheetData/main:row", _XLSX_NS):
+            cells = []
+            for cell in row.findall("main:c", _XLSX_NS):
+                cell_type = cell.attrib.get("t")
+                inline = cell.find("main:is/main:t", _XLSX_NS)
+                value = cell.find("main:v", _XLSX_NS)
+                cells.append((cell_type, inline.text if inline is not None else value.text))
+            rows.append(cells)
+        return rows
+
+    async def test_csv_export_preserves_comma_product_and_validates_shape(self):
+        from dartlens._earnings_export import EXPORT_HEADERS, run_export
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = EarningsCache(Path(td) / "e.sqlite")
+            basic, metas = self._basic_and_meta(3)
+            with patch.object(_earnings, "get_multi_acnt", self._fake_multi_acnt()), \
+                 patch.object(_earnings, "corp_basic_map", AsyncMock(return_value=basic)), \
+                 patch.object(_earnings, "meta_map", AsyncMock(return_value=metas)):
+                result = await run_export(
+                    period="2026Q1",
+                    universe="00000001,00000002,00000003",
+                    output_format="csv",
+                    max_rows=3,
+                    output_dir=Path(td),
+                    cache=cache,
+                )
+            cache.close()
+
+            self.assertEqual(result.row_count, 3)
+            self.assertEqual(result.column_count, 16)
+            self.assertEqual(result.files[0].rows, 3)
+            self.assertEqual(result.files[0].columns, 16)
+
+            path = result.files[0].path
+            with path.open("r", encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.reader(f))
+            self.assertEqual(rows[0], EXPORT_HEADERS)
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(len(rows[1]), 16)
+            self.assertEqual(rows[1][6], "반도체, 디스플레이")
+
+    async def test_xlsx_export_has_headers_and_numeric_cells(self):
+        from dartlens._earnings_export import EXPORT_HEADERS, run_export
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = EarningsCache(Path(td) / "e.sqlite")
+            basic, metas = self._basic_and_meta(2)
+            with patch.object(_earnings, "get_multi_acnt", self._fake_multi_acnt()), \
+                 patch.object(_earnings, "corp_basic_map", AsyncMock(return_value=basic)), \
+                 patch.object(_earnings, "meta_map", AsyncMock(return_value=metas)):
+                result = await run_export(
+                    period="2026Q1",
+                    universe="00000001,00000002",
+                    output_format="xlsx",
+                    max_rows=2,
+                    output_dir=Path(td),
+                    cache=cache,
+                )
+            cache.close()
+
+            self.assertEqual(result.row_count, 2)
+            self.assertEqual(result.column_count, 16)
+            rows = self._xlsx_rows(result.files[0].path)
+            self.assertEqual([value for _, value in rows[0]], EXPORT_HEADERS)
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(len(rows[1]), 16)
+            self.assertIsNone(rows[1][7][0])  # 매출 numeric cell, not inline string
+            self.assertIsNone(rows[1][8][0])  # 매출 YoY numeric cell, not inline string
+            self.assertEqual(rows[1][6][1], "반도체, 디스플레이")
+
+    async def test_export_max_rows_can_exceed_chat_top_n_limit(self):
+        from dartlens._earnings_export import run_export
+
+        count = 125
+        codes = ",".join(f"{i:08d}" for i in range(1, count + 1))
+        with tempfile.TemporaryDirectory() as td:
+            cache = EarningsCache(Path(td) / "e.sqlite")
+            basic, metas = self._basic_and_meta(count)
+            with patch.object(_earnings, "get_multi_acnt", self._fake_multi_acnt()), \
+                 patch.object(_earnings, "corp_basic_map", AsyncMock(return_value=basic)), \
+                 patch.object(_earnings, "meta_map", AsyncMock(return_value=metas)):
+                result = await run_export(
+                    period="2026Q1",
+                    universe=codes,
+                    output_format="csv",
+                    max_rows=120,
+                    output_dir=Path(td),
+                    cache=cache,
+                )
+            cache.close()
+
+            self.assertEqual(result.row_count, 120)
+            with result.files[0].path.open("r", encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.reader(f))
+            self.assertEqual(len(rows), 121)  # header + 120 data rows
 
     async def test_legacy_cache_without_receipt_metadata_is_refetched(self):
         with tempfile.TemporaryDirectory() as td:

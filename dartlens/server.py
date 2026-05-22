@@ -12,6 +12,7 @@ from dartlens._corp_code import (
 )
 from dartlens._document_tables import extract_document_tables
 from dartlens._earnings import run_scan
+from dartlens._earnings_export import run_export
 from dartlens._http import get_bytes, get_json
 from dartlens._metrics import track_metrics
 from dartlens._order_backlog import (
@@ -62,6 +63,8 @@ Claude가 조정자입니다.
 - `get_order_backlog`: 사업/분기/반기보고서 표에서 수주잔고·계약잔액 추이를 구조화
 - `get_major_holders`: 5%룰 대량보유 변동 — 외국인/펀드/행동주의 진입 추적 (시세에 안 나오는 자본 흐름)
 - `get_insider_trades`: 임원·주요주주 특정증권 소유 — 내부자 매매 시그널
+- `scan_earnings_season`: 어닝 시즌 유니버스 일괄 스캔 — 채팅용 Top N Markdown
+- `export_earnings_scan`: 어닝 시즌 스캔 결과를 XLSX/CSV 파일로 저장 — 한국 Excel은 XLSX 권장
 
 ## 워크플로우 권장
 
@@ -1397,6 +1400,53 @@ async def scan_earnings_season(
         fs_div=fs_div,
         group_by=group_by,
     )
+
+
+@mcp.tool()
+@safe_tool
+@track_metrics("export_earnings_scan")
+async def export_earnings_scan(
+    period: str,
+    universe: str = "kospi",
+    sort_by: str = "op_yoy",
+    direction: str = "desc",
+    max_rows: int = 1000,
+    output_format: str = "xlsx",
+    amount_unit: str = "eok",
+    fs_div: str = "CFS",
+) -> str:
+    """실적 스캔 파일 생성 — `scan_earnings_season` 결과를 정렬/필터 가능한
+    스프레드시트 파일로 저장합니다.
+
+    한국어 Excel에서는 CSV 구분자/따옴표 환경 차이로 주요제품 같은 쉼표 포함
+    텍스트가 열 밀림을 만들 수 있으므로, 기본값은 XLSX입니다. CSV는 복사용
+    보조 산출물로 제공합니다.
+
+    Args:
+        period: "YYYYQ1" / "YYYYH1" / "YYYYQ3" / "YYYY".
+        universe: "all", "kospi", "kosdaq", 또는 corp_code 콤마 리스트.
+        sort_by: rev_yoy/op_yoy/ni_yoy/op_margin/rev/op/ni.
+        direction: desc / asc.
+        max_rows: 저장할 최대 데이터 행 수. 기본 1000, 최대 3000.
+        output_format: "xlsx"(기본) / "csv" / "both".
+        amount_unit: "eok"(기본, 억원 숫자) / "won"(원 숫자).
+        fs_div: "CFS"(연결, 기본) / "OFS"(별도).
+
+    Returns:
+        생성된 파일 경로와 `N행 × 16열` 검증 결과. 파일은
+        `~/.dartlens/exports` 아래에 저장됩니다.
+    """
+    result = await run_export(
+        period=period,
+        universe=universe,
+        sort_by=sort_by,
+        direction=direction,
+        max_rows=max_rows,
+        output_format=output_format,
+        amount_unit=amount_unit,
+        fs_div=fs_div,
+    )
+    return result.to_markdown()
 
 
 # ---------------------------------------------------------------------------

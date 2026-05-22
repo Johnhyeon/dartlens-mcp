@@ -274,6 +274,7 @@ def extract_accounts(
 class ScanRow:
     corp_code: str
     corp_name: str
+    stock_code: str
     rev: float | None
     rev_yoy: float | None
     op: float | None
@@ -287,6 +288,26 @@ class ScanRow:
     flagged: bool = False
     sector: str = ""   # KRX 업종(KSIC)
     product: str = ""  # KRX 주요제품(free-text)
+
+
+@dataclass
+class ScanResult:
+    rows: list[ScanRow]
+    period: str
+    year: int
+    reprt_code: str
+    universe: str
+    fs_div: str
+    sort_by: str
+    direction: str
+    universe_size: int
+    data_count: int
+    missing: int
+    flagged_count: int
+    api_calls: int
+    cache_hits: int
+    api_fetched: int
+    warnings: list[str]
 
 
 # 비현실적 금액 임계 = 1,000조(원). 한국 최대 기업(삼성전자) 연 매출도
@@ -331,6 +352,7 @@ def compute_row(corp_code: str, acc: dict) -> ScanRow:
     return ScanRow(
         corp_code=corp_code,
         corp_name=acc.get("corp_name") or "",
+        stock_code="",
         rev=rev,
         rev_yoy=_yoy(rev, acc.get("rev_prev")),
         op=op,
@@ -469,36 +491,28 @@ async def _fetch_year(
 # ---------------------------------------------------------------------------
 
 
-async def run_scan(
+async def collect_scan_rows(
     *,
     period: str,
     universe: str = "kospi",
     sort_by: str = "op_yoy",
     direction: str = "desc",
-    top_n: int = 30,
+    limit: int | None = None,
     fs_div: str = "CFS",
-    group_by: str | None = None,
     cache: EarningsCache | None = None,
-) -> str:
-    """scan_earnings_season 본체. 마크다운 str 반환.
-
-    group_by="sector"면 KSIC 업종별 집계(중앙값) 테이블, 그 외엔
-    종목별 테이블(주요제품 컬럼 포함).
-    """
+) -> ScanResult:
+    """실적 스캔 데이터 수집. Markdown과 export가 같은 계산 경로를 공유한다."""
     year, reprt_code = parse_period(period)
-    if group_by not in (None, "", "sector"):
-        raise ValueError(f"group_by는 None 또는 'sector'여야 합니다 (받음: '{group_by}').")
-
     if fs_div not in ("CFS", "OFS"):
         raise ValueError(f"fs_div는 CFS 또는 OFS여야 합니다 (받음: '{fs_div}').")
-    if not isinstance(top_n, int) or not (1 <= top_n <= 100):
-        raise ValueError(f"top_n은 1~100 정수여야 합니다 (받음: {top_n}).")
     if sort_by not in _SORT_KEYS:
         raise ValueError(
             f"sort_by '{sort_by}' 미지원. 사용 가능: {', '.join(_SORT_KEYS)}."
         )
     if direction not in ("desc", "asc"):
         raise ValueError(f"direction은 desc 또는 asc여야 합니다 (받음: '{direction}').")
+    if limit is not None and (not isinstance(limit, int) or limit < 1):
+        raise ValueError(f"limit은 1 이상 정수여야 합니다 (받음: {limit}).")
 
     corp_codes, universe_warn = await resolve_universe(universe)
     universe_size = len(corp_codes)
@@ -545,6 +559,7 @@ async def run_scan(
         name, sc = basic.get(r.corp_code, ("", ""))
         if not r.corp_name:
             r.corp_name = name or r.corp_code
+        r.stock_code = sc or ""
         m = metas.get(sc) if sc else None
         if m:
             r.sector = m.get("sector", "")
@@ -559,28 +574,10 @@ async def run_scan(
     total_fetched = cur_fetched + prev_fetched
     warnings = [w for w in (universe_warn, big_universe_warn) if w]
 
-    if group_by == "sector":
-        return _format_sector_markdown(
-            rows=rows,
-            period=period,
-            universe=universe,
-            fs_div=fs_div,
-            direction=direction,
-            top_n=top_n,
-            universe_size=universe_size,
-            data_count=data_count,
-            missing=missing,
-            flagged_count=flagged_count,
-            api_calls=total_api,
-            cache_hits=total_hits,
-            api_fetched=total_fetched,
-            warnings=warnings,
-        )
-
     sorted_rows = sort_rows(rows, sort_by, direction)
-    top = sorted_rows[:top_n]
-    return _format_markdown(
-        top=top,
+    limited_rows = sorted_rows[:limit] if limit is not None else sorted_rows
+    return ScanResult(
+        rows=limited_rows,
         period=period,
         year=year,
         reprt_code=reprt_code,
@@ -588,7 +585,6 @@ async def run_scan(
         fs_div=fs_div,
         sort_by=sort_by,
         direction=direction,
-        top_n=top_n,
         universe_size=universe_size,
         data_count=data_count,
         missing=missing,
@@ -597,6 +593,76 @@ async def run_scan(
         cache_hits=total_hits,
         api_fetched=total_fetched,
         warnings=warnings,
+    )
+
+
+async def run_scan(
+    *,
+    period: str,
+    universe: str = "kospi",
+    sort_by: str = "op_yoy",
+    direction: str = "desc",
+    top_n: int = 30,
+    fs_div: str = "CFS",
+    group_by: str | None = None,
+    cache: EarningsCache | None = None,
+) -> str:
+    """scan_earnings_season 본체. 마크다운 str 반환.
+
+    group_by="sector"면 KSIC 업종별 집계(중앙값) 테이블, 그 외엔
+    종목별 테이블(주요제품 컬럼 포함).
+    """
+    if group_by not in (None, "", "sector"):
+        raise ValueError(f"group_by는 None 또는 'sector'여야 합니다 (받음: '{group_by}').")
+    if not isinstance(top_n, int) or not (1 <= top_n <= 100):
+        raise ValueError(f"top_n은 1~100 정수여야 합니다 (받음: {top_n}).")
+
+    result = await collect_scan_rows(
+        period=period,
+        universe=universe,
+        sort_by=sort_by,
+        direction=direction,
+        limit=None if group_by == "sector" else top_n,
+        fs_div=fs_div,
+        cache=cache,
+    )
+
+    if group_by == "sector":
+        return _format_sector_markdown(
+            rows=result.rows,
+            period=result.period,
+            universe=result.universe,
+            fs_div=result.fs_div,
+            direction=result.direction,
+            top_n=top_n,
+            universe_size=result.universe_size,
+            data_count=result.data_count,
+            missing=result.missing,
+            flagged_count=result.flagged_count,
+            api_calls=result.api_calls,
+            cache_hits=result.cache_hits,
+            api_fetched=result.api_fetched,
+            warnings=result.warnings,
+        )
+
+    return _format_markdown(
+        top=result.rows,
+        period=result.period,
+        year=result.year,
+        reprt_code=result.reprt_code,
+        universe=result.universe,
+        fs_div=result.fs_div,
+        sort_by=result.sort_by,
+        direction=result.direction,
+        top_n=top_n,
+        universe_size=result.universe_size,
+        data_count=result.data_count,
+        missing=result.missing,
+        flagged_count=result.flagged_count,
+        api_calls=result.api_calls,
+        cache_hits=result.cache_hits,
+        api_fetched=result.api_fetched,
+        warnings=result.warnings,
     )
 
 

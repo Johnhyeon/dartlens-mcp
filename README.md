@@ -145,6 +145,8 @@ dartlens-setup --plaintext <KEY>
 | `get_order_backlog` | 사업/분기/반기보고서 표에서 수주잔고·계약잔액 추이를 구조화 |
 | `get_major_holders` | 5%룰 대량보유 변동 — 외인/펀드/행동주의 진입 추적 |
 | `get_insider_trades` | 임원·주요주주 특정증권 소유 — 내부자 매매 시그널 |
+| `scan_earnings_season` | 어닝 시즌 전체/시장별 실적 스캔 — 채팅용 Top N Markdown |
+| `export_earnings_scan` | 실적 스캔 결과를 `.xlsx`/`.csv` 파일로 저장. 한국 Excel은 `.xlsx` 권장 |
 
 ### 권장 워크플로우
 
@@ -161,6 +163,13 @@ get_major_accounts(corp_code, bsns_year=2024, reprt_code="annual") → 핵심 �
 get_full_financial(corp_code, bsns_year=2024, reprt_code="annual",
                    fs_div="CFS", sj_div="IS") → 손익 전체
 get_order_backlog(corp_code, years=3) → 수주잔고/계약잔액 추이
+
+# 어닝 시즌 전체 스캔
+scan_earnings_season(period="2026Q1", universe="kospi", top_n=30) → 채팅용 요약 표
+export_earnings_scan(period="2026Q1", universe="all",
+                     output_format="xlsx", max_rows=1000) → 엑셀 파일 + 행/열 검증
+export_earnings_scan(period="2026Q1", universe="all",
+                     output_format="both", amount_unit="eok") → XLSX + CSV 동시 생성
 
 # 지분 흐름 (시세에 안 나오는 자본 움직임)
 search_company("삼성전자") → corp_code
