@@ -389,6 +389,16 @@ _CHUNK = 100  # DART fnlttMultiAcnt 회사 한도
 _MAX_CONCURRENT_CHUNKS = 5
 
 
+def _has_receipt_schema(acc: dict) -> bool:
+    """v2 cache schema guard.
+
+    bea5cd3 이전 EarningsCache payload에는 rcept_no/filing_date가 없어
+    새 출력에서 공시일이 N/A가 된다. 값이 빈 문자열일 수는 있으므로
+    truthiness가 아니라 키 존재 여부로 새 스키마를 판정한다.
+    """
+    return "rcept_no" in acc and "filing_date" in acc
+
+
 async def _fetch_year(
     corp_codes: list[str],
     year: int,
@@ -410,7 +420,7 @@ async def _fetch_year(
     result: dict[str, dict] = {}
     misses: list[str] = []
     for cc, k in keys.items():
-        if k in cached:
+        if k in cached and _has_receipt_schema(cached[k]):
             result[cc] = cached[k]
         else:
             misses.append(cc)

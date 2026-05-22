@@ -301,6 +301,42 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("캐시 hit", out2)
             cache.close()
 
+    async def test_legacy_cache_without_receipt_metadata_is_refetched(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = EarningsCache(Path(td) / "legacy.sqlite")
+            old_payload = {
+                "corp_name": "구캐시",
+                "rev_cur": 10_000_000_000.0,
+                "rev_prev": 8_000_000_000.0,
+                "op_cur": 2_000_000_000.0,
+                "op_prev": 1_000_000_000.0,
+                "ni_cur": 1_500_000_000.0,
+                "ni_prev": 900_000_000.0,
+            }
+            cache.set_many(
+                {
+                    EarningsCache.make_key("00126380", 2026, "11013", "CFS"): old_payload,
+                    EarningsCache.make_key("00126380", 2025, "11013", "CFS"): old_payload,
+                }
+            )
+            mock = self._fake_multi_acnt()
+            with patch.object(_earnings, "get_multi_acnt", mock), patch.object(
+                _earnings, "corp_basic_map", AsyncMock(return_value={})
+            ), patch.object(_earnings, "meta_map", AsyncMock(return_value={})):
+                out = await run_scan(
+                    period="2026Q1",
+                    universe="00126380",
+                    sort_by="op_yoy",
+                    direction="desc",
+                    top_n=1,
+                    cache=cache,
+                )
+            self.assertGreater(mock.call_count, 0)
+            self.assertIn("2026-05-15", out)
+            self.assertIn("rcept_no=20260515000001", out)
+            self.assertNotIn("| N/A |", out)
+            cache.close()
+
     async def test_top_n_limits_rows(self):
         with tempfile.TemporaryDirectory() as td:
             cache = EarningsCache(Path(td) / "e.sqlite")
