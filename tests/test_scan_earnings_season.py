@@ -33,10 +33,11 @@ from dartlens._earnings import (
 )
 
 
-def _row(corp_code, name, account, ths, frm, fs_div="CFS"):
+def _row(corp_code, name, account, ths, frm, fs_div="CFS", rcept_no="20260515000001"):
     return {
         "corp_code": corp_code,
         "corp_name": name,
+        "rcept_no": rcept_no,
         "account_nm": account,
         "fs_div": fs_div,
         "sj_div": "IS",
@@ -178,6 +179,24 @@ class YoYTests(unittest.TestCase):
         self.assertIsNone(extract_accounts(rows, "00444444", "CFS"))
         self.assertIsNotNone(extract_accounts(rows, "00444444", "OFS"))
 
+    def test_receipt_no_becomes_filing_date(self):
+        rows = [
+            _row(
+                "00126380",
+                "삼성전자",
+                "매출액",
+                "133,873,444,000,000",
+                "79,140,503,000,000",
+                rcept_no="20260430001234",
+            ),
+        ]
+        acc = extract_accounts(rows, "00126380", "CFS")
+        self.assertEqual(acc["rcept_no"], "20260430001234")
+        self.assertEqual(acc["filing_date"], "2026-04-30")
+        r = compute_row("00126380", acc)
+        self.assertEqual(r.rcept_no, "20260430001234")
+        self.assertEqual(r.filing_date, "2026-04-30")
+
 
 # ---------------------------------------------------------------------------
 # 5. 정렬 / top_n
@@ -256,8 +275,14 @@ class RunScanIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("# 분기 실적 스캐닝 — 2026Q1", out1)
                 self.assertIn("00126380", out1)
                 self.assertIn("| 순위 |", out1)
+                self.assertIn("공시일", out1)
+                self.assertIn("2026-05-15", out1)
+                self.assertIn("rcept_no=20260515000001", out1)
                 self.assertIn("OP YoY", out1)
                 self.assertIn("데이터 보유: 2", out1)
+                self.assertIn("실적 기간", out1)
+                self.assertIn("공시 접수일", out1)
+                self.assertIn("주가·수급 반응", out1)
 
                 # 2차 호출 — 동일 period, 전부 캐시 hit → API 호출 0건 추가
                 out2 = await run_scan(

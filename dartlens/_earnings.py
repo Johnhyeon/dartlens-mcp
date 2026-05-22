@@ -180,6 +180,26 @@ def _short(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _fmt_yyyymmdd(s: str) -> str:
+    s = (s or "").strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
+def _receipt_metadata(row: dict) -> tuple[str, str]:
+    """DART 접수번호/접수일 메타.
+
+    fnlttMultiAcnt는 접수일 컬럼이 없을 수 있어 rcept_no 앞 8자리(YYYYMMDD)를
+    접수일로 보완한다. 접수번호 자체는 원문 대조와 후속 공시 조회용으로 보존.
+    """
+    rcept_no = (row.get("rcept_no") or "").strip()
+    raw_dt = (row.get("rcept_dt") or "").strip()
+    if not raw_dt and len(rcept_no) >= 8 and rcept_no[:8].isdigit():
+        raw_dt = rcept_no[:8]
+    return rcept_no, _fmt_yyyymmdd(raw_dt)
+
+
 # ---------------------------------------------------------------------------
 # 계정 추출
 # ---------------------------------------------------------------------------
@@ -206,7 +226,8 @@ def extract_accounts(
 
     fs_div 일치 행만 사용. 같은 계정이 IS/CIS 양쪽에 있으면 먼저 본 값 우선.
     핵심 세 계정이 모두 결측이면 None (데이터 미보유로 간주, 캐시 안 함).
-    반환: {corp_name, rev_cur, rev_prev, op_cur, op_prev, ni_cur, ni_prev}
+    반환: {corp_name, rcept_no, filing_date, rev_cur, rev_prev, op_cur,
+    op_prev, ni_cur, ni_prev}
     """
     corp_rows = [
         r
@@ -218,6 +239,7 @@ def extract_accounts(
         return None
 
     corp_name = (corp_rows[0].get("corp_name") or "").strip()
+    rcept_no, filing_date = _receipt_metadata(corp_rows[0])
     picked: dict[str, dict] = {}  # bucket → row (먼저 본 것 우선)
 
     for r in corp_rows:
@@ -235,7 +257,7 @@ def extract_accounts(
     if not picked:
         return None
 
-    out: dict = {"corp_name": corp_name}
+    out: dict = {"corp_name": corp_name, "rcept_no": rcept_no, "filing_date": filing_date}
     for bucket in ("rev", "op", "ni"):
         r = picked.get(bucket)
         out[f"{bucket}_cur"] = parse_won(r.get("thstrm_amount")) if r else None
@@ -260,6 +282,8 @@ class ScanRow:
     ni_yoy: float | None
     op_margin: float | None
     note: str
+    rcept_no: str = ""
+    filing_date: str = ""
     flagged: bool = False
     sector: str = ""   # KRX 업종(KSIC)
     product: str = ""  # KRX 주요제품(free-text)
@@ -315,6 +339,8 @@ def compute_row(corp_code: str, acc: dict) -> ScanRow:
         ni_yoy=_yoy(ni, ni_prev),
         op_margin=op_margin,
         note=", ".join(notes) if notes else "-",
+        rcept_no=acc.get("rcept_no") or "",
+        filing_date=acc.get("filing_date") or "",
         flagged=flagged,
     )
 
@@ -695,6 +721,11 @@ def _format_sector_markdown(
         "가로질러 안 잡힘 — 개별 종목·사업보고서로 확인._"
     )
     lines.append(
+        f"_시간축: 실적 기간은 {period}, 공시 접수일은 회사별로 다릅니다. "
+        "섹터 집계는 공시일을 섞어 본 요약이므로 주가·수급 반응은 종목별 "
+        "scan 결과의 공시 접수일 기준 전후 거래일로 비교하세요._"
+    )
+    lines.append(
         f"_데이터 결측 {missing}건 · 회사 {_MIN_SECTOR_FIRMS}개 미만 "
         f"제외 섹터 {excluded}개 · 캐시 hit {cache_hits} / API fetch "
         f"{api_fetched} · API 호출 {api_calls}회._"
@@ -739,13 +770,17 @@ def _format_markdown(
         f"조회 회사: {universe_size} / 데이터 보유: {data_count} / "
         f"정렬: {sort_by} {direction} / Top {min(top_n, len(top))}",
         "",
-        "| 순위 | 회사 (corp_code) | 주요제품 | 매출 | 매출 YoY | 영업이익 | OP YoY | "
+        "| 순위 | 회사 (corp_code) | 공시일 | 주요제품 | 매출 | 매출 YoY | 영업이익 | OP YoY | "
         "순이익 | NI YoY | OP 마진 | 비고 |",
-        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for i, r in enumerate(top, 1):
+        filing = r.filing_date or "N/A"
+        if r.rcept_no:
+            filing = f"{filing} (`rcept_no={r.rcept_no}`)"
         lines.append(
             f"| {i} | {r.corp_name} ({r.corp_code}) "
+            f"| {filing} "
             f"| {_short(r.product, 28)} "
             f"| {fmt_won(r.rev)} | {fmt_pct(r.rev_yoy)} "
             f"| {fmt_won(r.op)} | {fmt_pct(r.op_yoy)} "
@@ -754,12 +789,18 @@ def _format_markdown(
             f"| {r.note} |"
         )
     if not top:
-        lines.append("| - | (데이터 없음) | - | - | - | - | - | - | - | - | - |")
+        lines.append("| - | (데이터 없음) | - | - | - | - | - | - | - | - | - | - |")
 
     lines.append("")
     lines.append(
         f"_금액 단위: 조/억 자동 절사. YoY는 전년동기({prev_label}) 대비. "
         "Q2 이후는 누적 기준(분기 환산은 v2)._"
+    )
+    lines.append(
+        f"_시간축: 실적 기간은 {period}, 공시 접수일은 회사별로 다릅니다. "
+        "주가·수급 반응은 마감일 일괄 기준이 아니라 각 회사의 공시 접수일 "
+        "기준 전후 거래일로 비교하세요. StockLens가 함께 설치되어 있으면 "
+        "event_date=공시일로 이어서 확인하세요._"
     )
     lines.append(
         f"_데이터 결측 {missing}건 · 캐시 hit {cache_hits} / API fetch {api_fetched} "

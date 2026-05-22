@@ -1359,6 +1359,8 @@ async def scan_earnings_season(
     "이번 분기 실적 다 뒤져서 두드러진 회사 추려줘"를 한 번의 호출로 처리합니다.
     get_major_accounts/get_full_financial 단건 fan-out 대신 이걸 쓰세요. 결과의
     corp_code로 후속 단건 도구(get_full_financial 등)를 호출하면 됩니다.
+    결과의 공시일은 회사별 DART 접수일입니다. 주가·수급 반응을 보려면
+    마감일 일괄 기준이 아니라 각 행의 공시일을 StockLens event_date로 넘기세요.
 
     Args:
         period: "YYYYQ1"(1분기) / "YYYYH1"(반기) / "YYYYQ3"(3분기) / "YYYY"(연간).
@@ -1380,11 +1382,11 @@ async def scan_earnings_season(
                 등)는 KSIC를 가로질러 안 잡힘 — 개별 종목·사업보고서로 확인.
 
     Returns:
-        group_by=None: 순위|회사(corp_code)|주요제품|매출|매출YoY|영업이익|
-        OP YoY|순이익|NI YoY|OP 마진|비고(흑전/적전).
+        group_by=None: 순위|회사(corp_code)|공시일(rcept_no)|주요제품|매출|
+        매출YoY|영업이익|OP YoY|순이익|NI YoY|OP 마진|비고(흑전/적전).
         group_by="sector": 순위|섹터(KSIC)|회사수|영익↑비율|흑전|흑전비율|
         영익YoY중앙|매출YoY중앙. 헤더에 모집단/유효수, footer에 결측·캐시·
-        API 통계.
+        API 통계와 시간축 주의사항.
     """
     return await run_scan(
         period=period,
