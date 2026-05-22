@@ -1368,20 +1368,23 @@ async def scan_earnings_season(
         sort_by: rev_yoy/op_yoy/ni_yoy(전년동기 대비 %), op_margin(영업이익률),
                 rev/op/ni(절댓값). 기본 op_yoy.
         direction: desc / asc. 결측(N/A)은 방향 무관 항상 맨 뒤.
-                group_by="sector"일 땐 흑전비율 정렬의 방향.
+                group_by="sector"일 땐 영익증가비율 정렬의 방향.
         top_n: 1~100. 기본 30. (group_by="sector"면 섹터 개수 상한)
         fs_div: "CFS"(연결, 기본) / "OFS"(별도). v1은 OFS 폴백 없음.
         group_by: None(기본)이면 종목별 표(주요제품 컬럼 포함). "sector"면
-                KSIC 업종별 집계 — 회사수·흑전비율·영익/매출 YoY **중앙값**
-                (이상치 면역). "어느 섹터가 전반적으로 잘 나왔나"용. 단
-                테마(원전·AI반도체 등)는 KSIC를 가로질러 안 잡힘 — 그건
-                개별 종목·사업보고서로 확인.
+                KSIC 업종별 집계 — 회사수·영익증가비율·흑전비율·영익/매출
+                YoY **중앙값**(이상치 면역). 영익증가비율 desc 정렬.
+                "어느 섹터가 전반적으로 잘 나왔나"용. 영익증가비율(작년比
+                영익 증가)과 흑전비율(적자→흑자)은 다른 시그널 — 후자만으론
+                이미 흑자인 우량 업종이 0%로 묻힘. 단 테마(원전·AI반도체
+                등)는 KSIC를 가로질러 안 잡힘 — 개별 종목·사업보고서로 확인.
 
     Returns:
         group_by=None: 순위|회사(corp_code)|주요제품|매출|매출YoY|영업이익|
         OP YoY|순이익|NI YoY|OP 마진|비고(흑전/적전).
-        group_by="sector": 순위|섹터(KSIC)|회사수|흑전|흑전비율|영익YoY중앙|
-        매출YoY중앙. 헤더에 모집단/유효수, footer에 결측·캐시·API 통계.
+        group_by="sector": 순위|섹터(KSIC)|회사수|영익↑비율|흑전|흑전비율|
+        영익YoY중앙|매출YoY중앙. 헤더에 모집단/유효수, footer에 결측·캐시·
+        API 통계.
     """
     return await run_scan(
         period=period,

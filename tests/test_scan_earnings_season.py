@@ -400,6 +400,26 @@ class SectorAggregateTests(unittest.TestCase):
         self.assertEqual(a.turnaround, 2)
         self.assertAlmostEqual(a.turn_ratio, 0.5)
 
+    def test_op_inc_ratio_distinct_from_turnaround(self):
+        # 4사 전부 흑자, 작년比 영익 증가 3사 / 감소 1사 → 영익↑비율 0.75.
+        # 적자→흑자는 0건이므로 흑전비율 0 — 두 지표가 분리됨을 검증.
+        rows = [
+            self._row("반도체", 50),
+            self._row("반도체", 20),
+            self._row("반도체", 10),
+            self._row("반도체", -30),  # 감소(여전히 흑자, 흑전 아님)
+        ]
+        a = _earnings.aggregate_sectors(rows)[0]
+        self.assertAlmostEqual(a.op_inc_ratio, 0.75)
+        self.assertEqual(a.turnaround, 0)
+        self.assertAlmostEqual(a.turn_ratio, 0.0)
+
+    def test_op_inc_ratio_none_when_no_yoy(self):
+        # 전년 결측이면 op_yoy 산출 불가 → 분모 0 → None (0%로 오인 금지)
+        rows = [self._row("정유", None), self._row("정유", None), self._row("정유", None)]
+        a = _earnings.aggregate_sectors(rows)[0]
+        self.assertIsNone(a.op_inc_ratio)
+
     def test_median_immune_to_implausible_outlier(self):
         # 87,243조급 이상치가 섞여도 중앙값은 정상
         rows = [
@@ -439,7 +459,9 @@ class SectorMarkdownSmokeTests(unittest.IsolatedAsyncioTestCase):
             cache.close()
         self.assertIn("# 섹터 실적 스캐닝 — 2026Q1", out)
         self.assertIn("석유 정제품 제조업", out)
+        self.assertIn("영익↑비율", out)
         self.assertIn("흑전비율", out)
+        self.assertIn("정렬: 영익증가비율", out)
         self.assertIn("중앙값", out)
 
     async def test_invalid_group_by_rejected(self):

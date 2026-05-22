@@ -576,6 +576,7 @@ _MIN_SECTOR_FIRMS = 3
 class SectorAgg:
     sector: str
     n: int                       # 데이터 보유 회사 수
+    op_inc_ratio: float | None   # 영익 YoY > 0 회사 / YoY 산출 가능 회사
     turnaround: int              # 흑전(영업/순익) 회사 수
     turn_ratio: float            # turnaround / n
     op_yoy_median: float | None  # 영익 YoY 중앙값 (이상치 면역)
@@ -601,10 +602,20 @@ def aggregate_sectors(rows: list[ScanRow]) -> list[SectorAgg]:
         turn = sum(1 for r in group if "흑전" in r.note)
         op_yoys = [r.op_yoy for r in group if r.op_yoy is not None]
         rev_yoys = [r.rev_yoy for r in group if r.rev_yoy is not None]
+        # 영익 증가 비율: 흑전(적자→흑자)과 별개 — 흑자였든 적자였든
+        # 작년보다 영익이 늘었나. 흑전비율로는 못 잡는 "이미 흑자인데
+        # 더 좋아진 업종"을 드러낸다. YoY 산출 불가(전년 0/결측) 회사는
+        # 분모에서 제외 — 중앙값과 동일 모집단.
+        op_inc_ratio = (
+            sum(1 for v in op_yoys if v > 0) / len(op_yoys)
+            if op_yoys
+            else None
+        )
         out.append(
             SectorAgg(
                 sector=sec,
                 n=len(group),
+                op_inc_ratio=op_inc_ratio,
                 turnaround=turn,
                 turn_ratio=turn / len(group),
                 op_yoy_median=statistics.median(op_yoys) if op_yoys else None,
@@ -638,12 +649,15 @@ def _format_sector_markdown(
         else "지정 리스트"
     )
     aggs = aggregate_sectors(rows)
-    # 흑전비율 desc, 동률이면 영익YoY 중앙값 desc (None은 맨 뒤)
+    # 영익증가비율 desc → 동률이면 영익YoY중앙값 → 흑전비율 순.
+    # "전반적으로 좋았던 업종"의 1차 기준은 흑전(턴어라운드)이 아니라
+    # 영익이 늘어난 회사 비중. 산출불가(None)는 -inf로 맨 뒤.
     reverse = direction != "asc"
     aggs.sort(
         key=lambda a: (
-            a.turn_ratio,
+            a.op_inc_ratio if a.op_inc_ratio is not None else float("-inf"),
             a.op_yoy_median if a.op_yoy_median is not None else float("-inf"),
+            a.turn_ratio,
         ),
         reverse=reverse,
     )
@@ -656,24 +670,27 @@ def _format_sector_markdown(
         "",
         f"조회 회사: {universe_size} / 데이터 보유: {data_count} / "
         f"집계 섹터: {len(aggs)}개(회사 {_MIN_SECTOR_FIRMS}+ 기준) / "
-        f"정렬: 흑전비율 {direction} / Top {min(top_n, len(top))}",
+        f"정렬: 영익증가비율 {direction} / Top {min(top_n, len(top))}",
         "",
-        "| 순위 | 섹터 (KSIC 업종) | 회사수 | 흑전 | 흑전비율 | "
+        "| 순위 | 섹터 (KSIC 업종) | 회사수 | 영익↑비율 | 흑전 | 흑전비율 | "
         "영익 YoY 중앙 | 매출 YoY 중앙 |",
-        "|---:|---|---:|---:|---:|---:|---:|",
+        "|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for i, a in enumerate(top, 1):
+        inc = f"{a.op_inc_ratio * 100:.0f}%" if a.op_inc_ratio is not None else "N/A"
         lines.append(
-            f"| {i} | {_short(a.sector, 28)} | {a.n} | {a.turnaround} "
+            f"| {i} | {_short(a.sector, 28)} | {a.n} | {inc} | {a.turnaround} "
             f"| {a.turn_ratio * 100:.0f}% "
             f"| {fmt_pct(a.op_yoy_median)} | {fmt_pct(a.rev_yoy_median)} |"
         )
     if not top:
-        lines.append("| - | (집계 가능 섹터 없음) | - | - | - | - | - |")
+        lines.append("| - | (집계 가능 섹터 없음) | - | - | - | - | - | - |")
 
     lines.append("")
     lines.append(
-        "_흑전비율 = (영업/순익 흑전 회사) / (섹터 내 데이터 보유 회사). "
+        "_영익↑비율 = (영익 YoY > 0 회사) / (YoY 산출 가능 회사) — 흑자였든 "
+        "적자였든 작년보다 영익이 늘었나. 흑전비율 = (영업/순익 흑전 회사) "
+        "/ (섹터 내 데이터 보유 회사) — 적자→흑자만. 둘은 다른 시그널. "
         "YoY는 **중앙값**(이상치 면역). 테마(원전·AI반도체 등)는 KSIC를 "
         "가로질러 안 잡힘 — 개별 종목·사업보고서로 확인._"
     )
