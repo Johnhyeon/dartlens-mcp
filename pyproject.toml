@@ -37,6 +37,7 @@ Issues = "https://github.com/Johnhyeon/dartlens-mcp/issues"
 dartlens = "dartlens.server:main"
 dartlens-setup = "dartlens.setup_claude:main"
 dartlens-doctor = "dartlens.doctor:main"
+dartlens-export-earnings = "dartlens.export_earnings_cli:main"
 
 [build-system]
 requires = ["hatchling"]

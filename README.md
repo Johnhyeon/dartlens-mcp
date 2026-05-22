@@ -171,6 +171,11 @@ export_earnings_scan(period="2026Q1", universe="all",
 export_earnings_scan(period="2026Q1", universe="all",
                      output_format="both", amount_unit="eok") → XLSX + CSV 동시 생성
 
+# 터미널에서 바로 엑셀 파일 생성
+uvx --from dartlens-mcp dartlens-export-earnings --period 2026Q1 --universe all --sort-by op_yoy --max-rows 3000 --format xlsx
+# PowerShell에서 corp_code 콤마 리스트를 직접 넘길 때는 따옴표 사용
+uvx --from dartlens-mcp dartlens-export-earnings --period 2026Q1 --universe "00126380,00631518" --format both
+
 # 지분 흐름 (시세에 안 나오는 자본 움직임)
 search_company("삼성전자") → corp_code
 get_major_holders(corp_code, limit=10) → 5%룰 보고서 (외인/펀드/행동주의)
