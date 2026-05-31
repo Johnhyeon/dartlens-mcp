@@ -81,7 +81,7 @@ DARTLENS_TARGET="${DARTLENS_TARGET:-auto}"
 export DARTLENS_TARGET
 
 printf '%b[3/3] Configuring MCP (target=%s, DART API key required)...%b\n' "$CYAN" "$DARTLENS_TARGET" "$NC"
-printf '      DART API 키가 없다면 https://opendart.fss.or.kr 에서 무료 발급 (분당 1,000건 / 일 20,000건)\n\n'
+printf '      DART API 키가 없다면 https://opendart.fss.or.kr 에서 발급 (분당 1,000건 / 일 20,000건)\n\n'
 
 # arrays 대신 함수 + "$@" 으로 우회 (POSIX 호환).
 # curl | sh 일 때 stdin은 파이프라 input() 이 막힌다. /dev/tty 가 있으면

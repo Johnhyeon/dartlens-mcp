@@ -4,13 +4,17 @@
 
 **전자공시(DART)를 Claude가 진짜 데이터로 읽습니다**
 
-[![PyPI](https://img.shields.io/pypi/v/dartlens-mcp.svg)](https://pypi.org/project/dartlens-mcp/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 </div>
 
 ---
+
+## 배포 상태
+
+DartLens의 공개 설치 안내는 2026-06-01 기준으로 종료했습니다.
+
+현재 신규 설치는 구매자 안내문을 통해 제공되는 설치 명령어와 가이드를 기준으로 진행합니다. 이미 설치한 기존 사용자는 보유한 공개 버전을 계속 사용할 수 있지만, 신규 배포·설치 지원·활용 템플릿은 구매자 패키지 기준으로 정리합니다.
 
 ## 왜 필요한가
 
@@ -31,63 +35,21 @@ AI에게 공시 PDF를 보여주면 **숫자를 추측해서 틀린 답**을 합
 
 - 📑 **7개 도구** — 기업 검색, 공시 목록·본문, 재무제표(요약·전체), 5%룰, 임원·주요주주 매매
 - 🔐 **API 키는 OS 키체인** (Windows DPAPI / macOS Keychain / Linux Secret Service) — config 평문 저장 X
-- 💸 **무료 DART OpenAPI** — 분당 1,000건 / 일 20,000건
+- 💸 **DART OpenAPI** — 분당 1,000건 / 일 20,000건
 - 🧠 **토큰 다이어트** — 단위 압축 + 보고서 인덱스 + 키워드 매치 (`find=...`)로 긴 사업보고서도 가벼움
 - 🩺 **`dartlens-doctor`** — 막혔을 때 원인·해결 명령까지 자동 진단
 
-## 빠른 시작 (Python 사전 설치 불필요)
+## 설치 안내
 
-[`uv`](https://docs.astral.sh/uv/)가 Python 런타임까지 자동으로 설치합니다. 터미널에 한 줄 복붙.
+구매자에게 제공되는 안내문에는 다음 과정이 포함됩니다.
 
-### Windows (PowerShell)
+1. `uv` 확인 및 설치
+2. DartLens MCP 설치
+3. DART API 키 입력 및 검증
+4. Claude Desktop 또는 Claude Code MCP 설정 자동 등록
+5. 설치 진단과 첫 실행 확인
 
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Johnhyeon/dartlens-mcp/main/install.ps1 | iex"
-```
-
-### macOS / Linux (터미널)
-
-```bash
-curl -LsSf https://raw.githubusercontent.com/Johnhyeon/dartlens-mcp/main/install.sh | sh
-```
-
-스크립트가 ① uv 설치 → ② `uv tool install dartlens-mcp` → ③ DART API 키 입력·검증 → ④ MCP 클라이언트 자동 등록까지 처리합니다. **타겟 자동 감지**: `claude` CLI가 PATH에 있으면 Claude Code, Claude Desktop config 디렉토리가 있으면 Desktop, 둘 다면 둘 다 등록. 끝나면 Claude Desktop은 완전히 종료(트레이→Quit) 후 재시작, Claude Code는 새 세션에서 자동 적용.
-
-API 키가 없다면 먼저 [DART OpenAPI 발급](https://opendart.fss.or.kr/uss/umt/EgovMberInsertView.do) (무료, 분당 1,000건 / 일 20,000건).
-
-> 💡 **키를 미리 넣고 무대화 설치**
-> - PowerShell: `$env:DART_API_KEY="..."; powershell -c "irm https://raw.githubusercontent.com/Johnhyeon/dartlens-mcp/main/install.ps1 | iex"`
-> - bash: `curl -LsSf https://raw.githubusercontent.com/Johnhyeon/dartlens-mcp/main/install.sh | DART_API_KEY=... sh`
->
-> 💡 **타겟 직접 지정** (자동감지 무시): `DARTLENS_TARGET=claude-code` (또는 `claude-desktop` / `both`) 를 추가로 export.
-
-### 업데이트
-
-```bash
-uv tool upgrade dartlens-mcp
-```
-
-또는 위 install 명령을 다시 실행하면 됩니다.
-
----
-
-### 수동 설치 (pip)
-
-uv 없이 기존 환경에 설치하려면:
-
-```bash
-pip install dartlens-mcp
-
-dartlens-setup <DART_API_KEY>          # 인자로 직접
-dartlens-setup                         # 또는 대화형
-DART_API_KEY=... dartlens-setup        # 또는 env로
-```
-
-`dartlens-setup`은:
-
-1. DART API 키를 받아 **유효성 검증** (삼성전자 기업개황 1회 호출)
-2. 키를 **OS 키체인**에 저장 (Windows DPAPI / macOS Keychain / Linux Secret Service)
-3. Claude Desktop의 `claude_desktop_config.json`에 `mcpServers.dartlens` 엔트리 등록 (키는 JSON에 박지 않음)
+공개 README에는 더 이상 직접 설치 명령어를 게시하지 않습니다.
 
 ## 동작 확인
 
@@ -201,9 +163,9 @@ get_insider_trades(corp_code, limit=10) → 임원·주요주주 자사주 매�
 - 두 서버는 서로 호출하지 않습니다. **Claude가 조정자**입니다.
 - 투자 추천·매매 시그널을 만들지 않습니다. 데이터 제공만.
 
-## 기여
+## 운영 원칙
 
-이슈, PR 모두 환영합니다. 버그 제보나 기능 요청은 [Issues](https://github.com/Johnhyeon/dartlens-mcp/issues)에 남겨주세요.
+DartLens는 투자 추천·매수/매도 신호·자동매매 기능을 제공하지 않습니다. DART 공시와 정형 재무 데이터를 Claude가 읽을 수 있는 형태로 연결하는 데이터 도구입니다.
 
 ## 라이선스
 
