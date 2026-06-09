@@ -24,7 +24,7 @@ Write-Host ""
 $LocalBin = Join-Path $env:USERPROFILE ".local\bin"
 
 # ── [1/3] uv ─────────────────────────────────────────────
-Info "[1/3] Checking uv..."
+Info "[1/4] Checking uv..."
 $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $uvCmd) {
     Info "      uv not found. Installing from astral.sh..."
@@ -50,7 +50,7 @@ if (-not $uvCmd) {
 Write-Host ""
 
 # ── [2/3] dartlens-mcp ─────────────────────────────
-Info "[2/3] Installing dartlens-mcp..."
+Info "[2/4] Installing dartlens-mcp..."
 
 # --force re-creates the tool environment, so re-running upgrades cleanly.
 & uv tool install --force dartlens-mcp
@@ -72,7 +72,7 @@ if (Test-Path $LocalBin -PathType Container) {
 # $env:DARTLENS_TARGET 으로 등록 대상 지정: claude-desktop / claude-code / both / auto
 if (-not $env:DARTLENS_TARGET) { $env:DARTLENS_TARGET = "auto" }
 
-Info "[3/3] Configuring MCP (target=$($env:DARTLENS_TARGET), DART API key required)..."
+Info "[3/4] Configuring MCP (target=$($env:DARTLENS_TARGET), DART API key required)..."
 Write-Host "      DART API 키가 없다면 https://opendart.fss.or.kr 에서 발급 (분당 1,000건 / 일 20,000건)"
 Write-Host ""
 
@@ -89,6 +89,25 @@ if ($LASTEXITCODE -ne 0) {
     Err "[FAIL] dartlens-setup failed. 키를 직접 다시 등록하려면:"
     Err "       dartlens-setup <YOUR_DART_API_KEY>"
     exit 1
+}
+Write-Host ""
+
+# ── [4/4] License activation ─────────────────────────────
+Info "[4/4] License activation..."
+Write-Host "      Enter the license key sent to your email after purchase."
+$activateExe = Join-Path $LocalBin "dartlens-activate.exe"
+$licKey = (Read-Host "      License key").Trim()
+if ($licKey) {
+    if (Test-Path $activateExe) {
+        & $activateExe $licKey
+    } else {
+        & uv tool run --from dartlens-mcp dartlens-activate $licKey
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Warn "      Activation failed. Check the key and retry: dartlens-activate <LICENSE-KEY>"
+    }
+} else {
+    Warn "      Skipped. Activate later: dartlens-activate <LICENSE-KEY>"
 }
 Write-Host ""
 
@@ -116,6 +135,7 @@ Write-Host "  1. FULLY quit Claude Desktop (tray icon -> Quit)"
 Write-Host "  2. Restart Claude Desktop"
 Write-Host "  3. Try: '삼성전자 최근 공시 보여줘'"
 Write-Host ""
+Write-Host "Activate:        dartlens-activate <LICENSE-KEY>"
 Write-Host "Update later:    uv tool upgrade dartlens-mcp"
 Write-Host "Re-register key: dartlens-setup <KEY>"
 Write-Host "Diagnose:        dartlens-doctor"

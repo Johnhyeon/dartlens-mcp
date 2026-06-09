@@ -1,9 +1,9 @@
 [project]
 name = "dartlens-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "dartlens — 금융감독원 전자공시(DART OpenAPI) 래핑 MCP 서버. 공시 검색·본문·재무제표 조회를 Claude에서 자연어로."
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Proprietary" }
 authors = [
     { name = "Johnhyeon" }
 ]
@@ -12,7 +12,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Financial and Insurance Industry",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -26,6 +26,8 @@ dependencies = [
     "httpx>=0.27.0",
     "lxml>=5.0.0",
     "keyring>=24.0",
+    "cryptography>=42.0.0",
+    "tzdata>=2024.1",
 ]
 
 [project.urls]
@@ -38,6 +40,7 @@ dartlens = "dartlens.server:main"
 dartlens-setup = "dartlens.setup_claude:main"
 dartlens-doctor = "dartlens.doctor:main"
 dartlens-export-earnings = "dartlens.export_earnings_cli:main"
+dartlens-activate = "dartlens.licensing:activate_cli"
 
 [build-system]
 requires = ["hatchling"]

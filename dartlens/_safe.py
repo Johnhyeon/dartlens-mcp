@@ -7,6 +7,8 @@ import os
 
 import httpx
 
+from dartlens.licensing import is_licensed, LOCKED_MESSAGE
+
 
 class DartApiError(Exception):
     """DART API가 비정상 status를 반환했을 때."""
@@ -47,10 +49,16 @@ def require_api_key() -> str:
 
 
 def safe_tool(func):
-    """MCP 도구의 예외를 사용자 친화적 문자열로 변환."""
+    """MCP 도구의 예외를 사용자 친화적 문자열로 변환.
+
+    아울러 라이선스 게이트를 적용한다 — 모든 도구가 이 래퍼를 거치므로,
+    활성화되지 않은 경우 데이터 조회 없이 안내 메시지를 반환한다.
+    """
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
+        if not is_licensed():
+            return LOCKED_MESSAGE
         try:
             return await func(*args, **kwargs)
         except MissingApiKeyError as e:

@@ -241,7 +241,11 @@ class OrderBacklogToolTests(unittest.IsolatedAsyncioTestCase):
         fetch_list = AsyncMock(return_value=disclosure_list)
         fetch_doc = AsyncMock(return_value=payload.getvalue())
 
-        with patch.object(server, "_fetch_disclosure_list", fetch_list), patch.object(server, "_fetch_document_zip", fetch_doc):
+        with (
+            patch("dartlens._safe.is_licensed", return_value=True),
+            patch.object(server, "_fetch_disclosure_list", fetch_list),
+            patch.object(server, "_fetch_document_zip", fetch_doc),
+        ):
             text = await server.get_order_backlog("00126380", years=3, days=1200)
 
         fetch_doc.assert_awaited_once_with("20260318000001")
@@ -280,7 +284,11 @@ class OrderBacklogToolTests(unittest.IsolatedAsyncioTestCase):
         fetch_list = AsyncMock(return_value=disclosure_list)
         fetch_doc = AsyncMock(side_effect=lambda rcept_no: docs[rcept_no])
 
-        with patch.object(server, "_fetch_disclosure_list", fetch_list), patch.object(server, "_fetch_document_zip", fetch_doc):
+        with (
+            patch("dartlens._safe.is_licensed", return_value=True),
+            patch.object(server, "_fetch_disclosure_list", fetch_list),
+            patch.object(server, "_fetch_document_zip", fetch_doc),
+        ):
             text = await server.get_order_backlog("00126380", years=3, days=1200)
 
         self.assertIn("[연간] 2023=320,000 | 2024=410,000 | 2025=560,000", text)
