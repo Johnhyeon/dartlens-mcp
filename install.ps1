@@ -78,7 +78,7 @@ Write-Host ""
 
 $setupExe = Join-Path $LocalBin "dartlens-setup.exe"
 
-# DART_API_KEY env var를 미리 넣어두면 prompt 없이 바로 진행됨
+# If DART_API_KEY is already set, setup can run without prompting.
 if (Test-Path $setupExe) {
     & $setupExe
 } else {
