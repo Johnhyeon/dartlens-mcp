@@ -166,36 +166,17 @@ def _format_candidates(entries: list[CorpEntry], query: str) -> str:
 @safe_tool
 @track_metrics("search_company")
 async def search_company(query: str, listed_only: bool = True) -> str:
-    """기업검색 / 식별자 변환 디스패치 — 종목명·6자리 종목코드·8자리 corp_code 무엇이든
-    받아서 corp_code + stock_code + 기업개황을 반환.
+    """기업검색 / 식별자 변환 디스패치 — 종목명·6자리 종목코드·8자리 corp_code 무엇이든 받아 corp_code + stock_code + 기업개황 반환.
 
-    DART의 모든 후속 API는 8자리 corp_code를 입력으로 받습니다. 그래서 이 도구는
-    워크플로우의 **첫 번째 디스패치**로 자주 쓰입니다.
+    DART 후속 API는 모두 8자리 corp_code를 입력으로 받으므로, 워크플로우 첫 디스패치로 자주 쓰임.
+    종목명/6자리 코드만 알 때 corp_code 확보용. 8자리 숫자는 (종목코드 6자리와 달리) corp_code로 가정.
 
-    ## 언제 이 도구를 부르나
-
-    1. **사용자가 8자리 숫자 식별자를 줬는데 시스템 출처가 모호할 때** — 한국 주식
-       종목코드는 6자리이므로 8자리 숫자는 corp_code일 가능성이 높습니다. 다른 MCP
-       (예: stocklens)가 6자리만 받아서 처리 못 할 때, 이 도구로 corp_code를 풀면
-       응답에 stock_code(6자리)가 같이 나와 다른 MCP에 위임할 수 있습니다.
-    2. 종목명("삼성전자")만 받고 후속 DART 도구를 호출해야 할 때.
-    3. 6자리 종목코드를 받고 corp_code가 필요할 때 (DART 도구 호출 전).
-    4. 회사 기본정보(대표자, 시장구분, 주소, 사업자번호 등)가 필요할 때.
-
-    ## 입력 자동 판정
-
-    - 8자리 숫자 → corp_code lookup
-    - 6자리 영숫자 → stock_code lookup
-    - 그 외 → 종목명 검색 (정확/부분 일치)
+    입력 자동 판정:
+        8자리 숫자 → corp_code / 6자리 영숫자 → stock_code / 그 외 → 종목명 검색(정확·부분)
 
     Args:
         query: 종목명, 6자리 종목코드, 또는 8자리 corp_code.
         listed_only: True면 상장사만 (기본). 비상장 자회사도 포함하려면 False.
-
-    Returns:
-        - 단일 매칭: corp_code + stock_code + 기업개황(대표자/설립일/시장구분/주소 등).
-        - 다중 매칭: 후보 리스트 (사용자에게 확인 요청).
-        - 매칭 없음: 안내 메시지.
     """
     q = (query or "").strip()
     if not q:
@@ -348,22 +329,17 @@ async def list_disclosures(
 ) -> str:
     """공시목록 — DART에 접수된 공시 리스트를 기간·유형으로 필터링.
 
-    특정 회사 공시를 보려면 corp_code(8자리) 필수. 종목명/종목코드만 안다면 먼저
-    `search_company`로 corp_code를 확정하세요. corp_code를 생략하면 전체 회사 공시.
+    특정 회사 공시는 corp_code(8자리) 필수. 종목명/코드만 알면 먼저 search_company로 확정.
+    corp_code 생략 시 전체 회사 공시. (rcept_no는 후속 도구 입력값)
 
     Args:
         corp_code: DART 8자리 고유번호 (선택). 생략 시 전체회사 공시.
-        days: 오늘 기준 최근 N일 (기본 30, 최대 3650). bgn_de/end_de를 주면 무시.
-        kind: 공시유형 필터.
-            "all"(전체) / "regular"(정기-사업/반기/분기) / "material"(주요사항) /
-            "issuance"(발행) / "ownership"(지분) / "audit"(외부감사) / "exchange"(거래소)
-            한글 라벨("정기", "지분") 또는 DART 원시 코드(A~J)도 가능.
-        limit: 반환 건수 (기본 20, 최대 100). DART 페이지 사이즈에 매핑.
+        days: 오늘 기준 최근 N일 (기본 30, 최대 3650). bgn_de/end_de 주면 무시.
+        kind: 공시유형. "all"/"regular"(정기)/"material"(주요사항)/"issuance"(발행)/
+            "ownership"(지분)/"audit"(외부감사)/"exchange"(거래소). 한글 라벨·DART 코드(A~J)도 가능.
+        limit: 반환 건수 (기본 20, 최대 100).
         bgn_de: 시작일 YYYYMMDD (선택, days보다 우선).
         end_de: 종료일 YYYYMMDD (선택, days보다 우선).
-
-    Returns:
-        마크다운 표 — 접수일/회사/보고서명/rcept_no/비고. rcept_no는 후속 도구 입력값.
     """
     cc = normalize_corp_code(corp_code) if corp_code is not None else None
     pblntf_ty = _resolve_kind(kind)
@@ -764,20 +740,16 @@ async def get_full_financial(
 ) -> str:
     """전체 재무제표 — 정기보고서의 모든 계정과목.
 
-    행이 많으므로 (사업보고서 손익만 30~70행, 전체는 200+) **반드시 sj_div로 한 표만 골라
-    호출**하세요. sj_div를 비우면 행 수만 요약하고 표는 안 줍니다 (토큰 절약).
+    행이 많으므로 (손익만 30~70행, 전체 200+) **반드시 sj_div로 한 표만 골라 호출**.
+    sj_div를 비우면 구분별 행 수만 요약하고 표는 안 줌 (토큰 절약).
 
     Args:
         corp_code: DART 8자리 고유번호.
         bsns_year: 사업연도 4자리.
         reprt_code: "annual" / "Q1" / "H1" / "Q3" 또는 한글.
         fs_div: "CFS"(연결, 기본) 또는 "OFS"(별도).
-        sj_div: "BS"(재무상태표) / "IS"(손익계산서) / "CIS"(포괄손익) / "CF"(현금흐름표) / "SCE"(자본변동표).
+        sj_div: "BS"(재무상태표)/"IS"(손익)/"CIS"(포괄손익)/"CF"(현금흐름)/"SCE"(자본변동).
             None이면 표 대신 구분별 행 수만 반환.
-
-    Returns:
-        sj_div 지정 시: 마크다운 표 (당기/전기/(전전기) 비교).
-        sj_div None 시: sj_div별 행 수 요약 + 재호출 예시.
     """
     cc = normalize_corp_code(corp_code)
     yr = normalize_bsns_year(bsns_year)
@@ -1168,31 +1140,16 @@ def _format_find_results(
 @safe_tool
 @track_metrics("get_disclosure_detail")
 async def get_disclosure_detail(rcept_no: str, find: str | None = None) -> str:
-    """공시본문 — rcept_no로 공시 원문을 조회. 보고서 길이에 따라 자동 분기.
+    """공시본문 — rcept_no로 공시 원문 조회. 보고서 길이에 따라 자동 분기.
 
-    ## 동작 분기
-
-    1. **find 인자 있음** — 키워드 검색 모드 (길이 무관):
-       본문에서 keyword를 case-insensitive로 찾아 매치 주변 ±300자씩 최대 5건 반환.
-       예: find="신사업", find="배당금", find="주요 제품"
-       → 긴 보고서에서 특정 정보만 효율적으로 추출.
-    2. **짧은 공시** (본문 ≤ 8000자): 본문 최대 3000자 발췌 + viewer URL.
-       대량보유·임원 매매·단일계약 등 대부분 공시.
-    3. **긴 보고서** (본문 > 8000자): 본문 생략. 제목 추정 + zip 파일 목록 + viewer URL +
-       find 사용 안내. 사업/반기/분기/감사 보고서가 여기 해당 — 본문이 수십~수백 페이지라
-       전체를 토큰에 박으면 context 낭비.
-
-    ## 자주 쓰는 패턴
-
-    - 단순 본문 보기: `get_disclosure_detail(rcept_no)` — 짧은 공시면 발췌, 긴 보고서면 인덱스
-    - 긴 보고서에서 키워드: `get_disclosure_detail(rcept_no, find="신사업")`
+    - find 인자 있음: 키워드 검색 모드 — 본문에서 키워드 주변 발췌 최대 5건. 긴 보고서에서 특정 정보만 추출.
+      예: find="신사업", find="배당금"
+    - 짧은 공시: 본문 발췌 + viewer URL (대량보유·임원매매·단일계약 등)
+    - 긴 보고서(사업/반기/분기/감사): 본문 생략, 제목+파일목록+viewer URL. 전체를 토큰에 박으면 낭비라 find로 좁혀 쓰기.
 
     Args:
         rcept_no: DART 공시 접수번호 14자리 (list_disclosures 결과에서 얻음).
         find: 본문 검색 키워드 (선택). 지정 시 키워드 검색 모드.
-
-    Returns:
-        분기별 포맷팅된 마크다운 — viewer URL은 항상 포함.
     """
     no = normalize_rcept_no(rcept_no)
     raw = await _fetch_document_zip(no)
@@ -1356,40 +1313,21 @@ async def scan_earnings_season(
     fs_div: str = "CFS",
     group_by: str | None = None,
 ) -> str:
-    """분기/연간 실적 스캐닝. fnlttMultiAcnt 다중회사 API로 유니버스 전체의 당기·전년동기
-    핵심계정을 일괄 조회한 뒤 YoY 계산, 정렬·필터해 top_n만 마크다운 테이블로 반환.
+    """분기/연간 실적 스캐닝 — 유니버스 전체의 당기·전년동기 핵심계정을 일괄 조회해 YoY 계산·정렬 후 top_n을 마크다운 표로 반환.
 
-    "이번 분기 실적 다 뒤져서 두드러진 회사 추려줘"를 한 번의 호출로 처리합니다.
-    get_major_accounts/get_full_financial 단건 fan-out 대신 이걸 쓰세요. 결과의
-    corp_code로 후속 단건 도구(get_full_financial 등)를 호출하면 됩니다.
-    결과의 공시일은 회사별 DART 접수일입니다. 주가·수급 반응을 보려면
-    마감일 일괄 기준이 아니라 각 행의 공시일을 StockLens event_date로 넘기세요.
+    "이번 분기 실적 다 뒤져서 두드러진 회사 추려줘"를 한 번에 처리. get_major_accounts/get_full_financial
+    단건 fan-out 대신 사용. 결과의 corp_code로 후속 단건 도구 호출. 각 행 공시일은 회사별 DART 접수일 —
+    주가·수급 반응은 그 공시일을 StockLens event_date로 넘김(마감일 일괄 아님).
 
     Args:
-        period: "YYYYQ1"(1분기) / "YYYYH1"(반기) / "YYYYQ3"(3분기) / "YYYY"(연간).
-                Q2/Q4/H2는 정기보고서가 없어 v1 미지원 — ValueError(v2 잠정실적과 함께).
-        universe: "all"(상장사 전체), "kospi"/"kosdaq"(KRX 시장구분으로 필터 —
-                매핑 fetch 실패 시에만 전체 폴백 + footer 경고), 또는 corp_code 콤마 리스트.
-        sort_by: rev_yoy/op_yoy/ni_yoy(전년동기 대비 %), op_margin(영업이익률),
-                rev/op/ni(절댓값). 기본 op_yoy.
-        direction: desc / asc. 결측(N/A)은 방향 무관 항상 맨 뒤.
-                group_by="sector"일 땐 영익증가비율 정렬의 방향.
-        top_n: 1~100. 기본 30. (group_by="sector"면 섹터 개수 상한)
-        fs_div: "CFS"(연결, 기본) / "OFS"(별도). v1은 OFS 폴백 없음.
-        group_by: None(기본)이면 종목별 표(주요제품 컬럼 포함). "sector"면
-                KSIC 업종별 집계 — 회사수·영익증가비율·흑전비율·영익/매출
-                YoY **중앙값**(이상치 면역). 영익증가비율 desc 정렬.
-                "어느 섹터가 전반적으로 잘 나왔나"용. 영익증가비율(작년比
-                영익 증가)과 흑전비율(적자→흑자)은 다른 시그널 — 후자만으론
-                이미 흑자인 우량 업종이 0%로 묻힘. 단 테마(원전·AI반도체
-                등)는 KSIC를 가로질러 안 잡힘 — 개별 종목·사업보고서로 확인.
-
-    Returns:
-        group_by=None: 순위|회사(corp_code)|공시일(rcept_no)|주요제품|매출|
-        매출YoY|영업이익|OP YoY|순이익|NI YoY|OP 마진|비고(흑전/적전).
-        group_by="sector": 순위|섹터(KSIC)|회사수|영익↑비율|흑전|흑전비율|
-        영익YoY중앙|매출YoY중앙. 헤더에 모집단/유효수, footer에 결측·캐시·
-        API 통계와 시간축 주의사항.
+        period: "YYYYQ1"/"YYYYH1"/"YYYYQ3"/"YYYY"(연간). Q2/Q4/H2는 정기보고서 없어 미지원.
+        universe: "all"/"kospi"/"kosdaq" 또는 corp_code 콤마 리스트. 기본 kospi.
+        sort_by: rev_yoy/op_yoy/ni_yoy(YoY %), op_margin, rev/op/ni(절댓값). 기본 op_yoy.
+        direction: desc/asc. 결측(N/A)은 항상 맨 뒤.
+        top_n: 1~100, 기본 30. (group_by="sector"면 섹터 개수 상한)
+        fs_div: "CFS"(연결, 기본)/"OFS"(별도).
+        group_by: None이면 종목별 표. "sector"면 KSIC 업종별 집계(회사수·영익증가비율·흑전비율·
+                YoY 중앙값, 영익증가비율 desc). 테마(원전·AI반도체 등)는 KSIC로 안 잡힘.
     """
     return await run_scan(
         period=period,
@@ -1415,26 +1353,19 @@ async def export_earnings_scan(
     amount_unit: str = "eok",
     fs_div: str = "CFS",
 ) -> str:
-    """실적 스캔 파일 생성 — `scan_earnings_season` 결과를 정렬/필터 가능한
-    스프레드시트 파일로 저장합니다.
+    """실적 스캔 파일 생성 — scan_earnings_season 결과를 스프레드시트 파일로 저장.
 
-    한국어 Excel에서는 CSV 구분자/따옴표 환경 차이로 주요제품 같은 쉼표 포함
-    텍스트가 열 밀림을 만들 수 있으므로, 기본값은 XLSX입니다. CSV는 복사용
-    보조 산출물로 제공합니다.
+    한국어 Excel의 CSV 구분자 문제로 쉼표 포함 텍스트가 열 밀림을 만들 수 있어 기본값은 XLSX.
 
     Args:
-        period: "YYYYQ1" / "YYYYH1" / "YYYYQ3" / "YYYY".
-        universe: "all", "kospi", "kosdaq", 또는 corp_code 콤마 리스트.
+        period: "YYYYQ1"/"YYYYH1"/"YYYYQ3"/"YYYY".
+        universe: "all"/"kospi"/"kosdaq" 또는 corp_code 콤마 리스트.
         sort_by: rev_yoy/op_yoy/ni_yoy/op_margin/rev/op/ni.
-        direction: desc / asc.
-        max_rows: 저장할 최대 데이터 행 수. 기본 1000, 최대 3000.
-        output_format: "xlsx"(기본) / "csv" / "both".
-        amount_unit: "eok"(기본, 억원 숫자) / "won"(원 숫자).
-        fs_div: "CFS"(연결, 기본) / "OFS"(별도).
-
-    Returns:
-        생성된 파일 경로와 `N행 × 16열` 검증 결과. 파일은
-        `~/.dartlens/exports` 아래에 저장됩니다.
+        direction: desc/asc.
+        max_rows: 저장 최대 행 수. 기본 1000, 최대 3000.
+        output_format: "xlsx"(기본)/"csv"/"both".
+        amount_unit: "eok"(억원, 기본)/"won"(원).
+        fs_div: "CFS"(연결, 기본)/"OFS"(별도).
     """
     result = await run_export(
         period=period,
