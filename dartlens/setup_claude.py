@@ -28,13 +28,20 @@ from pathlib import Path
 import httpx
 
 from dartlens import _keyring as keyring_helper
+from dartlens import diagnostics
+from dartlens import licensing
 
 SERVER_KEY = "dartlens"
 LEGACY_KEYS: list[str] = ["dart-mcp"]
 
-# 검증용: 삼성전자(00126380) — DART에 항상 존재하는 안정적 corp_code
-_VALIDATE_URL = "https://opendart.fss.or.kr/api/company.json"
-_VALIDATE_CORP_CODE = "00126380"
+
+class SetupError(Exception):
+    """비대화형(--non-interactive/--json) 경로의 실패. print/sys.exit 대신 이걸 던진다."""
+
+    def __init__(self, error_code: str, message: str):
+        self.error_code = error_code
+        self.message = message
+        super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
@@ -67,16 +74,12 @@ def _prompt_for_key() -> str:
 
 
 async def _validate_key_async(api_key: str) -> tuple[bool, str]:
+    """DART 라이트 엔드포인트 1회 호출로 키를 검증. HTTP 메커니즘은 diagnostics 모듈과 공유."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                _VALIDATE_URL,
-                params={"crtfc_key": api_key, "corp_code": _VALIDATE_CORP_CODE},
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        status = str(data.get("status", "")).strip()
-        if status == "000":
+        status, data = await diagnostics.check_dart_key_online(api_key)
+        if status in diagnostics.SUCCESS_CODES:
+            if status == "013":
+                return True, "검증 성공 (조회 결과 없음)"
             corp_name = data.get("corp_name", "(unknown)")
             return True, f"검증 성공 — {corp_name}"
         return False, f"DART 응답 [{status}]: {data.get('message', '알 수 없는 오류')}"
@@ -347,6 +350,108 @@ def configure(
 
 
 # ---------------------------------------------------------------------------
+# 비대화형 경로 (Manager 등 --json/--non-interactive) — print/sys.exit 없는 순수 로직
+# ---------------------------------------------------------------------------
+
+def _write_config_entry(config_path: Path, *, api_key: str, command: str, plaintext: bool) -> dict:
+    """`_configure_one_target`의 출력-없는 버전. stdout에는 최종 JSON 한 줄만 나가야 하므로
+    backup/legacy 제거/entry 기록을 조용히 수행한다."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config: dict = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            backup = config_path.with_suffix(".json.backup")
+            with open(backup, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            config = {}
+
+    config.setdefault("mcpServers", {})
+    for legacy in LEGACY_KEYS:
+        config["mcpServers"].pop(legacy, None)
+
+    entry = resolve_server_entry(command)
+    if plaintext:
+        entry["env"] = {"DART_API_KEY": api_key}
+
+    config["mcpServers"][SERVER_KEY] = entry
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    return entry
+
+
+def run_setup_noninteractive(
+    *,
+    api_key: str,
+    targets: list[str],
+    command: str = "dartlens",
+    plaintext_consent: bool = False,
+) -> dict:
+    """`--non-interactive`/`--json` 진입점의 순수 로직. print/sys.exit 없음 — 실패 시 SetupError.
+
+    Manager 계약: 반환 dict는 항상 `api_key_saved` 키를 쓴다 (`license_activated`와 혼용 안 함).
+    """
+    key = (api_key or "").strip()
+    if not key:
+        raise SetupError(diagnostics.DART_API_KEY_MISSING, "DART API 키가 비어 있습니다.")
+
+    if licensing.looks_like_license_shape(key):
+        raise SetupError(diagnostics.DART_API_KEY_INVALID, licensing.CROSS_HINT_LICENSE_IN_API_KEY_FIELD)
+
+    try:
+        status, data = asyncio.run(diagnostics.check_dart_key_online(key))
+    except httpx.TimeoutException:
+        raise SetupError(diagnostics.DART_NETWORK_UNREACHABLE, "DART 서버 응답이 지연되고 있습니다 (타임아웃).")
+    except httpx.ConnectError:
+        raise SetupError(diagnostics.DART_NETWORK_UNREACHABLE, "DART 서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.")
+    except httpx.HTTPError as e:
+        raise SetupError(diagnostics.DART_NETWORK_UNREACHABLE, f"네트워크 오류: {type(e).__name__}")
+
+    if status in diagnostics.RATE_LIMIT_CODES:
+        raise SetupError(
+            diagnostics.DART_API_RATE_LIMITED,
+            f"DART 요청 제한에 도달했습니다 (응답 {status}). 키는 정상일 수 있습니다 — 잠시 후 다시 시도하세요.",
+        )
+    if status in diagnostics.SERVICE_ISSUE_CODES:
+        raise SetupError(
+            diagnostics.DART_NETWORK_UNREACHABLE,
+            f"DART 서비스 자체 문제로 보입니다 (응답 {status}). 키 문제가 아닙니다.",
+        )
+    if status not in diagnostics.SUCCESS_CODES:
+        raise SetupError(
+            diagnostics.DART_API_KEY_INVALID,
+            f"DART가 키를 거부했습니다 (응답 {status}: {data.get('message', '알 수 없는 오류')}).",
+        )
+
+    plaintext = False
+    storage = "os-keychain"
+    try:
+        keyring_helper.save(key)
+    except keyring_helper.KeyringUnavailableError as e:
+        if not plaintext_consent:
+            raise SetupError(
+                diagnostics.DART_API_KEY_STORAGE_FAILED,
+                f"OS 키체인을 사용할 수 없습니다: {e} 평문 저장에 동의하려면 --plaintext 를 추가하세요.",
+            )
+        plaintext = True
+        storage = "plaintext-config"
+
+    for target in targets:
+        path_func, _label = TARGETS[target]
+        _write_config_entry(path_func(), api_key=key, command=command, plaintext=plaintext)
+
+    return {
+        "api_key_saved": True,
+        "storage": storage,
+        "targets": list(targets),
+        "key_tail_masked": licensing.mask_tail(key),
+        "validated_online": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -379,7 +484,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--plaintext",
         action="store_true",
-        help="OS 키체인 대신 config env에 키를 평문 저장 (헤드리스 환경 fallback).",
+        help=(
+            "OS 키체인 대신 config env에 키를 평문 저장 (헤드리스 환경 fallback). "
+            "--non-interactive 모드에서는 키체인 실패 시 평문 저장에 동의한다는 의미도 겸한다."
+        ),
+    )
+    p.add_argument(
+        "--api-key-stdin",
+        action="store_true",
+        help="DART API 키를 위치인자/환경변수 대신 stdin에서 읽음 (argv/프로세스 목록 노출 방지).",
+    )
+    p.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="프롬프트 없이 즉시 성공/실패 (Manager 등 자동화용). 재시도 루프 없음.",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="사람용 출력 대신 JSON 결과 한 줄만 stdout에 출력. --non-interactive를 암시.",
     )
     return p
 
@@ -469,7 +592,11 @@ def _decide_plaintext_mode(explicit_flag: bool) -> bool:
     3. Windows/macOS → False (DPAPI/Keychain 신뢰)
     4. Linux: keyring.get_password 를 짧은 timeout 으로 찔러봐서:
        - 응답 있음 → False (키체인 정상)
-       - 응답 없음/예외 → True (안내 출력 후 자동 평문)
+       - 응답 없음/예외 → tty면 y/N으로 명시적 동의를 구함(동의해야만 True).
+         동의 안 함/비tty → False로 반환해 실제 keychain 저장을 시도하게 두고,
+         거기서 다시 실패하면 기존 KeyringUnavailableError → SystemExit(2) 안내
+         (--plaintext 재실행)로 자연스럽게 떨어진다. 동의 없이 평문으로
+         자동 전환하지 않는다.
 
     DISPLAY env 휴리스틱은 RasPi OS Desktop 같은 케이스(DISPLAY 는 있지만 실제
     SecretService 는 잠금)를 못 잡아내므로 실제 응답성 측정으로 대체.
@@ -487,26 +614,70 @@ def _decide_plaintext_mode(explicit_flag: bool) -> bool:
         print("  [OK] Keychain responsive — using OS keychain mode")
         return False
 
-    print("  [INFO] OS 키체인이 응답하지 않아 평문 모드로 자동 전환합니다.")
-    print("         (헤드리스 SSH/RaspberryPi 등 GUI 세션 없는 Linux 에서는 정상)")
-    print("         키는 config JSON 의 env 항목에 저장되므로 파일 권한을 닫아주세요:")
-    for path in (
-        Path.home() / ".claude.json",
-        Path.home() / ".config" / "Claude" / "claude_desktop_config.json",
-    ):
-        if path.exists() or path.parent.exists():
-            print(f"             chmod 600 {path}")
-    print("         키체인을 강제로 시도하려면: DARTLENS_NO_PLAINTEXT=1 dartlens-setup")
-    return True
+    print("  [WARN] OS 키체인이 응답하지 않습니다 (헤드리스 SSH/RaspberryPi 등에서 흔함).")
+    print("         동의 없이 평문 저장으로 자동 전환하지 않습니다 — 아래에서 직접 결정하세요.")
+
+    if sys.stdin.isatty():
+        try:
+            ans = input(
+                "  평문 모드(키가 config JSON에 그대로 저장됨)로 진행하는 데 동의하십니까? (y/N) ▸ "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans == "y":
+            print("  [OK] 평문 모드에 동의함 — config JSON 의 env 항목에 저장합니다.")
+            for path in (
+                Path.home() / ".claude.json",
+                Path.home() / ".config" / "Claude" / "claude_desktop_config.json",
+            ):
+                if path.exists() or path.parent.exists():
+                    print(f"         저장 후 파일 권한을 닫아주세요: chmod 600 {path}")
+            return True
+
+    print("  [INFO] 평문 저장에 동의하지 않아 키체인 저장을 그대로 시도합니다.")
+    print("         (실패하면 명시적으로 --plaintext 를 붙여 재실행하라는 안내가 나옵니다)")
+    return False
 
 
 def main() -> None:
+    # 파이프/리다이렉트로 stdout이 콘솔이 아니게 되면 Windows는 cp949 등 로캘 코드페이지로
+    # 떨어져 em-dash 같은 문자에서 UnicodeEncodeError가 난다. Manager가 --json 출력을
+    # 파이프로 읽는 게 기본 사용 패턴이라 이 reconfigure가 없으면 JSON 계약 자체가 깨진다.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    args = _build_parser().parse_args()
+    targets = _resolve_targets(args.target)
+
+    if args.json or args.non_interactive:
+        api_key = (
+            sys.stdin.read().strip()
+            if args.api_key_stdin
+            else (args.api_key or os.environ.get("DART_API_KEY", "")).strip()
+        )
+        try:
+            result = run_setup_noninteractive(
+                api_key=api_key,
+                targets=targets,
+                command=args.command,
+                plaintext_consent=args.plaintext,
+            )
+            code = 0
+        except SetupError as e:
+            result = {"api_key_saved": False, "error_code": e.error_code, "message": e.message}
+            code = 2
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(result.get("message") or ("완료" if result.get("api_key_saved") else "실패"), file=sys.stderr)
+        sys.exit(code)
+
     print("==============================================")
     print("  dartlens — MCP Setup")
     print("==============================================")
 
-    args = _build_parser().parse_args()
-    targets = _resolve_targets(args.target)
     target_labels = ", ".join(TARGETS[t][1] for t in targets)
     print(f"  Targets: {target_labels}")
 

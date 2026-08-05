@@ -12,9 +12,13 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
 import sys
 from pathlib import Path
+
+from dartlens._error_codes import DARTLENS_LICENSE_INVALID, DARTLENS_LICENSE_MISSING
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -63,6 +67,53 @@ def _decode(key_str: str) -> bytes:
     s = key_str.strip().upper().replace("-", "").replace(" ", "")
     s += "=" * ((8 - len(s) % 8) % 8)
     return base64.b32decode(s)
+
+
+# ---------------------------------------------------------------------------
+# 키 형태 판별 — DART API 키 ↔ DartLens 라이선스 키 혼동 감지 (교차 안내용)
+#
+# DART API 키는 40자리 hex 문자열이라 base32 알파벳(A-Z, 2-7)에 0/1/8/9가
+# 섞여있으면 대개 디코드부터 실패한다 — 두 형식은 실질적으로 겹치지 않는다.
+# ---------------------------------------------------------------------------
+
+_DART_API_KEY_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def looks_like_dart_api_key(s: str) -> bool:
+    """DART OpenAPI 키(40자리 hex) 형태인지."""
+    return bool(_DART_API_KEY_RE.fullmatch((s or "").strip().lower()))
+
+
+def looks_like_license_shape(s: str) -> bool:
+    """상품 라이선스 키(디코드 시 74바이트: 4B 제품태그 + 6B payload + 64B 서명) 형태인지.
+
+    제품 태그/서명 유효성은 안 본다 — '이 값은 우리 라이선스 체계의 키처럼 생겼다'는
+    형태 판정만으로 교차 안내(다른 필드에 넣은 게 아닌지)를 붙이기에 충분하다.
+    """
+    try:
+        raw = _decode(s)
+    except Exception:
+        return False
+    return len(raw) == 74
+
+
+def mask_tail(value: str, keep: int = 4) -> str:
+    """마지막 keep자만 남기고 나머지는 '*'로 가림. 로그·JSON에 원문 노출 방지용."""
+    v = (value or "").strip()
+    if len(v) <= keep:
+        return "*" * len(v)
+    return "*" * 4 + v[-keep:]
+
+
+CROSS_HINT_API_KEY_IN_LICENSE_FIELD = (
+    "이 값은 DART API 키 형식입니다. API 키를 라이선스 입력란에 넣지 마세요 — "
+    "API 키는 `dartlens-setup` 으로 등록하고, 라이선스 키는 `dartlens-activate` 로 등록하세요."
+)
+
+CROSS_HINT_LICENSE_IN_API_KEY_FIELD = (
+    "이 값은 DartLens 라이선스 키 형식입니다. 라이선스 키를 API 키 입력란에 넣지 마세요 — "
+    "라이선스는 `dartlens-activate` 로 등록하고, DART API 키는 `dartlens-setup` 으로 등록하세요."
+)
 
 
 def verify_key(key_str: str) -> dict:
@@ -153,12 +204,42 @@ def _prompt_key() -> str | None:
 
 
 def activate_cli() -> None:
-    """`dartlens-activate <KEY>` 진입점. 인자가 없으면 키 입력을 안내한다."""
-    args = sys.argv[1:]
-    key = " ".join(args).strip() if args else _prompt_key()
+    """`dartlens-activate <KEY>` 진입점. 인자가 없으면 키 입력을 안내한다.
+
+    `--stdin`: 키를 stdin에서 읽음 (Manager 등 비대화형 — argv/프로세스 목록 노출 방지).
+    `--json`: 사람용 출력 대신 JSON 결과 한 줄 (`license_activated` 키. `api_key_saved`와 혼용 안 함).
+    """
+    # 파이프/리다이렉트로 stdout이 콘솔이 아니게 되면 Windows는 로캘 코드페이지(cp949 등)로
+    # 떨어져 em-dash 같은 문자에서 UnicodeEncodeError가 난다. Manager가 --json 출력을
+    # 파이프로 읽는 게 기본 사용 패턴이라 이 reconfigure가 없으면 JSON 계약이 깨진다.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    argv = sys.argv[1:]
+    json_mode = "--json" in argv
+    stdin_mode = "--stdin" in argv
+    positional = [a for a in argv if a not in ("--json", "--stdin")]
+
+    if stdin_mode:
+        key = sys.stdin.read().strip()
+    elif positional:
+        key = " ".join(positional).strip()
+    else:
+        key = _prompt_key()
 
     if not key:
-        if is_licensed():
+        licensed = is_licensed()
+        if json_mode:
+            result = (
+                {"license_activated": True}
+                if licensed
+                else {"license_activated": False, "error_code": DARTLENS_LICENSE_MISSING, "message": "라이선스 키가 입력되지 않았습니다."}
+            )
+            print(json.dumps(result, ensure_ascii=False))
+            sys.exit(0 if licensed else 1)
+        if licensed:
             print("현재 상태: 활성화됨 ✅")
             sys.exit(0)
         print("현재 상태: 미활성화 ❌\n")
@@ -167,11 +248,28 @@ def activate_cli() -> None:
 
     res = save_key(key)
     if res["valid"]:
+        if json_mode:
+            print(json.dumps(
+                {"license_activated": True, "license_id_masked": mask_tail(res["license_id"].upper())},
+                ensure_ascii=False,
+            ))
+            sys.exit(0)
         print(f"활성화 완료 ✅  (license_id: {res['license_id']})")
         print("Claude Desktop을 완전히 종료했다가 다시 켜면 DartLens 도구를 쓸 수 있습니다.")
         sys.exit(0)
+
+    cross_hint = CROSS_HINT_API_KEY_IN_LICENSE_FIELD if looks_like_dart_api_key(key) else None
+    if json_mode:
+        message = res["reason"] + (f" {cross_hint}" if cross_hint else "")
+        print(json.dumps(
+            {"license_activated": False, "error_code": DARTLENS_LICENSE_INVALID, "message": message},
+            ensure_ascii=False,
+        ))
+        sys.exit(1)
     print(f"활성화 실패 ❌  — {res['reason']}\n")
     print("· 결제 후 발송된 키를 공백 없이 정확히 붙여넣었는지 확인하세요.")
+    if cross_hint:
+        print(f"· {cross_hint}")
     if PURCHASE_URL:
         print(f"· 키 재발송·문의: {PURCHASE_URL}")
     sys.exit(1)

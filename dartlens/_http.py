@@ -128,6 +128,16 @@ async def get_json(endpoint: str, params: dict[str, Any] | None = None) -> dict:
     resp = await _request(endpoint, params=params)
     data = resp.json()
     status = str(data.get("status", "")).strip()
+
+    # dartlens_status MCP 도구용 최근 호출 기록 — 진단 부가기능이라 실패해도 본 흐름은 막지 않는다.
+    if status:
+        from dartlens._metrics import record_dart_call
+
+        try:
+            record_dart_call(status)
+        except Exception:
+            pass
+
     if status and status != "000":
         message = data.get("message") or _STATUS_MESSAGES.get(status, "알 수 없는 오류")
         raise DartApiError(status, message)

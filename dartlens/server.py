@@ -7,6 +7,7 @@ from mcp.server.fastmcp import FastMCP
 from dartlens._cache import cached
 from dartlens._corp_code import (
     CorpEntry,
+    cache_diagnosis,
     resolve_identifier,
     search_by_name,
 )
@@ -14,7 +15,8 @@ from dartlens._document_tables import extract_document_tables
 from dartlens._earnings import run_scan
 from dartlens._earnings_export import run_export
 from dartlens._http import get_bytes, get_json
-from dartlens._metrics import track_metrics
+from dartlens._metrics import read_dart_call_status, track_metrics
+from dartlens import diagnostics
 from dartlens._order_backlog import (
     OrderBacklogSeries,
     extract_order_backlog_point,
@@ -65,6 +67,7 @@ Claude가 조정자입니다.
 - `get_insider_trades`: 임원·주요주주 특정증권 소유 — 내부자 매매 시그널
 - `scan_earnings_season`: 어닝 시즌 유니버스 일괄 스캔 — 채팅용 Top N Markdown
 - `export_earnings_scan`: 어닝 시즌 스캔 결과를 XLSX/CSV 파일로 저장 — 한국 Excel은 XLSX 권장
+- `dartlens_status`: 자가진단(버전/라이선스/API 키/캐시/업데이트) — 다른 도구가 막힐 때 원인 파악용
 
 ## 워크플로우 권장
 
@@ -1378,6 +1381,100 @@ async def export_earnings_scan(
         fs_div=fs_div,
     )
     return result.to_markdown()
+
+
+# ---------------------------------------------------------------------------
+# dartlens_status — 자가진단 (라이선스 게이트 의도적 미적용, 아래 참고)
+# ---------------------------------------------------------------------------
+
+def _format_status(
+    *,
+    version: str,
+    latest_version: str | None,
+    license_diag,
+    api_diag,
+    cache_diag: dict,
+    call_status: dict,
+    checked_online: bool,
+) -> str:
+    lines = ["# DartLens 상태", ""]
+
+    update_line = f"- 버전: {version}"
+    if latest_version and latest_version != version:
+        update_line += f" (최신: {latest_version} — `uv tool upgrade dartlens-mcp` 로 업데이트 가능)"
+    elif latest_version:
+        update_line += " (최신 버전)"
+    else:
+        update_line += " (최신 버전 확인 불가 — PyPI 연결 실패)"
+    lines.append(update_line)
+
+    if license_diag.status == "active":
+        lines.append(f"- 라이선스: 활성화 (ID: {license_diag.license_id_masked})")
+    else:
+        lines.append(f"- ⚠️ 라이선스: {license_diag.message}")
+
+    api_note = " (실제 유효성 확인됨)" if checked_online else " (형식만 확인 — 실제 유효성은 check_online=True)"
+    if api_diag.status == "valid":
+        lines.append(f"- DART API 키: 정상{api_note} — {api_diag.storage}, {api_diag.key_tail_masked}")
+    elif api_diag.status in ("rate_limited", "network_unreachable"):
+        lines.append(f"- DART API 키: {api_diag.message} (일시적 문제로 보임)")
+    else:
+        lines.append(f"- ⚠️ DART API 키: {api_diag.message}")
+
+    if call_status["last_call_at"]:
+        lines.append(f"- 최근 DART 호출: {call_status['last_call_at']} (status {call_status['last_status']})")
+    else:
+        lines.append("- 최근 DART 호출: 기록 없음")
+    if call_status["last_success_at"]:
+        lines.append(f"- 최근 성공 호출: {call_status['last_success_at']}")
+
+    if cache_diag["exists"]:
+        freshness = "최신" if cache_diag["is_fresh"] else "오래됨(TTL 초과)"
+        entries = f"{cache_diag['entry_count']:,}개 기업" if cache_diag["entry_count"] is not None else "파싱 실패"
+        lines.append(f"- corp code 캐시: {entries}, {cache_diag['last_updated']} 갱신 ({freshness})")
+    else:
+        lines.append("- corp code 캐시: 없음 (첫 조회 시 자동 다운로드)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@track_metrics("dartlens_status")
+async def dartlens_status(check_online: bool = False) -> str:
+    """DartLens 자가진단 — 패키지 버전·라이선스·DART API 키·최근 DART 호출·corp code 캐시·업데이트 가능 여부를 한 번에 확인.
+
+    라이선스나 API 키가 없어도 동작한다(문제 원인을 보여주는 게 목적이라 다른 도구처럼
+    라이선스 게이트를 걸지 않음 — 재무 데이터는 전혀 포함하지 않아 게이트가 필요 없음).
+    "DartLens가 왜 안 되지" 류 질문에서 dartlens-doctor 안내 전에 먼저 호출하기 좋음.
+
+    Args:
+        check_online: True면 DART에 가벼운 엔드포인트 1회 호출해 API 키의 실제 유효성까지 확인.
+            기본 False(형식/저장소만 확인, 네트워크 호출 없음 — 빠름).
+    """
+    try:
+        license_diag = diagnostics.diagnose_license()
+        api_diag = (
+            await diagnostics.diagnose_dart_api_key_online()
+            if check_online
+            else diagnostics.diagnose_dart_api_key()
+        )
+        cache_diag = cache_diagnosis()
+        call_status = read_dart_call_status()
+        latest_version = await diagnostics.fetch_latest_pypi_version()
+
+        import dartlens as _dartlens_pkg
+
+        return _format_status(
+            version=_dartlens_pkg.__version__,
+            latest_version=latest_version,
+            license_diag=license_diag,
+            api_diag=api_diag,
+            cache_diag=cache_diag,
+            call_status=call_status,
+            checked_online=check_online,
+        )
+    except Exception as e:
+        return f"⚠️ 상태 조회 중 오류: {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------

@@ -53,6 +53,49 @@ def _sanitize_kwargs(kwargs: dict) -> dict:
     return out
 
 
+def _dart_call_status_path() -> Path:
+    return get_metrics_dir() / "dart_call_status.json"
+
+
+def record_dart_call(status: str) -> None:
+    """DART 응답 status 코드를 마지막 호출 시각과 함께 기록 — 히스토리가 아니라 최신 값만 덮어쓴다.
+
+    `dartlens_status` MCP 도구가 "최근 성공 호출 시각 / 마지막 DART status" 를 보여주는 데 쓴다.
+    쓰기 실패는 조용히 무시한다 — 진단 부가기능이 본 API 호출 흐름을 막으면 안 된다
+    (기존 track_metrics와 동일한 방어 스타일).
+    """
+    path = _dart_call_status_path()
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        existing = {}
+    existing["last_call_at"] = now
+    existing["last_status"] = status
+    if status in ("000", "013"):  # DART 성공 / 조회결과없음 — 연결 성공으로 취급
+        existing["last_success_at"] = now
+    try:
+        path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def read_dart_call_status() -> dict:
+    """record_dart_call()이 저장한 마지막 호출 상태. 기록이 없으면 모두 None."""
+    path = _dart_call_status_path()
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {
+                "last_call_at": data.get("last_call_at"),
+                "last_status": data.get("last_status"),
+                "last_success_at": data.get("last_success_at"),
+            }
+    except Exception:
+        pass
+    return {"last_call_at": None, "last_status": None, "last_success_at": None}
+
+
 def track_metrics(tool_name: str) -> Callable:
     def decorator(func: Callable[..., Awaitable[Any]]):
         @wraps(func)

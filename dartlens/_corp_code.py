@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
+import shutil
 import time
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from lxml import etree
@@ -237,3 +240,59 @@ async def resolve_identifier(identifier: str) -> CorpEntry | None:
     if len(s) == 6 and s.isalnum():
         return await lookup_by_stock_code(s)
     return None
+
+
+# ---------------------------------------------------------------------------
+# 캐시 진단 / repair (dartlens-doctor 용)
+# ---------------------------------------------------------------------------
+
+
+def cache_diagnosis() -> dict:
+    """corp code 캐시 진단 — 존재/최신성/파싱 가능 여부/기업 수/쓰기 권한.
+
+    순수 로컬 파일 I/O만 수행한다 (다운로드 없음) — doctor 기본(오프라인) 모드에서도 안전.
+    """
+    path = _cache_path()
+    info: dict = {
+        "exists": path.exists(),
+        "last_updated": None,
+        "is_fresh": False,
+        "entry_count": None,
+        "parseable": None,
+        "writable": os.access(path.parent, os.W_OK) if path.parent.exists() else False,
+    }
+    if not info["exists"]:
+        return info
+
+    info["last_updated"] = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+    info["is_fresh"] = _is_cache_fresh(path)
+    try:
+        entries = _parse_xml(path.read_bytes())
+        info["parseable"] = True
+        info["entry_count"] = len(entries)
+    except Exception:
+        info["parseable"] = False
+        info["entry_count"] = 0
+    return info
+
+
+def repair_corp_code_cache(*, yes: bool) -> dict:
+    """corp-code-cache repair — 기존 캐시를 `.bak`으로 보존한 뒤 강제 재다운로드.
+
+    yes=False면 아무 파일도 건드리지 않고 확인 필요 메시지만 반환한다 (파괴적 작업 안전장치).
+    """
+    if not yes:
+        return {"repaired": False, "message": "재다운로드하려면 --yes 플래그가 필요합니다."}
+
+    path = _cache_path()
+    if path.exists():
+        bak = path.with_suffix(path.suffix + ".bak")
+        shutil.copy2(path, bak)
+
+    try:
+        asyncio.run(ensure_loaded(force_refresh=True))
+    except Exception as e:
+        return {"repaired": False, "message": f"재다운로드 실패: {type(e).__name__}: {e}"}
+
+    diag = cache_diagnosis()
+    return {"repaired": True, "entry_count": diag["entry_count"], "last_updated": diag["last_updated"]}

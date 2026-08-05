@@ -177,6 +177,21 @@ def backend_name() -> str:
         return "unavailable"
 
 
+def backend_status() -> tuple[bool, str]:
+    """백엔드 자체의 가용성. (True, backend명) 또는 (False, 사유).
+
+    load()는 백엔드 부재/응답없음을 모두 삼켜 None을 반환하므로 "키를 등록한 적
+    없음"과 "키체인이 고장나서 못 읽음"을 구분할 수 없다. diagnostics 모듈이 이
+    함수로 후자(DART_API_KEY_STORAGE_FAILED)를 전자(DART_API_KEY_MISSING)와
+    구분한다.
+    """
+    try:
+        backend = _get_backend()
+        return True, type(backend.get_keyring()).__name__
+    except KeyringUnavailableError as e:
+        return False, str(e)
+
+
 def is_responsive(timeout_sec: int = 2) -> bool:
     """짧은 타임아웃으로 keyring 의 실제 응답성을 검증.
 

@@ -4,10 +4,36 @@ from __future__ import annotations
 
 import functools
 import os
+import sys
 
 import httpx
 
 from dartlens.licensing import is_licensed, LOCKED_MESSAGE
+
+
+def _support_hint() -> str:
+    """safe_tool 의 '예상 못한 오류' 버킷에서만 붙이는 자가진단 안내.
+
+    이미 원인이 명확한 예외(라이선스/API키/타임아웃/연결오류 등)엔 안 붙인다 — 사소한
+    것까지 문의로 유도하면 노이즈만 늘어난다. sys.platform 은 이 프로세스가 실제 도는
+    OS라 Mac/Win 명령을 헷갈릴 일 없이 바로 골라 보여줄 수 있다.
+    """
+    if sys.platform == "darwin":
+        log_cmd = "cd ~/Library/Logs/Claude && zip -r ~/Desktop/claude_logs.zip . && open ~/Desktop"
+    elif sys.platform == "win32":
+        log_cmd = (
+            'powershell -c "Compress-Archive $env:APPDATA\\Claude\\logs\\* '
+            '$env:USERPROFILE\\Desktop\\claude_logs.zip -Force; explorer $env:USERPROFILE\\Desktop"'
+        )
+    else:
+        log_cmd = None
+    hint = "\n\n계속되면:\n1) Claude 완전 종료 후 재시작 → 다시 시도"
+    if log_cmd:
+        hint += (
+            "\n2) 그래도 안 되면 아래 명령으로 로그를 모아서 osy980315@gmail.com 으로 "
+            f"보내주세요\n   {log_cmd}"
+        )
+    return hint
 
 
 class DartApiError(Exception):
@@ -77,6 +103,7 @@ def safe_tool(func):
             return (
                 f"⚠️ 처리 중 오류: {type(e).__name__}: {e}\n"
                 f"입력값(종목코드/corp_code/날짜)을 다시 확인해주세요."
+                + _support_hint()
             )
 
     return wrapper
