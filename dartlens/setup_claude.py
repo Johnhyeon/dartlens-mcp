@@ -3,7 +3,7 @@
 Run `dartlens-setup` after `pip install dartlens-mcp`.
 
 기본 동작 (권장):
-    1. 키 입력받기 (인자 / 대화형 / DART_API_KEY env fallback)
+    1. 키 입력받기 (인자 / DART_API_KEY env / 키체인에 이미 저장된 키 재사용 / 대화형)
     2. DART에 1회 호출해 키 유효성 검증 (삼성전자 corp_code 기준)
     3. 키를 OS 키체인에 저장 (Windows DPAPI / macOS Keychain / Secret Service)
     4. claude_desktop_config.json의 mcpServers.dartlens 엔트리 등록 — env에는 키를 두지 않음
@@ -395,6 +395,10 @@ def run_setup_noninteractive(
     """
     key = (api_key or "").strip()
     if not key:
+        # 명시적으로 준 키가 없으면 키체인에 이미 등록된 키를 재사용 시도 — 타겟 재등록/
+        # 마이그레이션 목적의 재실행(예: legacy 엔트리 정리)에서 매번 재입력을 요구하지 않는다.
+        key = (keyring_helper.load() or "").strip()
+    if not key:
         raise SetupError(diagnostics.DART_API_KEY_MISSING, "DART API 키가 비어 있습니다.")
 
     if licensing.looks_like_license_shape(key):
@@ -536,6 +540,29 @@ def _resolve_targets(arg: str) -> list[str]:
 
 
 _MAX_KEY_ATTEMPTS = 3
+
+
+def _try_reuse_stored_key() -> str | None:
+    """키체인에 이미 저장된 키가 있으면 재입력 없이 재사용을 시도한다.
+
+    dartlens-setup을 "새 키 등록"이 아니라 "타겟 재등록/마이그레이션" 목적으로 다시
+    돌리는 흔한 케이스(예: legacy `dart-mcp` 엔트리를 `dartlens`로 정리)에서, 예전에
+    등록한 키를 사용자가 기억 못 해도 막히지 않게 한다. 검증까지 1회 거친 뒤 성공한
+    키만 반환 — 없거나 검증 실패면 None을 반환해 호출자가 기존 프롬프트 흐름으로
+    자연스럽게 폴백하게 한다.
+    """
+    stored = (keyring_helper.load() or "").strip()
+    if not stored:
+        return None
+    print()
+    print("  이미 등록된 DART API 키를 키체인에서 발견했습니다 — 재입력 없이 재사용을 시도합니다.")
+    ok, msg = validate_key(stored)
+    if ok:
+        print(f"  [OK] {msg}")
+        return stored
+    print(f"  [WARN] 저장된 키 검증 실패 — {msg}")
+    print("  새 키를 입력해주세요.")
+    return None
 
 
 def _obtain_validated_key(initial_key: str, *, key_was_provided: bool) -> str:
@@ -685,8 +712,9 @@ def main() -> None:
 
     initial_key = (args.api_key or os.environ.get("DART_API_KEY", "")).strip()
     key_was_provided = bool(initial_key)
+    reused_key = None if initial_key else _try_reuse_stored_key()
 
-    api_key = _obtain_validated_key(initial_key, key_was_provided=key_was_provided)
+    api_key = reused_key or _obtain_validated_key(initial_key, key_was_provided=key_was_provided)
 
     try:
         configure(

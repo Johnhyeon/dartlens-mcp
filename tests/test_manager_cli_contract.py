@@ -52,10 +52,22 @@ class RunSetupNoninteractiveTests(unittest.TestCase):
         mock_save.assert_called_once()
         mock_write.assert_called_once()
 
-    def test_empty_key_is_missing(self):
-        with self.assertRaises(setup_claude.SetupError) as ctx:
-            setup_claude.run_setup_noninteractive(api_key="   ", targets=[])
+    def test_empty_key_is_missing_when_nothing_stored(self):
+        with patch.object(setup_claude.keyring_helper, "load", return_value=None):
+            with self.assertRaises(setup_claude.SetupError) as ctx:
+                setup_claude.run_setup_noninteractive(api_key="   ", targets=[])
         self.assertEqual(ctx.exception.error_code, diagnostics.DART_API_KEY_MISSING)
+
+    def test_empty_key_reuses_stored_keychain_key(self):
+        """키를 안 줘도 키체인에 이미 저장된 키가 있으면 재입력 없이 그걸로 진행한다."""
+        with self._patch_online("000", {"corp_name": "삼성전자"}), \
+             patch.object(setup_claude.keyring_helper, "load", return_value="a" * 40), \
+             patch.object(setup_claude.keyring_helper, "save", return_value="MockBackend") as mock_save, \
+             patch.object(setup_claude, "_write_config_entry") as mock_write:
+            result = setup_claude.run_setup_noninteractive(api_key="", targets=["claude-desktop"])
+        self.assertTrue(result["api_key_saved"])
+        mock_save.assert_called_once_with("a" * 40)
+        mock_write.assert_called_once()
 
     def test_license_key_in_api_field_rejected_before_network_call(self):
         fake_license = _fake_license_shaped_key()
@@ -107,6 +119,25 @@ class RunSetupNoninteractiveTests(unittest.TestCase):
         mock_write.assert_called_once()
         _, kwargs = mock_write.call_args
         self.assertTrue(kwargs["plaintext"])
+
+
+class TryReuseStoredKeyTests(unittest.TestCase):
+    """대화형 dartlens-setup이 키체인에 이미 저장된 키를 재입력 없이 재사용하는 경로."""
+
+    def test_returns_none_when_nothing_stored(self):
+        with patch.object(setup_claude.keyring_helper, "load", return_value=None):
+            self.assertIsNone(setup_claude._try_reuse_stored_key())
+
+    def test_returns_key_when_stored_key_validates(self):
+        with patch.object(setup_claude.keyring_helper, "load", return_value="a" * 40), \
+             patch.object(setup_claude, "validate_key", return_value=(True, "검증 성공 — 삼성전자")):
+            self.assertEqual(setup_claude._try_reuse_stored_key(), "a" * 40)
+
+    def test_returns_none_when_stored_key_fails_validation(self):
+        """저장된 키가 더 이상 유효하지 않으면 재사용을 포기하고 프롬프트로 폴백하도록 None."""
+        with patch.object(setup_claude.keyring_helper, "load", return_value="a" * 40), \
+             patch.object(setup_claude, "validate_key", return_value=(False, "DART 응답 [010]: 등록되지 않은 키")):
+            self.assertIsNone(setup_claude._try_reuse_stored_key())
 
 
 class ActivateCliTests(unittest.TestCase):
