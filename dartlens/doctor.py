@@ -487,10 +487,10 @@ def _corp_cache_check_from_diag(diag: dict) -> Check:
     c = Check("Corp Code Cache")
 
     if not diag["exists"]:
-        c.warn(
-            "corp code 캐시가 아직 없습니다 (첫 조회 시 자동 다운로드됩니다)",
-            fix="dartlens-doctor --repair corp-code-cache --yes",
-        )
+        # 첫 설치엔 당연히 없고, 첫 조회 때 알아서 받는다 — 사용자가 할 일이 없는데도
+        # 경고로 잡으면 갓 설치한 사람에게 "문제 1건"으로 보인다(TelegramLens의 DB
+        # 미생성 판정과 같은 부류의 오해). 손상·권한 문제는 아래에서 계속 걸러진다.
+        c.ok("기업코드 캐시는 첫 조회 때 자동으로 받습니다 — 지금은 준비 안 돼 있어도 정상입니다")
         return c
 
     c.info(f"Last updated: {diag['last_updated']}")
