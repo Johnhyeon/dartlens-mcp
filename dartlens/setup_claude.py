@@ -193,6 +193,15 @@ def get_claude_code_config_path() -> Path:
     return Path.home() / ".claude.json"
 
 
+def get_codex_config_path() -> Path:
+    """Codex CLI의 MCP 서버 설정 — `~/.codex/config.toml`, `[mcp_servers.<name>]` 섹션.
+
+    Windows에서 실제 설치본으로 이 경로를 확인했다. macOS/Linux도 관례상 같은 경로일
+    가능성이 높으나 이 환경에서 직접 검증하지는 못했다.
+    """
+    return Path.home() / ".codex" / "config.toml"
+
+
 # 하위 호환 — 기존 import 자리 유지
 def get_config_path() -> Path:
     return get_claude_desktop_config_path()
@@ -202,6 +211,7 @@ def get_config_path() -> Path:
 TARGETS: dict[str, tuple] = {
     "claude-desktop": (get_claude_desktop_config_path, "Claude Desktop"),
     "claude-code": (get_claude_code_config_path, "Claude Code CLI"),
+    "codex": (get_codex_config_path, "Codex CLI"),
 }
 
 
@@ -254,6 +264,67 @@ def _store_api_key(api_key: str, *, plaintext: bool, env_for_entry: dict) -> dic
     return env or None
 
 
+def _toml_env_and_write(doc, *, api_key: str, command: str, plaintext: bool, existing_env: dict) -> dict:
+    """TOML 문서에 mcp_servers.dartlens 테이블을 채워 넣는다(파일 쓰기는 호출자가 함).
+    JSON 쪽 `_store_api_key`와 같은 정신 — plaintext면 env에 키를 남기고, 아니면
+    키체인에만 둔다(TOML에는 아예 env 자체를 안 만듦)."""
+    import tomlkit
+
+    entry = resolve_server_entry(command)
+    server_table = tomlkit.table()
+    server_table["command"] = entry["command"]
+    if "args" in entry:
+        server_table["args"] = entry["args"]
+    if plaintext:
+        env_table = tomlkit.table()
+        env_table["DART_API_KEY"] = api_key
+        server_table["env"] = env_table
+    doc["mcp_servers"][SERVER_KEY] = server_table
+    return entry
+
+
+def _configure_toml_target(
+    config_path: Path, label: str, *, api_key: str, command: str, plaintext: bool,
+) -> None:
+    """Codex처럼 TOML 기반인 타겟용 — tomlkit으로 다른 mcp_servers.*·주석은 보존."""
+    import tomlkit
+
+    print()
+    print(f"  → {label}")
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = tomlkit.document()
+    if config_path.exists():
+        backup = config_path.with_suffix(".toml.backup")
+        backup.write_bytes(config_path.read_bytes())
+        print(f"  [OK] Backup saved: {backup}")
+        try:
+            doc = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            print("  [WARN] Existing config is corrupted. Creating new one.")
+            doc = tomlkit.document()
+
+    if "mcp_servers" not in doc:
+        doc["mcp_servers"] = tomlkit.table()
+    for legacy in LEGACY_KEYS:
+        if legacy in doc["mcp_servers"]:
+            del doc["mcp_servers"][legacy]
+            print(f"  [OK] Removed legacy entry: {legacy}")
+
+    entry = _toml_env_and_write(doc, api_key=api_key, command=command, plaintext=plaintext, existing_env={})
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+    print(f"  [OK] Config updated (key: {SERVER_KEY})")
+    print(f"  Path:    {config_path}")
+    print(f"  Command: {entry['command']}")
+    if "args" in entry:
+        print(f"  Args:    {' '.join(entry['args'])}")
+    if plaintext:
+        print(f"  Env:     DART_API_KEY=***{api_key[-4:]} (plaintext)")
+    else:
+        print("  Env:     (none — DART_API_KEY in keychain)")
+
+
 def _configure_one_target(
     config_path: Path,
     label: str,
@@ -264,6 +335,14 @@ def _configure_one_target(
     save_key: bool,
 ) -> None:
     """단일 config 파일(Claude Desktop 또는 Claude Code)에 mcpServers.dartlens 등록."""
+    if config_path.suffix == ".toml":
+        # keyring 저장 자체는 save_key일 때 딱 한 번만 하면 되므로(여러 타겟 순회 시
+        # claude-desktop 등에서 이미 처리됨) 여기선 config 파일 갱신만 담당.
+        if save_key:
+            _store_api_key(api_key, plaintext=plaintext, env_for_entry={})
+        _configure_toml_target(config_path, label, api_key=api_key, command=command, plaintext=plaintext)
+        return
+
     print()
     print(f"  → {label}")
 
@@ -353,9 +432,36 @@ def configure(
 # 비대화형 경로 (Manager 등 --json/--non-interactive) — print/sys.exit 없는 순수 로직
 # ---------------------------------------------------------------------------
 
+def _write_config_entry_toml(config_path: Path, *, api_key: str, command: str, plaintext: bool) -> dict:
+    """`_write_config_entry`의 TOML(Codex 등) 버전 — 조용히(print 없이) 수행."""
+    import tomlkit
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = tomlkit.document()
+    if config_path.exists():
+        try:
+            doc = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            doc = tomlkit.document()
+        backup = config_path.with_suffix(".toml.backup")
+        backup.write_bytes(config_path.read_bytes())
+
+    if "mcp_servers" not in doc:
+        doc["mcp_servers"] = tomlkit.table()
+    for legacy in LEGACY_KEYS:
+        doc["mcp_servers"].pop(legacy, None)
+
+    entry = _toml_env_and_write(doc, api_key=api_key, command=command, plaintext=plaintext, existing_env={})
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    return entry
+
+
 def _write_config_entry(config_path: Path, *, api_key: str, command: str, plaintext: bool) -> dict:
     """`_configure_one_target`의 출력-없는 버전. stdout에는 최종 JSON 한 줄만 나가야 하므로
     backup/legacy 제거/entry 기록을 조용히 수행한다."""
+    if config_path.suffix == ".toml":
+        return _write_config_entry_toml(config_path, api_key=api_key, command=command, plaintext=plaintext)
+
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config: dict = {}
     if config_path.exists():
@@ -471,12 +577,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--target",
-        choices=["claude-desktop", "claude-code", "both", "auto"],
+        choices=["claude-desktop", "claude-code", "both", "auto", "codex"],
         default="auto",
         help=(
             "MCP 등록 대상. "
             "claude-desktop=Claude Desktop 앱, claude-code=Claude Code CLI, "
-            "both=둘 다, auto=환경 자동 감지 (기본: auto). "
+            "both=둘 다, auto=환경 자동 감지 (기본: auto), "
+            "codex=Codex CLI(명시적 선택만 지원, auto 감지 대상 아님). "
             "DARTLENS_TARGET 환경변수로도 지정 가능."
         ),
     )
