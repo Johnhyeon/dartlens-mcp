@@ -26,6 +26,7 @@ try:
     from dartlens.setup_claude import (
         get_claude_desktop_config_path,
         get_claude_code_config_path,
+        get_codex_config_path,
         SERVER_KEY,
         LEGACY_KEYS,
         _uv_tool_bin_dirs,
@@ -38,6 +39,7 @@ except ImportError:
     from dartlens.setup_claude import (
         get_claude_desktop_config_path,
         get_claude_code_config_path,
+        get_codex_config_path,
         SERVER_KEY,
         LEGACY_KEYS,
         _uv_tool_bin_dirs,
@@ -283,8 +285,80 @@ def check_config_code() -> Check:
     )
 
 
+def check_config_codex() -> Check:
+    return _check_config_toml_file(
+        "Codex CLI", get_codex_config_path(), required=False
+    )
+
+
+def _check_config_toml_file(label: str, config_path: Path, *, required: bool) -> Check:
+    """TOML 기반 클라이언트(Codex의 `~/.codex/config.toml`, `[mcp_servers.<key>]`)용
+    config 점검 — _check_config_file(JSON)과 같은 계약(entry 유무·command 유효성)을
+    TOML 구조에 맞춰 재구현. setup_claude._configure_toml_target()이 쓰는 것과 동일한
+    구조(mcp_servers.<SERVER_KEY> = {command, args?})를 읽기만 한다."""
+    c = Check(f"Config — {label}")
+    c.info(f"Path:       {config_path}")
+
+    if not config_path.exists():
+        if required:
+            c.fail("Config file does not exist", fix="dartlens-setup --target codex")
+        else:
+            c.info("Config file does not exist (target not in use — OK)")
+            c.status = "info-skip"
+            c.summary = "Config file does not exist (target not in use — OK)"
+        return c
+
+    try:
+        import tomlkit
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = tomlkit.parse(f.read())
+    except Exception as e:
+        c.fail(f"Cannot read config: {e}")
+        return c
+
+    servers = cfg.get("mcp_servers", {}) or {}
+    entry = servers.get(SERVER_KEY)
+
+    if not entry:
+        if required:
+            c.fail(f"'{SERVER_KEY}' entry missing in mcp_servers", fix="dartlens-setup --target codex")
+        else:
+            c.info(f"'{SERVER_KEY}' entry not present (target not in use — OK)")
+            c.status = "info-skip"
+            c.summary = f"'{SERVER_KEY}' entry not present (target not in use — OK)"
+        return c
+
+    cmd = entry.get("command")
+    args = list(entry.get("args") or [])
+    c.info(f"Command:    {cmd}")
+    if args:
+        c.info(f"Args:       {args}")
+
+    if not cmd:
+        c.fail("Entry has no 'command' field")
+        return c
+
+    if Path(cmd).is_absolute():
+        if Path(cmd).exists():
+            c.ok("Command points to existing file")
+        else:
+            c.fail(f"Command file missing: {cmd}", fix="dartlens-setup --target codex")
+    else:
+        resolved = shutil.which(cmd)
+        if resolved:
+            c.ok(f"Command resolvable via PATH: {resolved}")
+        else:
+            c.fail(
+                f"Command '{cmd}' not in PATH — client will fail to launch the server",
+                fix="dartlens-setup --target codex",
+            )
+
+    return c
+
+
 def check_at_least_one_config(*configs: Check) -> Check:
-    """두 config 모두 미등록이면 종합 fail. 하나라도 등록돼있으면 OK."""
+    """모든 config가 미등록이면 종합 fail. 하나라도 등록돼있으면 OK."""
     c = Check("Registered targets")
     registered = [
         cc for cc in configs
@@ -294,19 +368,21 @@ def check_at_least_one_config(*configs: Check) -> Check:
         c.ok(f"{len(registered)} target(s) configured")
         return c
     c.fail(
-        "dartlens not registered in any MCP client (Claude Desktop / Code)",
-        fix="dartlens-setup --target {claude-desktop|claude-code|both}",
+        "dartlens not registered in any MCP client (Claude Desktop / Code / Codex)",
+        fix="dartlens-setup --target {claude-desktop|claude-code|both|codex}",
     )
     return c
 
 
-def _registered_targets(desktop_check: Check, code_check: Check) -> list[str]:
+def _registered_targets(desktop_check: Check, code_check: Check, codex_check: Check) -> list[str]:
     """실제로 등록된 MCP 타겟 slug 목록 — Manager 공통 계약 top-level `targets` 필드용."""
     targets: list[str] = []
     if desktop_check.status == "ok" or (desktop_check.status == "warn" and "Legacy" in " ".join(desktop_check.lines)):
         targets.append("claude-desktop")
     if code_check.status == "ok" or (code_check.status == "warn" and "Legacy" in " ".join(code_check.lines)):
         targets.append("claude-code")
+    if codex_check.status == "ok":
+        targets.append("codex")
     return targets
 
 
@@ -319,6 +395,7 @@ _CHECK_IDS = {
     "command": "COMMAND_AVAILABLE",
     "config_desktop": "MCP_CONFIG_DESKTOP",
     "config_code": "MCP_CONFIG_CODE",
+    "config_codex": "MCP_CONFIG_CODEX",
     "registered_targets": "MCP_CONFIG_VALID",
     "dart_api": "DART_API_KEY",
     "license": "LICENSE_ACTIVE",
@@ -461,6 +538,7 @@ def run_diagnostics(*, online: bool = False) -> dict:
     """전체 체크를 한 번 계산. 텍스트 모드/JSON 모드가 결과를 공유 — 중복 네트워크 호출 없음."""
     desktop_check = check_config_desktop()
     code_check = check_config_code()
+    codex_check = check_config_codex()
 
     plaintext_key = _extract_plaintext_dart_key()
     if online:
@@ -483,7 +561,8 @@ def run_diagnostics(*, online: bool = False) -> dict:
         "command": check_dartlens_command(),
         "config_desktop": desktop_check,
         "config_code": code_check,
-        "registered_targets": check_at_least_one_config(desktop_check, code_check),
+        "config_codex": codex_check,
+        "registered_targets": check_at_least_one_config(desktop_check, code_check, codex_check),
         "dart_api": _dart_api_check_from_diag(dart_diag),
         "license": _license_check_from_diag(license_diag),
         "corp_code_cache": _corp_cache_check_from_diag(corp_cache_diag),
@@ -493,7 +572,7 @@ def run_diagnostics(*, online: bool = False) -> dict:
         "dart_diag": dart_diag,
         "license_diag": license_diag,
         "corp_cache_diag": corp_cache_diag,
-        "targets": _registered_targets(desktop_check, code_check),
+        "targets": _registered_targets(desktop_check, code_check, codex_check),
         "latest_version": latest_version,
     }
 
