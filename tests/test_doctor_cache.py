@@ -125,6 +125,18 @@ class RepairCorpCodeCacheTests(_TempCacheDirMixin, unittest.TestCase):
         # 실패해도 백업은 이미 만들어졌어야 한다 (삭제 전 보존 원칙).
         self.assertTrue(path.with_suffix(path.suffix + ".bak").exists())
 
+    def test_backup_copy_failure_is_reported_not_raised(self):
+        """shutil.copy2가 실패(디스크 꽉 참/권한 문제 등)해도 raw exception이 아니라
+        {"repaired": False, ...}로 깨끗하게 끝나야 한다."""
+        path = self._cache_path()
+        path.write_bytes(SAMPLE_XML)
+
+        with patch.object(_corp_code.shutil, "copy2", side_effect=OSError("disk full")):
+            result = _corp_code.repair_corp_code_cache(yes=True)
+
+        self.assertFalse(result["repaired"])
+        self.assertIn("message", result)
+
 
 if __name__ == "__main__":
     unittest.main()

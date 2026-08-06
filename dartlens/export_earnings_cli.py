@@ -34,6 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # 파이프/리다이렉트로 stdout이 콘솔이 아니게 되면 Windows는 cp949 등 로캘 코드페이지로
+    # 떨어져 마크다운 출력의 한글/× 문자에서 UnicodeEncodeError가 난다.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     args = build_parser().parse_args(argv)
 
     try:

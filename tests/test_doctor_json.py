@@ -1,11 +1,13 @@
 """dartlens-doctor --json / --online 계약 테스트."""
 
+import contextlib
+import io
 import json
 import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if sys.platform == "win32":
@@ -69,6 +71,84 @@ class DiagnoseDartApiKeyOnlineTests(unittest.IsolatedAsyncioTestCase):
         key = "a" * 40
         diag = await self._run(mock_return=("000", {}))
         self.assertNotIn(key, json.dumps(diag.to_dict()))
+
+    async def test_901_is_invalid_not_network_unreachable(self):
+        """901(개인정보 보유기간 만료)은 계정 문제라 '서비스 문제, 당신 잘못 아님'으로 오도하면 안 됨."""
+        diag = await self._run(mock_return=("901", {"message": "사용자 계정의 개인정보 보유기간이 만료되었습니다"}))
+        self.assertEqual(diag.status, "invalid")
+        self.assertNotEqual(diag.status, "network_unreachable")
+        self.assertIn("개인정보 보유기간", diag.message)
+
+    async def test_800_system_maintenance_is_network_unreachable(self):
+        diag = await self._run(mock_return=("800", {"message": "시스템 점검"}))
+        self.assertEqual(diag.status, "network_unreachable")
+
+
+class CheckDartKeyOnlineTests(unittest.IsolatedAsyncioTestCase):
+    """check_dart_key_online()이 DART의 비정상 응답(200이지만 JSON이 아님 등)도 httpx.HTTPError로
+    통일해서 던지는지 — 그래야 기존 호출부들의 `except httpx.HTTPError` 폴백이 실제로 잡는다."""
+
+    async def test_non_json_200_response_raises_http_error_not_raw_exception(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json = MagicMock(side_effect=ValueError("not valid json"))
+        with patch.object(httpx.AsyncClient, "get", new=AsyncMock(return_value=mock_resp)):
+            with self.assertRaises(httpx.HTTPError):
+                await diagnostics.check_dart_key_online("a" * 40)
+
+    async def test_unexpected_json_shape_raises_http_error(self):
+        """DART가 dict가 아닌 JSON(list 등)을 주면 .get() 호출에서 AttributeError가 나는데,
+        이것도 httpx.HTTPError로 통일돼야 한다."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json = MagicMock(return_value=["unexpected", "shape"])
+        with patch.object(httpx.AsyncClient, "get", new=AsyncMock(return_value=mock_resp)):
+            with self.assertRaises(httpx.HTTPError):
+                await diagnostics.check_dart_key_online("a" * 40)
+
+
+class DoctorMainCrashHandlingTests(unittest.TestCase):
+    """run_diagnostics()/repair가 예상 못하게 터져도 raw traceback이 아니라 깨끗한 오류로 끝나는지."""
+
+    def test_json_mode_reports_clean_error_instead_of_traceback(self):
+        from dartlens import doctor
+
+        buf = io.StringIO()
+        with patch.object(doctor, "run_diagnostics", side_effect=RuntimeError("boom")), \
+             patch.object(sys, "argv", ["dartlens-doctor", "--json"]), \
+             contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                doctor.main()
+        self.assertEqual(ctx.exception.code, 1)
+        result = json.loads(buf.getvalue())
+        self.assertEqual(result["overall"], "fail")
+        self.assertIn("RuntimeError", result["error"])
+
+    def test_text_mode_reports_clean_error_instead_of_traceback(self):
+        from dartlens import doctor
+
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with patch.object(doctor, "run_diagnostics", side_effect=RuntimeError("boom")), \
+             patch.object(sys, "argv", ["dartlens-doctor"]), \
+             contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            with self.assertRaises(SystemExit) as ctx:
+                doctor.main()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("RuntimeError", buf_err.getvalue())
+
+    def test_repair_mode_reports_clean_error_instead_of_traceback(self):
+        from dartlens import doctor
+
+        buf = io.StringIO()
+        with patch.object(doctor._corp_code, "repair_corp_code_cache", side_effect=RuntimeError("boom")), \
+             patch.object(sys, "argv", ["dartlens-doctor", "--repair", "corp-code-cache", "--yes", "--json"]), \
+             contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                doctor.main()
+        self.assertEqual(ctx.exception.code, 1)
+        result = json.loads(buf.getvalue())
+        self.assertFalse(result["repaired"])
+        self.assertIn("RuntimeError", result["message"])
 
 
 class DoctorBuildReportTests(unittest.TestCase):

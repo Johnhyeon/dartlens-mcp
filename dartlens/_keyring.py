@@ -186,8 +186,11 @@ def backend_status() -> tuple[bool, str]:
     구분한다.
     """
     try:
-        backend = _get_backend()
-        return True, type(backend.get_keyring()).__name__
+        with _PosixTimeout(_KEYRING_OP_TIMEOUT_SEC):
+            backend = _get_backend()
+            return True, type(backend.get_keyring()).__name__
+    except TimeoutError as e:
+        return False, f"{e} — Secret Service 가 응답하지 않습니다."
     except KeyringUnavailableError as e:
         return False, str(e)
 

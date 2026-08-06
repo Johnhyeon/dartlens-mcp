@@ -582,14 +582,31 @@ def main():
     args = _build_arg_parser().parse_args()
 
     if args.repair:
-        result = _corp_code.repair_corp_code_cache(yes=args.yes)
+        try:
+            result = _corp_code.repair_corp_code_cache(yes=args.yes)
+        except Exception as e:
+            result = {"repaired": False, "message": f"복구 중 예상치 못한 오류: {type(e).__name__}: {e}"}
         if args.json:
             print(json.dumps(result, ensure_ascii=False))
         else:
             print(result.get("message") or ("복구 완료" if result.get("repaired") else "복구 실패"))
         sys.exit(0 if result.get("repaired") or not args.yes else 1)
 
-    state = run_diagnostics(online=args.online)
+    try:
+        state = run_diagnostics(online=args.online)
+    except Exception as e:
+        message = f"진단 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        if args.json:
+            print(json.dumps({
+                "schema_version": diagnostics.SCHEMA_VERSION,
+                "product": diagnostics.PRODUCT,
+                "package_name": diagnostics.PACKAGE_NAME,
+                "overall": "fail",
+                "error": message,
+            }, ensure_ascii=False))
+        else:
+            print(f"[FAIL] {message}", file=sys.stderr)
+        sys.exit(1)
     checks = state["checks"]
 
     if args.json:

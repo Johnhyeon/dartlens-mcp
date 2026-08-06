@@ -165,8 +165,11 @@ _VALIDATE_URL = "https://opendart.fss.or.kr/api/company.json"
 _VALIDATE_CORP_CODE = "00126380"
 
 RATE_LIMIT_CODES = {"020", "021"}
-# DART 서비스 자체 문제 — 키 불량으로 오판하면 안 됨
-SERVICE_ISSUE_CODES = {"800", "900", "901"}
+# DART 서비스 자체 문제 — 키 불량으로 오판하면 안 됨. "901"(개인정보 보유기간 만료)은
+# 계정 자체 문제라 여기 넣지 않는다 — SUCCESS/RATE_LIMIT 어디에도 안 걸리면 기본적으로
+# invalid 분기로 떨어져 DART 원문 메시지("사용자 계정의 개인정보 보유기간이 만료되었습니다")가
+# 그대로 사용자에게 전달된다. "서비스 문제라 당신 잘못 아님"이라고 오도하지 않기 위함.
+SERVICE_ISSUE_CODES = {"800", "900"}
 SUCCESS_CODES = {"000", "013"}  # 013 = 조회 결과 없음. 연결 성공으로 취급.
 
 
@@ -174,6 +177,9 @@ async def check_dart_key_online(api_key: str) -> tuple[str, dict]:
     """DART 가벼운 엔드포인트 1회 호출 → (status_code, raw_json).
 
     네트워크 예외(httpx.*)는 그대로 전파 — 호출자가 network_unreachable 로 매핑한다.
+    DART가 200을 주면서 JSON이 아니거나 예상 형태가 아닌 응답(점검 페이지 등)을 줄 수도
+    있는데, 그 경우도 httpx.HTTPError로 통일해서 던진다 — 이미 모든 호출부가
+    httpx.HTTPError를 폴백으로 잡고 있으므로 새 예외 타입을 각 호출부에 추가할 필요가 없다.
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
@@ -181,8 +187,12 @@ async def check_dart_key_online(api_key: str) -> tuple[str, dict]:
             params={"crtfc_key": api_key, "corp_code": _VALIDATE_CORP_CODE},
         )
     resp.raise_for_status()
-    data = resp.json()
-    return str(data.get("status", "")).strip(), data
+    try:
+        data = resp.json()
+        status = str(data.get("status", "")).strip()
+    except Exception as e:
+        raise httpx.HTTPError(f"DART 응답을 해석할 수 없습니다: {type(e).__name__}") from e
+    return status, data
 
 
 async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = None) -> DartApiDiagnosis:

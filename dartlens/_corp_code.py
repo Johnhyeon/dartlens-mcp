@@ -285,11 +285,10 @@ def repair_corp_code_cache(*, yes: bool) -> dict:
         return {"repaired": False, "message": "재다운로드하려면 --yes 플래그가 필요합니다."}
 
     path = _cache_path()
-    if path.exists():
-        bak = path.with_suffix(path.suffix + ".bak")
-        shutil.copy2(path, bak)
-
     try:
+        if path.exists():
+            bak = path.with_suffix(path.suffix + ".bak")
+            shutil.copy2(path, bak)
         asyncio.run(ensure_loaded(force_refresh=True))
     except Exception as e:
         return {"repaired": False, "message": f"재다운로드 실패: {type(e).__name__}: {e}"}

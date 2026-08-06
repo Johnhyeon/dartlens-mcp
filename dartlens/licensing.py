@@ -144,7 +144,9 @@ def stored_key() -> str | None:
     if p.exists():
         try:
             return p.read_text(encoding="utf-8").strip() or None
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # 손상/바이너리 파일(디스크 오류, 강제종료 중 쓰기 등)도 "저장된 키 없음"과
+            # 동일하게 취급 — 여기서 예외가 새면 doctor의 라이선스 체크가 통째로 죽는다.
             return None
     return None
 

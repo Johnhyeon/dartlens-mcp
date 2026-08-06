@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -125,6 +126,39 @@ class DiagnoseLicenseTests(unittest.TestCase):
             diag = diagnostics.diagnose_license()
         text = json.dumps(diag.to_dict(), ensure_ascii=False)
         self.assertNotIn("abcdef123456", text)
+
+
+class StoredKeyCorruptionTests(unittest.TestCase):
+    """license.key 파일이 손상(바이너리 등)돼도 stored_key()가 예외를 흘리지 않는지.
+
+    diagnose_license()가 doctor.py에서 아무 try/except 없이 바로 호출되므로, 여기서
+    UnicodeDecodeError가 새면 dartlens-doctor 전체가 raw traceback으로 죽는다.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = patch.dict(os.environ, {"DARTLENS_HOME": self._tmpdir.name}, clear=False)
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_binary_license_file_returns_none_not_raises(self):
+        license_path = Path(self._tmpdir.name) / "license.key"
+        license_path.write_bytes(b"\xff\xfe\x00\x01\x80\x81corrupted-not-utf8")
+
+        key = licensing.stored_key()
+
+        self.assertIsNone(key)
+
+    def test_diagnose_license_handles_corrupted_file_gracefully(self):
+        license_path = Path(self._tmpdir.name) / "license.key"
+        license_path.write_bytes(b"\xff\xfe\x00\x01\x80\x81corrupted-not-utf8")
+
+        diag = diagnostics.diagnose_license()
+
+        self.assertEqual(diag.status, "missing")
 
 
 if __name__ == "__main__":
