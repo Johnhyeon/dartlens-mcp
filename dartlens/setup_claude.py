@@ -505,7 +505,27 @@ def run_setup_noninteractive(
         # 마이그레이션 목적의 재실행(예: legacy 엔트리 정리)에서 매번 재입력을 요구하지 않는다.
         key = (keyring_helper.load() or "").strip()
     if not key:
-        raise SetupError(diagnostics.DART_API_KEY_MISSING, "DART API 키가 비어 있습니다.")
+        # 키가 없어도 MCP 등록은 해준다.
+        #
+        # 예전엔 여기서 실패시켰다 — 그래서 Manager의 "MCP 등록" 버튼이 DartLens에서만
+        # 세 타겟 모두 실패했다(다른 두 Lens는 자격증명 없이도 등록된다). 사용자 눈에는
+        # 이유 없이 등록이 안 되는 막다른 길이었다.
+        #
+        # 등록과 키 입력은 별개 작업이다. 등록만 해두면 클라이언트가 서버를 띄울 수 있고,
+        # 키가 없는 동안에는 각 도구가 "키를 넣으라"고 자기 자리에서 안내한다 —
+        # StockLens가 라이선스 없이 등록된 뒤 도구에서 안내하는 것과 같은 모양이다.
+        for target in targets:
+            path_func, _label = TARGETS[target]
+            _write_config_entry(path_func(), api_key="", command=command, plaintext=False)
+        return {
+            "ok": True,
+            "api_key_saved": False,
+            "storage": None,
+            "targets": list(targets),
+            "key_tail_masked": None,
+            "validated_online": False,
+            "message": "MCP 등록을 마쳤습니다. DART API 키는 아직 등록되지 않았습니다.",
+        }
 
     if licensing.looks_like_license_shape(key):
         raise SetupError(diagnostics.DART_API_KEY_INVALID, licensing.CROSS_HINT_LICENSE_IN_API_KEY_FIELD)
