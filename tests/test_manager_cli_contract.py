@@ -52,11 +52,36 @@ class RunSetupNoninteractiveTests(unittest.TestCase):
         mock_save.assert_called_once()
         mock_write.assert_called_once()
 
-    def test_empty_key_is_missing_when_nothing_stored(self):
-        with patch.object(setup_claude.keyring_helper, "load", return_value=None):
-            with self.assertRaises(setup_claude.SetupError) as ctx:
-                setup_claude.run_setup_noninteractive(api_key="   ", targets=[])
-        self.assertEqual(ctx.exception.error_code, diagnostics.DART_API_KEY_MISSING)
+    def test_empty_key_still_registers_mcp(self):
+        """키가 없어도 MCP 등록은 된다 — 등록과 키 입력은 별개 작업이다.
+
+        예전엔 여기서 SetupError(DART_API_KEY_MISSING)를 냈고, 그래서 Manager의
+        "MCP 등록"이 DartLens에서만 세 타겟 모두 실패했다(다른 두 Lens는 자격증명
+        없이도 등록된다). 그 동작을 고치면서 이 테스트가 안 따라와 빨간 채로 남아
+        있었다. 지금 계약은 "등록은 해주고, 키는 아직 없다고 정직하게 알린다"이다.
+        """
+        with patch.object(setup_claude.keyring_helper, "load", return_value=None), \
+             patch.object(setup_claude, "_write_config_entry") as mock_write:
+            result = setup_claude.run_setup_noninteractive(
+                api_key="   ", targets=["claude-code"], command="dartlens",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["api_key_saved"])
+        self.assertIsNone(result["storage"])
+        self.assertEqual(result["targets"], ["claude-code"])
+        self.assertFalse(result["validated_online"])
+        # 등록은 실제로 일어나야 한다 — "성공했다"고만 답하고 아무것도 안 쓰면 최악이다.
+        mock_write.assert_called_once()
+
+    def test_empty_key_with_no_targets_writes_nothing(self):
+        with patch.object(setup_claude.keyring_helper, "load", return_value=None), \
+             patch.object(setup_claude, "_write_config_entry") as mock_write:
+            result = setup_claude.run_setup_noninteractive(api_key="", targets=[])
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["api_key_saved"])
+        self.assertEqual(result["targets"], [])
+        mock_write.assert_not_called()
 
     def test_empty_key_reuses_stored_keychain_key(self):
         """키를 안 줘도 키체인에 이미 저장된 키가 있으면 재입력 없이 그걸로 진행한다."""
