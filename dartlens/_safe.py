@@ -8,7 +8,7 @@ import sys
 
 import httpx
 
-from dartlens.licensing import is_licensed, LOCKED_MESSAGE
+from dartlens.licensing import is_licensed, locked_message
 
 
 def _support_hint() -> str:
@@ -84,7 +84,7 @@ def safe_tool(func):
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         if not is_licensed():
-            return LOCKED_MESSAGE
+            return locked_message()
         try:
             return await func(*args, **kwargs)
         except MissingApiKeyError as e:
