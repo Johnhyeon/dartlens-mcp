@@ -82,13 +82,20 @@ class DartApiDiagnosis:
 
 @dataclass
 class LicenseDiagnosis:
-    status: str  # active | missing | invalid
+    # active | missing | invalid | expired | revoked | clock
+    # 뒤의 셋은 키 자체는 진짜인데 지금 못 쓰는 상태다 — 예전엔 전부 "active"로
+    # 보고해서, 도구는 잠겼는데 Manager는 "라이선스 활성"이라고 말했다.
+    status: str
     license_id_masked: str | None = None
     error_code: str | None = None
     message: str = ""
+    # 기간이 있는 키(체험판·구독)만 채워진다.
+    expires_on: str | None = None
 
     def to_dict(self) -> dict:
         d: dict = {"status": self.status}
+        if self.expires_on is not None:
+            d["expires_on"] = self.expires_on
         if self.license_id_masked is not None:
             d["license_id_masked"] = self.license_id_masked
         if self.error_code is not None:
@@ -269,6 +276,14 @@ async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = Non
 # ---------------------------------------------------------------------------
 
 
+# 셋 다 "키를 다시 넣으세요"가 답이 아니다 — 할 일이 서로 다르다.
+_LICENSE_BLOCKED_MESSAGE = {
+    "expired": "DartLens 사용 기간이 끝났습니다. 계속 쓰시려면 라이선스를 구매해주세요.",
+    "revoked": "이 라이선스 키는 현재 사용이 중지되어 있습니다. 착오라면 문의해주세요.",
+    "clock": "이 컴퓨터의 날짜가 실제보다 과거로 설정되어 있습니다. 날짜를 맞춘 뒤 다시 시도해주세요.",
+}
+
+
 def diagnose_license() -> LicenseDiagnosis:
     key = licensing.stored_key()
     if not key:
@@ -283,7 +298,22 @@ def diagnose_license() -> LicenseDiagnosis:
 
     res = licensing.verify_key(key)
     if res["valid"]:
-        return LicenseDiagnosis(status="active", license_id_masked=licensing.mask_tail(res["license_id"].upper()))
+        expiry = res.get("expires_on")
+        masked = licensing.mask_tail(res["license_id"].upper())
+        reason = licensing.license_block_reason()
+        if reason in ("expired", "revoked", "clock"):
+            return LicenseDiagnosis(
+                status=reason,
+                license_id_masked=masked,
+                error_code=DARTLENS_LICENSE_INVALID,
+                message=_LICENSE_BLOCKED_MESSAGE[reason],
+                expires_on=expiry.isoformat() if expiry else None,
+            )
+        return LicenseDiagnosis(
+            status="active",
+            license_id_masked=masked,
+            expires_on=expiry.isoformat() if expiry else None,
+        )
 
     message = f"라이선스 키가 유효하지 않습니다 — {res['reason']}."
     if licensing.looks_like_dart_api_key(key):
