@@ -1401,7 +1401,9 @@ def _format_status(
 
     update_line = f"- 버전: {version}"
     if latest_version and latest_version != version:
-        update_line += f" (최신: {latest_version} — `uv tool upgrade dartlens-mcp` 로 업데이트 가능)"
+        # 터미널 명령을 안내하면 주 고객층은 거기서 막힌다 — LeetKit Manager가 있는
+        # 이유가 그 명령을 안 치게 하려는 것이다. 세 Lens 안내를 같은 말로 맞춘다.
+        update_line += f" (최신: {latest_version} — LeetKit Manager를 열고 [지금 업데이트])"
     elif latest_version:
         update_line += " (최신 버전)"
     else:
