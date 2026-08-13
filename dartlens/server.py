@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+# TLS 신뢰 기준(OS 인증서 저장소)을 다른 무엇보다 먼저 세운다. `_http.py` 를 안 타는
+# 호출(자가진단·KRX 목록·폐기 목록·업데이트 확인)까지 같은 기준을 쓰게 하려면 여기가
+# 가장 이르다.
+from dartlens import _tls as _tls_bootstrap
+
+_tls_bootstrap.apply()
+
+from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from dartlens._cache import cached
 from dartlens._corp_code import (

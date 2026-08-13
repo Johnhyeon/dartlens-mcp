@@ -677,6 +677,12 @@ def main():
     except Exception:
         pass
 
+    # 서버와 같은 TLS 기준으로 진단한다. 어긋나면 진단은 통과하는데 서버만 실패하는,
+    # 가장 찾기 어려운 상태가 된다 — 2026-08-13 문의에서 실제로 그랬다.
+    from dartlens import _tls
+
+    _tls.apply()
+
     args = _build_arg_parser().parse_args()
 
     if args.repair:
