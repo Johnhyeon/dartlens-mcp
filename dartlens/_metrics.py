@@ -8,11 +8,29 @@ stocklens 메트릭과 호환되는 스키마로 기록한다 (timestamp/tool/du
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+# stocklens/_metrics.py 와 같은 규칙이어야 한다 — 두 로그를 나란히 놓고 읽는다.
+_QUERY_RE = re.compile(r"\?[^\s'\"]*")
+_DETAIL_MAX = 200
+
+
+def _error_detail(exc: Exception) -> str | None:
+    """예외 메시지를 로그에 담을 수 있는 형태로. 메시지가 없으면 None.
+
+    쿼리스트링은 통째로 지운다 — httpx 예외 문자열에는 요청 URL이 그대로 들어가고
+    DART 호출 URL에는 `?crtfc_key=<40자리>` 가 실린다. 이 파일은 지원 번들에 담겨
+    고객이 메일로 내보낸다.
+    """
+    msg = str(exc).strip()
+    if not msg:
+        return None
+    return _QUERY_RE.sub("?…", msg)[:_DETAIL_MAX]
 
 
 def get_data_dir() -> Path:
@@ -102,6 +120,7 @@ def track_metrics(tool_name: str) -> Callable:
         async def wrapper(*args, **kwargs):
             start = time.monotonic()
             error_type: str | None = None
+            error_detail: str | None = None
             result_text = ""
             try:
                 result = await func(*args, **kwargs)
@@ -110,6 +129,10 @@ def track_metrics(tool_name: str) -> Callable:
                 return result
             except Exception as e:
                 error_type = type(e).__name__
+                # 타입만 남기면 "ConnectError"가 전부라 원인을 못 좁힌다 — 이름 조회
+                # 실패인지·거부인지·프록시인지에 따라 사용자가 할 일이 완전히 다르다
+                # (2026-08-13 문의에서 실제로 여기서 막혔다).
+                error_detail = _error_detail(e)
                 raise
             finally:
                 duration_ms = round((time.monotonic() - start) * 1000, 1)
@@ -122,6 +145,7 @@ def track_metrics(tool_name: str) -> Callable:
                         "output_chars": len(result_text),
                         "cache_hit": duration_ms < 10.0,
                         "error": error_type,
+                        "error_detail": error_detail,
                     }
                     with open(get_metrics_file(), "a", encoding="utf-8") as f:
                         f.write(json.dumps(record, ensure_ascii=False) + "\n")

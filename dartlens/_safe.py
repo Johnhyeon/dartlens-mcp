@@ -4,11 +4,31 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import sys
 
 import httpx
 
 from dartlens.licensing import is_licensed, locked_message
+
+_QUERY_RE = re.compile(r"\?[^\s'\"]*")
+_CAUSE_MAX = 160
+
+
+def _cause_text(exc: Exception) -> str:
+    """예외 메시지를 사용자에게 보여줄 수 있는 형태로. 없으면 예외 타입 이름.
+
+    쿼리스트링은 통째로 지운다 — httpx 예외 문자열에는 요청 URL이 그대로 들어가고,
+    DART 호출 URL에는 `?crtfc_key=<40자리>` 가 실린다. 이 문자열은 화면에 뜨고
+    로그에도 남고 지원 번들로 밖에 나간다.
+    """
+    msg = str(exc).strip()
+    if not msg:
+        return type(exc).__name__
+    msg = _QUERY_RE.sub("?…", msg)
+    if len(msg) > _CAUSE_MAX:
+        msg = msg[:_CAUSE_MAX] + "…"
+    return f"{type(exc).__name__}: {msg}"
 
 
 def _support_hint() -> str:
@@ -93,15 +113,22 @@ def safe_tool(func):
             return f"⚠️ DART API 오류 [{e.status}]: {e.message}"
         except httpx.TimeoutException:
             return "⚠️ DART 응답이 지연되고 있습니다. 잠시 후 다시 시도해주세요."
-        except httpx.ConnectError:
-            return "⚠️ DART에 연결할 수 없습니다. 인터넷 연결을 확인해주세요."
+        except httpx.ConnectError as e:
+            # 원인을 같이 적는다. 예전엔 이 한 줄로 뭉갰는데, 실제 문의(2026-08-13,
+            # 뉴질랜드 사용자)에서 연결 실패가 100% 재현되는데도 원인을 좁힐 수가
+            # 없었다 — 화면에도 로그에도 "ConnectError" 뿐이라 이름 조회 실패인지·
+            # 거부당한 건지·프록시인지 구분이 안 됐다. 그 셋은 사용자가 할 일이 다르다.
+            return (
+                "⚠️ DART에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.\n"
+                f"(원인: {_cause_text(e)})"
+            )
         except httpx.HTTPError as e:
-            return f"⚠️ 네트워크 오류: {type(e).__name__}"
+            return f"⚠️ 네트워크 오류: {type(e).__name__}\n(원인: {_cause_text(e)})"
         except ValueError as e:
             return f"⚠️ 입력값 오류: {e}"
         except Exception as e:
             return (
-                f"⚠️ 처리 중 오류: {type(e).__name__}: {e}\n"
+                f"⚠️ 처리 중 오류: {_cause_text(e)}\n"
                 f"입력값(종목코드/corp_code/날짜)을 다시 확인해주세요."
                 + _support_hint()
             )
