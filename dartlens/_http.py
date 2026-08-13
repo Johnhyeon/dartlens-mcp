@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import ssl
 from typing import Any
 
 import httpx
@@ -40,6 +41,36 @@ _MAX_CONCURRENT = 10
 _semaphore: asyncio.Semaphore | None = None
 _client: httpx.AsyncClient | None = None
 
+_ssl_ctx: "ssl.SSLContext | bool | None" = None
+
+
+def _verify() -> "ssl.SSLContext | bool":
+    """TLS 검증에 OS 인증서 저장소를 쓴다(브라우저·curl과 같은 기준).
+
+    httpx 기본값은 certifi 번들만 믿는다. 백신이나 회사망 프록시가 TLS를 가로채
+    자기 루트로 재서명하면, 그 루트는 Windows 저장소에는 있어도 certifi 에는 없어
+    전부 이렇게 죽는다:
+
+        ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local
+        issuer certificate
+
+    실제 문의(2026-08-13, 뉴질랜드 사용자)에서 확인된 원인이다. StockLens
+    _http.py 와 같은 처리 — 한쪽만 고치면 같은 PC에서 시세는 되는데 공시만 안 되는
+    상태가 된다.
+
+    truststore 를 못 쓰면 기존 동작(certifi)으로 조용히 돌아간다. 검증을 끄는
+    선택지는 두지 않는다.
+    """
+    global _ssl_ctx
+    if _ssl_ctx is None:
+        try:
+            import truststore
+
+            _ssl_ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        except Exception:
+            _ssl_ctx = True
+    return _ssl_ctx
+
 
 def _get_semaphore() -> asyncio.Semaphore:
     global _semaphore
@@ -56,6 +87,7 @@ def get_client() -> httpx.AsyncClient:
             timeout=_TIMEOUT,
             headers=_HEADERS,
             follow_redirects=True,
+            verify=_verify(),
             limits=httpx.Limits(
                 max_keepalive_connections=15,
                 max_connections=25,

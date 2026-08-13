@@ -1,6 +1,6 @@
 [project]
 name = "dartlens-mcp"
-version = "0.6.16"
+version = "0.6.17"
 description = "dartlens — 금융감독원 전자공시(DART OpenAPI) 래핑 MCP 서버. 공시 검색·본문·재무제표 조회를 Claude에서 자연어로."
 readme = "README.md"
 license = { text = "Proprietary" }
@@ -29,6 +29,9 @@ dependencies = [
     "cryptography>=42.0.0",
     "tzdata>=2024.1",
     "tomlkit>=0.12",
+    # TLS 검증에 OS 인증서 저장소를 쓴다. 백신·회사망 프록시가 TLS를 가로채는 PC에서
+    # certifi 번들만 믿으면 전부 CERTIFICATE_VERIFY_FAILED 로 죽는다(_http.py 참고).
+    "truststore>=0.9",
 ]
 
 [project.urls]
