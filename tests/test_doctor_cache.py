@@ -271,6 +271,66 @@ class ErrorResponseMustNotBecomeTheCache(_TempCacheDirMixin, unittest.TestCase):
             asyncio.run(_corp_code.ensure_loaded(force_refresh=True))  # 쿨다운 무시
         self.assertEqual(len(_corp_code._by_corp_code), 2)
 
+    def test_expired_cache_is_used_when_the_refresh_fails(self):
+        """기한만 보고 버리면, 한 번 받아둔 사람도 딱 7일 뒤에 같은 장애를 다시 겪는다.
+        기업코드는 천천히 바뀌므로 며칠 지난 목록이 '아무것도 없음'보다 훨씬 낫다."""
+        import asyncio
+        import os
+        import time as _t
+
+        import httpx
+
+        p = self._cache_path()
+        p.write_bytes(SAMPLE_XML)
+        old = _t.time() - 8 * 24 * 3600  # TTL 7일 초과
+        os.utime(p, (old, old))
+
+        async def failing(endpoint, params=None, **kw):
+            raise httpx.ConnectError("[Errno 11001] getaddrinfo failed")
+
+        _corp_code._loaded_at = 0.0
+        _corp_code._failed_at = 0.0
+        with patch.object(_corp_code, "get_bytes", failing):
+            entry = asyncio.run(_corp_code.lookup_by_stock_code("005930"))
+        self.assertIsNotNone(entry, "쓸 수 있는 목록이 디스크에 있는데 실패했다")
+        self.assertEqual(entry.corp_name, "삼성전자")
+
+    def test_no_cache_at_all_still_fails_loudly(self):
+        """낡은 목록으로 버티는 건 있을 때만이다 — 없으면 조용히 넘기지 않는다."""
+        import asyncio
+
+        import httpx
+
+        async def failing(endpoint, params=None, **kw):
+            raise httpx.ConnectError("boom")
+
+        _corp_code._loaded_at = 0.0
+        _corp_code._failed_at = 0.0
+        with patch.object(_corp_code, "get_bytes", failing):
+            with self.assertRaises(Exception):
+                asyncio.run(_corp_code.lookup_by_stock_code("005930"))
+
+    def test_repair_does_not_pretend_stale_is_success(self):
+        """사용자가 직접 고치라고 실행한 명령이 낡은 캐시로 '성공'하면 안 된다."""
+        import os
+        import time as _t
+
+        import httpx
+
+        p = self._cache_path()
+        p.write_bytes(SAMPLE_XML)
+        old = _t.time() - 8 * 24 * 3600
+        os.utime(p, (old, old))
+
+        async def failing(endpoint, params=None, **kw):
+            raise httpx.ConnectError("boom")
+
+        _corp_code._loaded_at = 0.0
+        _corp_code._failed_at = 0.0
+        with patch.object(_corp_code, "get_bytes", failing):
+            result = _corp_code.repair_corp_code_cache(yes=True)
+        self.assertFalse(result["repaired"])
+
     def test_doctor_calls_an_empty_cache_a_failure(self):
         from dartlens import doctor
 

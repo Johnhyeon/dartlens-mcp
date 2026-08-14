@@ -185,12 +185,18 @@ async def ensure_loaded(force_refresh: bool = False) -> None:
 
         path = _cache_path()
         entries: list[CorpEntry] = []
+        stale: list[CorpEntry] = []
 
-        if not force_refresh and _is_cache_fresh(path):
+        if not force_refresh:
             try:
-                entries = _parse_xml(path.read_bytes())
+                parsed = _parse_xml(path.read_bytes())
             except Exception:
-                entries = []  # 손상된 캐시 — 아래에서 다시 받는다
+                parsed = []  # 없거나 손상됨 — 아래에서 받는다
+            if parsed:
+                if _is_cache_fresh(path):
+                    entries = parsed
+                else:
+                    stale = parsed  # 기한은 지났지만 쓸 수는 있다
 
         if not entries:
             try:
@@ -203,6 +209,16 @@ async def ensure_loaded(force_refresh: bool = False) -> None:
             except BaseException as e:  # CancelledError 도 실패로 기억한다
                 _failed_at = time.time()
                 _failure_reason = f"{type(e).__name__}: {e}"[:200]
+                # 갱신에 실패했어도 디스크에 쓸 수 있는 목록이 있으면 그걸 쓴다.
+                # 기업코드는 천천히 바뀌므로 며칠 지난 목록이 '아무것도 없음'보다
+                # 훨씬 낫다. 예전엔 기한(7일)만 보고 버려서, 한 번 받아둔 사람도
+                # 딱 7일 뒤에 같은 장애를 다시 겪게 돼 있었다(2026-08-14 문의에서
+                # --repair 로 겨우 살린 PC가 그대로 이 시한폭탄을 안고 있었다).
+                # doctor 는 이 상태를 "캐시가 오래되었습니다"로 계속 알린다.
+                if stale:
+                    _build_indexes(stale)
+                    _loaded_at = time.time()
+                    return
                 raise
             path.write_bytes(xml_bytes)
 
