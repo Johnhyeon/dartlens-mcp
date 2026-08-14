@@ -102,8 +102,14 @@ async def _request(
     *,
     params: dict[str, Any] | None = None,
     max_retries: int = 2,
+    timeout: "httpx.Timeout | float | None" = None,
 ) -> httpx.Response:
-    """크리덴셜 자동 주입 + Semaphore + 재시도."""
+    """크리덴셜 자동 주입 + Semaphore + 재시도.
+
+    `timeout`을 주면 이 요청만 클라이언트 기본값(_TIMEOUT) 대신 그 값을 쓴다.
+    corpCode.xml 처럼 몇 MB짜리 벌크 응답은 작은 JSON 기준으로 잡은 제한을 그대로
+    쓰면 안 된다 — 지연이 큰 회선에서는 다 받기도 전에 잘린다.
+    """
     client = get_client()
     sem = _get_semaphore()
 
@@ -112,11 +118,15 @@ async def _request(
         # None 값 제거 (DART는 빈 파라미터에 민감)
         merged.update({k: v for k, v in params.items() if v is not None})
 
+    # timeout=None 을 httpx 에 그대로 넘기면 "무제한"이 된다 — 안 준 경우와 구분해서
+    # 아예 인자를 빼야 클라이언트 기본값이 산다.
+    extra = {"timeout": timeout} if timeout is not None else {}
+
     async with sem:
         last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
-                resp = await client.get(endpoint, params=merged)
+                resp = await client.get(endpoint, params=merged, **extra)
                 if resp.status_code in (429, 500, 502, 503, 504):
                     if attempt < max_retries:
                         backoff = (2 ** attempt) * 0.5 + random.uniform(0, 0.3)
@@ -208,9 +218,22 @@ async def get_multi_acnt(
     return []
 
 
-async def get_bytes(endpoint: str, params: dict[str, Any] | None = None) -> bytes:
+# corpCode.xml 은 실측 3.4MB이고 DART 자체가 느려서 한국(왕복 5ms)에서도 3.8초 걸린다
+# — 0.9MB/s. 왕복 200ms짜리 해외 회선이면 몇 배로 늘어나고, 작은 JSON 기준인 15초는
+# 다 받기 전에 잘린다(2026-08-13 뉴질랜드 문의). 연결 자체는 여전히 빨리 포기하고
+# (connect 15초), 본문 받는 시간만 넉넉히 준다.
+BULK_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
+
+
+async def get_bytes(
+    endpoint: str,
+    params: dict[str, Any] | None = None,
+    *,
+    timeout: "httpx.Timeout | float | None" = None,
+    max_retries: int = 2,
+) -> bytes:
     """바이너리 엔드포인트 호출 (corpCode.xml zip, document.xml zip 등)."""
-    resp = await _request(endpoint, params=params)
+    resp = await _request(endpoint, params=params, timeout=timeout, max_retries=max_retries)
     return resp.content
 
 

@@ -21,8 +21,8 @@ from pathlib import Path
 
 from lxml import etree
 
-from dartlens._http import get_bytes
-from dartlens._metrics import get_data_dir
+from dartlens._http import BULK_TIMEOUT, get_bytes
+from dartlens._metrics import _error_detail, get_data_dir
 
 _CACHE_FILE = "corpCode.xml"
 _TTL_SECONDS = 7 * 24 * 3600  # 7일
@@ -73,8 +73,13 @@ def _is_cache_fresh(path: Path) -> bool:
 
 
 async def _download_corp_code() -> bytes:
-    """DART에서 corpCode.xml zip을 받아 내부 XML 바이트 반환."""
-    raw = await get_bytes("/corpCode.xml")
+    """DART에서 corpCode.xml zip을 받아 내부 XML 바이트 반환.
+
+    벌크 전용 타임아웃을 쓴다(BULK_TIMEOUT) — 3.4MB짜리라 작은 JSON 기준 제한으로는
+    지연이 큰 회선에서 다 받기 전에 잘린다. 재시도는 1회로 줄인다: 한 번에 2분까지
+    기다릴 수 있으므로 기본값(2회)이면 최악의 경우 6분을 붙잡고 있게 된다.
+    """
+    raw = await get_bytes("/corpCode.xml", timeout=BULK_TIMEOUT, max_retries=1)
     # zip 또는 raw XML — DART는 zip으로 응답
     if raw[:2] == b"PK":
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -291,7 +296,10 @@ def repair_corp_code_cache(*, yes: bool) -> dict:
             shutil.copy2(path, bak)
         asyncio.run(ensure_loaded(force_refresh=True))
     except Exception as e:
-        return {"repaired": False, "message": f"재다운로드 실패: {type(e).__name__}: {e}"}
+        # `{e}` 를 그대로 쓰면 안 된다 — httpx 예외 문자열엔 요청 URL이 통째로 들어가고
+        # DART 호출 URL에는 `?crtfc_key=<40자리>` 가 실린다. 이 메시지는 화면에 뜨고
+        # doctor --json 으로 지원 번들에도 나간다.
+        return {"repaired": False, "message": f"재다운로드 실패: {type(e).__name__}: {_error_detail(e)}"}
 
     diag = cache_diagnosis()
     return {"repaired": True, "entry_count": diag["entry_count"], "last_updated": diag["last_updated"]}

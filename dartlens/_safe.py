@@ -111,8 +111,14 @@ def safe_tool(func):
             return f"⚠️ {e}"
         except DartApiError as e:
             return f"⚠️ DART API 오류 [{e.status}]: {e.message}"
-        except httpx.TimeoutException:
-            return "⚠️ DART 응답이 지연되고 있습니다. 잠시 후 다시 시도해주세요."
+        except httpx.TimeoutException as e:
+            # 0.6.16에서 ConnectError/HTTPError에는 원인을 붙였는데 이 분기만 빠뜨렸다.
+            # 하필 여기가 corpCode.xml(3.4MB) 다운로드가 걸리는 자리였고, 화면에는
+            # "지연되고 있습니다"만 떠서 무엇이 얼마나 걸리다 잘렸는지 알 수 없었다.
+            return (
+                "⚠️ DART 응답이 지연되고 있습니다. 잠시 후 다시 시도해주세요.\n"
+                f"(원인: {_cause_text(e)})"
+            )
         except httpx.ConnectError as e:
             # 원인을 같이 적는다. 예전엔 이 한 줄로 뭉갰는데, 실제 문의(2026-08-13,
             # 뉴질랜드 사용자)에서 연결 실패가 100% 재현되는데도 원인을 좁힐 수가
