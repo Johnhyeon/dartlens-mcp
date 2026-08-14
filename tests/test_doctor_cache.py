@@ -205,6 +205,72 @@ class ErrorResponseMustNotBecomeTheCache(_TempCacheDirMixin, unittest.TestCase):
             asyncio.run(_corp_code.ensure_loaded())  # force_refresh 없이도 회복해야 한다
         self.assertEqual(len(_corp_code._by_corp_code), 2)
 
+    def test_repeated_failures_do_not_re_download_every_time(self):
+        """이 함수는 락을 쥔 채 3.4MB를 받는다 — 실패가 이어질 때 호출마다 처음부터
+        다시 받으면 Claude가 몇 번만 불러도 그 시간이 직렬로 쌓인다(최악 20분)."""
+        import asyncio
+
+        import httpx
+
+        attempts = {"n": 0}
+
+        async def failing(endpoint, params=None, **kw):
+            attempts["n"] += 1
+            raise httpx.ReadTimeout("timed out")
+
+        _corp_code._loaded_at = 0.0
+        _corp_code._failed_at = 0.0
+        with patch.object(_corp_code, "get_bytes", failing):
+            for _ in range(5):
+                with self.assertRaises(Exception):
+                    asyncio.run(_corp_code.lookup_by_stock_code("005930"))
+        self.assertEqual(attempts["n"], 1, "실패 후에도 매번 다시 받으러 갔다")
+
+    def test_the_remembered_failure_still_says_why(self):
+        import asyncio
+
+        import httpx
+
+        async def failing(endpoint, params=None, **kw):
+            raise httpx.ReadTimeout("timed out while reading response body")
+
+        _corp_code._loaded_at = 0.0
+        _corp_code._failed_at = 0.0
+        with patch.object(_corp_code, "get_bytes", failing):
+            with self.assertRaises(Exception):
+                asyncio.run(_corp_code.lookup_by_stock_code("005930"))
+            with self.assertRaises(Exception) as ctx:
+                asyncio.run(_corp_code.lookup_by_stock_code("005930"))
+        self.assertIn("ReadTimeout", str(ctx.exception))
+
+    def test_repair_ignores_the_cooldown(self):
+        """사용자가 직접 고치려는 경로는 반드시 시도해야 한다 — 안 그러면
+        "잠시 후 다시"만 반복하고 빠져나갈 방법이 없다."""
+        import asyncio
+        import io
+        import zipfile
+
+        import httpx
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("CORPCODE.xml", SAMPLE_XML)
+        calls = {"n": 0}
+
+        async def flaky(endpoint, params=None, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadTimeout("timed out")
+            return buf.getvalue()
+
+        _corp_code._loaded_at = 0.0
+        _corp_code._failed_at = 0.0
+        with patch.object(_corp_code, "get_bytes", flaky):
+            with self.assertRaises(Exception):
+                asyncio.run(_corp_code.ensure_loaded())
+            asyncio.run(_corp_code.ensure_loaded(force_refresh=True))  # 쿨다운 무시
+        self.assertEqual(len(_corp_code._by_corp_code), 2)
+
     def test_doctor_calls_an_empty_cache_a_failure(self):
         from dartlens import doctor
 

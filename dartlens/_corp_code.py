@@ -31,6 +31,12 @@ _TTL_SECONDS = 7 * 24 * 3600  # 7일
 # 메모리 인덱스 (프로세스 lifetime 동안 유지)
 _lock = asyncio.Lock()
 _loaded_at: float = 0.0
+# 직전 실패 기억 — 연쇄 재시도로 사용자를 오래 붙잡아두지 않기 위한 것. 짧게 잡는다:
+# 원인이 사라지면(네트워크 복구 등) 곧 다시 시도해야 하고, 사용자가 --repair 로
+# 직접 고치는 경로는 이 값을 아예 무시한다.
+_FAILURE_COOLDOWN_SECONDS = 60.0
+_failed_at: float = 0.0
+_failure_reason: str = ""
 _by_corp_code: dict[str, "CorpEntry"] = {}
 _by_stock_code: dict[str, "CorpEntry"] = {}
 # 정확 일치 / 부분 일치 검색을 위한 (정규화된 이름) → entries
@@ -154,12 +160,28 @@ async def ensure_loaded(force_refresh: bool = False) -> None:
     파싱해서, 에러 응답이 그대로 캐시가 되어 '기업 0곳'인 채로 7일을 버텼다.
     이미 그렇게 굳은 캐시(옛 버전이 만든 것)도 0건이면 무시하고 다시 받는다 —
     재설치로는 안 풀리는 자리라(캐시는 패키지 밖에 있다) 스스로 벗어나야 한다.
+
+    직전 실패는 잠깐 기억한다. 이 함수는 락을 쥔 채로 3.4MB를 받으므로, 실패가
+    이어지는 상황에서 호출마다 처음부터 다시 받으면 Claude가 도구를 몇 번만 불러도
+    그 시간이 직렬로 쌓인다(측정: 5회 호출 = 5회 재다운로드, 최악 20분). 안 되는
+    걸 오래 기다리게 하느니 같은 이유로 빨리 실패하는 편이 낫다. 사용자가 직접
+    고치려는 경우(force_refresh, 즉 --repair)는 이 기억을 무시하고 반드시 시도한다.
     """
-    global _loaded_at
+    global _loaded_at, _failed_at, _failure_reason
 
     async with _lock:
         if _loaded_at and not force_refresh:
             return
+
+        if (
+            not force_refresh
+            and _failed_at
+            and (time.time() - _failed_at) < _FAILURE_COOLDOWN_SECONDS
+        ):
+            raise RuntimeError(
+                f"기업코드 파일을 조금 전에 받지 못했습니다 — {_failure_reason} "
+                "(잠시 후 다시 시도해주세요)"
+            )
 
         path = _cache_path()
         entries: list[CorpEntry] = []
@@ -171,17 +193,23 @@ async def ensure_loaded(force_refresh: bool = False) -> None:
                 entries = []  # 손상된 캐시 — 아래에서 다시 받는다
 
         if not entries:
-            xml_bytes = await _download_corp_code()
-            entries = _parse_xml(xml_bytes)
-            if not entries:
-                raise RuntimeError(
-                    "기업코드 파일을 받았지만 기업이 한 곳도 들어있지 않습니다. "
-                    "잠시 후 다시 시도해주세요."
-                )
+            try:
+                xml_bytes = await _download_corp_code()
+                entries = _parse_xml(xml_bytes)
+                if not entries:
+                    raise RuntimeError(
+                        "받은 기업코드 파일에 기업이 한 곳도 들어있지 않습니다."
+                    )
+            except BaseException as e:  # CancelledError 도 실패로 기억한다
+                _failed_at = time.time()
+                _failure_reason = f"{type(e).__name__}: {e}"[:200]
+                raise
             path.write_bytes(xml_bytes)
 
         _build_indexes(entries)
         _loaded_at = time.time()
+        _failed_at = 0.0
+        _failure_reason = ""
 
 
 # 외부 노출 lookup --------------------------------------------------------
