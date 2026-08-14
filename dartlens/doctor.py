@@ -508,6 +508,16 @@ def _corp_cache_check_from_diag(diag: dict) -> Check:
         c.fail("캐시 파일이 손상되어 파싱할 수 없습니다", fix="dartlens-doctor --repair corp-code-cache --yes")
         return c
 
+    if not diag["entry_count"]:
+        # 파싱은 되는데 기업이 0곳 — 예전 버전이 DART 에러 응답을 캐시로 굳혀둔
+        # 모양이다. 예전엔 이 상태가 "최신 상태입니다"로 통과했다. 회사 조회는
+        # 전부 실패하는데 진단은 정상이라 원인을 찾을 수가 없다.
+        c.fail(
+            "캐시에 기업이 한 곳도 없습니다 — 내려받다 실패한 응답이 남은 것으로 보입니다",
+            fix="dartlens-doctor --repair corp-code-cache --yes",
+        )
+        return c
+
     if not diag["writable"]:
         c.fail("캐시 디렉토리에 쓰기 권한이 없어 갱신할 수 없습니다", fix="캐시 디렉토리 권한을 확인하세요")
         return c
@@ -521,7 +531,8 @@ def _corp_cache_check_from_diag(diag: dict) -> Check:
 
 
 def _corp_cache_error_code(diag: dict) -> str | None:
-    if not diag["exists"] or diag["parseable"] is False:
+    # entry_count 0 도 '없는 것'으로 다룬다 — 파일은 있지만 쓸 수 있는 내용이 없다.
+    if not diag["exists"] or diag["parseable"] is False or diag["entry_count"] == 0:
         return diagnostics.CORP_CODE_CACHE_MISSING
     if not diag["is_fresh"]:
         return diagnostics.CORP_CODE_CACHE_STALE
@@ -697,7 +708,14 @@ def main():
         try:
             result = _corp_code.repair_corp_code_cache(yes=args.yes)
         except Exception as e:
-            result = {"repaired": False, "message": f"복구 중 예상치 못한 오류: {type(e).__name__}: {e}"}
+            # `{e}` 를 그대로 쓰면 안 된다 — DART 호출 URL에는 `?crtfc_key=<40자리>`가
+            # 실리고 그게 예외 문자열에 통째로 들어간다(_corp_code 쪽과 같은 이유).
+            from dartlens._metrics import _error_detail
+
+            result = {
+                "repaired": False,
+                "message": f"복구 중 예상치 못한 오류: {type(e).__name__}: {_error_detail(e)}",
+            }
         if args.json:
             print(json.dumps(result, ensure_ascii=False))
         else:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import re
 import shutil
 import time
 import zipfile
@@ -80,17 +81,21 @@ async def _download_corp_code() -> bytes:
     기다릴 수 있으므로 기본값(2회)이면 최악의 경우 6분을 붙잡고 있게 된다.
     """
     raw = await get_bytes("/corpCode.xml", timeout=BULK_TIMEOUT, max_retries=1)
-    # zip 또는 raw XML — DART는 zip으로 응답
-    if raw[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            # 보통 'CORPCODE.xml' 단일 파일
-            names = zf.namelist()
-            if not names:
-                raise RuntimeError("corpCode zip이 비어있습니다.")
-            with zf.open(names[0]) as fp:
-                return fp.read()
-    # 에러 응답이 zip이 아닌 XML로 올 수 있음 — 그냥 반환
-    return raw
+    if raw[:2] != b"PK":
+        # 예전엔 zip이 아니면 "에러 응답이 XML로 올 수 있다"며 그대로 돌려줬다. 그게
+        # 호출 측에서 캐시로 굳었다 — DART의 에러 XML은 lxml로 잘 파싱되고 <list>가
+        # 없을 뿐이라, 예외 없이 '기업 0곳'짜리 캐시가 만들어지고 7일 동안 유지됐다.
+        # 그 사이 회사 조회는 전부 실패하는데 doctor는 "최신 상태"라고 말한다.
+        # 정상 응답은 항상 zip이다 — 아니면 실패로 다룬다.
+        snippet = _error_detail_from_bytes(raw)
+        raise RuntimeError(f"DART가 기업코드 파일 대신 다른 응답을 보냈습니다: {snippet}")
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        # 보통 'CORPCODE.xml' 단일 파일
+        names = zf.namelist()
+        if not names:
+            raise RuntimeError("corpCode zip이 비어있습니다.")
+        with zf.open(names[0]) as fp:
+            return fp.read()
 
 
 def _parse_xml(xml_bytes: bytes) -> list[CorpEntry]:
@@ -126,8 +131,30 @@ def _build_indexes(entries: list[CorpEntry]) -> None:
     _by_name_lower = by_name
 
 
+# 응답 본문 전용 마스킹. _metrics._error_detail 은 URL용이라 `?` 뒤를 통째로 지우는데,
+# 그걸 XML 본문에 쓰면 `<?xml ...?>` 선언에 걸려 뒤따르는 <status>013</status> 까지
+# 잘려나간다 — 하필 진단에 제일 필요한 값이다. 본문에 실릴 수 있는 건 (에러 페이지가
+# 요청 URL을 되비추는 경우의) crtfc_key 뿐이므로 그 값만 지운다.
+_BODY_SECRET_RE = re.compile(r"(crtfc_key\s*=\s*)([0-9A-Za-z]{4,})", re.IGNORECASE)
+
+
+def _error_detail_from_bytes(raw: bytes, limit: int = 200) -> str:
+    """받은 응답이 무엇이었는지 사람이 읽을 수 있게. 크리덴셜은 지우고 담는다."""
+    if not raw:
+        return "빈 응답"
+    text = raw[:limit].decode("utf-8", errors="replace").strip()
+    text = " ".join(text.split())
+    return _BODY_SECRET_RE.sub(lambda m: f"{m.group(1)}***", text)
+
+
 async def ensure_loaded(force_refresh: bool = False) -> None:
-    """corpCode.xml을 디스크 캐시에서 로드하거나, 만료/없으면 다운로드."""
+    """corpCode.xml을 디스크 캐시에서 로드하거나, 만료/없으면 다운로드.
+
+    검증을 통과한 것만 디스크에 남긴다. 예전엔 받은 바이트를 먼저 쓰고 나중에
+    파싱해서, 에러 응답이 그대로 캐시가 되어 '기업 0곳'인 채로 7일을 버텼다.
+    이미 그렇게 굳은 캐시(옛 버전이 만든 것)도 0건이면 무시하고 다시 받는다 —
+    재설치로는 안 풀리는 자리라(캐시는 패키지 밖에 있다) 스스로 벗어나야 한다.
+    """
     global _loaded_at
 
     async with _lock:
@@ -135,13 +162,24 @@ async def ensure_loaded(force_refresh: bool = False) -> None:
             return
 
         path = _cache_path()
-        if force_refresh or not _is_cache_fresh(path):
-            xml_bytes = await _download_corp_code()
-            path.write_bytes(xml_bytes)
-        else:
-            xml_bytes = path.read_bytes()
+        entries: list[CorpEntry] = []
 
-        entries = _parse_xml(xml_bytes)
+        if not force_refresh and _is_cache_fresh(path):
+            try:
+                entries = _parse_xml(path.read_bytes())
+            except Exception:
+                entries = []  # 손상된 캐시 — 아래에서 다시 받는다
+
+        if not entries:
+            xml_bytes = await _download_corp_code()
+            entries = _parse_xml(xml_bytes)
+            if not entries:
+                raise RuntimeError(
+                    "기업코드 파일을 받았지만 기업이 한 곳도 들어있지 않습니다. "
+                    "잠시 후 다시 시도해주세요."
+                )
+            path.write_bytes(xml_bytes)
+
         _build_indexes(entries)
         _loaded_at = time.time()
 

@@ -138,5 +138,80 @@ class RepairCorpCodeCacheTests(_TempCacheDirMixin, unittest.TestCase):
         self.assertIn("message", result)
 
 
+    # DART가 키 문제·한도 초과 등에서 돌려주는 형태. lxml로 잘 파싱되고 <list>만 없다.
+DART_ERROR_XML = (
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    "<result><status>013</status><message>조회된 데이타가 없습니다.</message></result>"
+).encode("utf-8")
+
+
+class ErrorResponseMustNotBecomeTheCache(_TempCacheDirMixin, unittest.TestCase):
+    """실사용에서 확인된 문제(2026-08-13, 뉴질랜드 문의 조사 중 발견).
+
+    DART가 zip 대신 에러 XML을 주면 예전 코드는 그걸 그대로 corpCode.xml로 저장했다.
+    예외도 안 나고, 파싱도 되고, <list>만 없어서 '기업 0곳'짜리 캐시가 7일을 버텼다.
+    그동안 회사 조회는 전부 실패하는데 doctor는 "최신 상태입니다"라고 말했고,
+    캐시가 패키지 밖(~/.dartlens)에 있어 재설치로도 안 풀렸다.
+    """
+
+    def _run_with_response(self, raw: bytes):
+        async def fake_get_bytes(endpoint, params=None, **kw):
+            return raw
+
+        with patch.object(_corp_code, "get_bytes", fake_get_bytes):
+            import asyncio
+
+            _corp_code._loaded_at = 0.0
+            return asyncio.run(_corp_code.ensure_loaded(force_refresh=True))
+
+    def test_error_xml_raises_instead_of_being_cached(self):
+        with self.assertRaises(Exception):
+            self._run_with_response(DART_ERROR_XML)
+        self.assertFalse(self._cache_path().exists(), "에러 응답이 캐시로 남았다")
+
+    def test_the_message_says_what_came_back(self):
+        with self.assertRaises(Exception) as ctx:
+            self._run_with_response(DART_ERROR_XML)
+        self.assertIn("013", str(ctx.exception))
+
+    def test_a_good_zip_is_still_cached(self):
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("CORPCODE.xml", SAMPLE_XML)
+        self._run_with_response(buf.getvalue())
+        self.assertTrue(self._cache_path().exists())
+        self.assertEqual(len(_corp_code._by_corp_code), 2)
+
+    def test_an_already_poisoned_cache_is_re_downloaded(self):
+        """옛 버전이 남긴 0건짜리 캐시에서 스스로 빠져나와야 한다 — 재설치로는 안 풀린다."""
+        self._cache_path().write_bytes(DART_ERROR_XML)
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("CORPCODE.xml", SAMPLE_XML)
+
+        async def fake_get_bytes(endpoint, params=None, **kw):
+            return buf.getvalue()
+
+        with patch.object(_corp_code, "get_bytes", fake_get_bytes):
+            import asyncio
+
+            _corp_code._loaded_at = 0.0
+            asyncio.run(_corp_code.ensure_loaded())  # force_refresh 없이도 회복해야 한다
+        self.assertEqual(len(_corp_code._by_corp_code), 2)
+
+    def test_doctor_calls_an_empty_cache_a_failure(self):
+        from dartlens import doctor
+
+        self._cache_path().write_bytes(DART_ERROR_XML)
+        check = doctor.check_corp_code_cache()
+        self.assertEqual(check.status, "fail")
+
+
 if __name__ == "__main__":
     unittest.main()
