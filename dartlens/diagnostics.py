@@ -298,7 +298,9 @@ def diagnose_license() -> LicenseDiagnosis:
 
     res = licensing.verify_key(key)
     if res["valid"]:
-        expiry = res.get("expires_on")
+        # 키에 박힌 날짜가 아니라 실제로 끝나는 날. 이 값이 매니저의 "N일 남음"
+        # 배지로 나가므로, 서명 날짜를 쓰면 "12월까지"라고 해놓고 9월에 잠긴다.
+        expiry = licensing.effective_expiry(res)
         masked = licensing.mask_tail(res["license_id"].upper())
         reason = licensing.license_block_reason()
         if reason in ("expired", "revoked", "clock"):
