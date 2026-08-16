@@ -31,7 +31,7 @@ from dartlens.server import _dart_meta, _identity_meta
 class ContractVersionTests(unittest.TestCase):
     def test_meta_version_matches_other_lenses(self):
         """세 Lens가 같은 규약을 쓰는지 확인하는 유일한 표식. 올릴 땐 셋 다 함께."""
-        self.assertEqual(rmeta.META_VERSION, 1)
+        self.assertEqual(rmeta.META_VERSION, 2)
 
     def test_marker_matches_stocklens(self):
         """StockLens가 먼저 쓰던 마커를 그대로 승계한다(파서 호환)."""
@@ -122,3 +122,39 @@ class HandoffChainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class CorrectionFilingTests(unittest.TestCase):
+    """정정공시 — "이 숫자는 그 뒤 정정됐습니다"를 말할 수 있는가.
+
+    DART API는 정정 반영본을 주므로 숫자 자체는 최신이 맞다. 문제는 그게 정정된
+    값이라는 사실을 말할 방법이 없었다는 것. 최근 5일 공시 100건 중 20건이
+    정정이었고, 부방은 2024 사업보고서를 2026-08-14에 정정했다(1년 8개월 뒤).
+    그 사이 같은 조회를 한 사람은 지금과 다른 숫자를 봤다.
+    """
+
+    def test_period_marker_matches_dart_naming(self):
+        """정기보고서 정정은 이름에 기간이 붙는다: '[기재정정]반기보고서 (2026.06)'."""
+        from dartlens.server import _REPRT_PERIOD_MONTH
+        self.assertEqual(_REPRT_PERIOD_MONTH["11011"], "12")  # 사업보고서
+        self.assertEqual(_REPRT_PERIOD_MONTH["11013"], "03")  # 1분기
+        self.assertEqual(_REPRT_PERIOD_MONTH["11012"], "06")  # 반기
+        self.assertEqual(_REPRT_PERIOD_MONTH["11014"], "09")  # 3분기
+
+    def test_note_names_the_correction_filing(self):
+        """무엇이 언제 정정됐는지, 원문을 어떻게 찾는지까지 줘야 확인이 가능하다."""
+        from dartlens.server import _correction_note
+        note = _correction_note({
+            "rcept_dt": "20260814",
+            "rcept_no": "20260814004258",
+            "report_nm": "[기재정정]반기보고서 (2026.06)",
+        })
+        self.assertIn("2026-08-14", note)
+        self.assertIn("20260814004258", note)
+        self.assertIn("[기재정정]반기보고서 (2026.06)", note)
+        self.assertIn("정정 반영본", note)
+
+    def test_no_correction_no_noise(self):
+        """정정이 없으면 아무 말도 하지 않는다. 항상 뜨는 경고는 무시된다."""
+        from dartlens.server import _correction_note
+        self.assertIsNone(_correction_note(None))

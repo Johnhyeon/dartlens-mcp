@@ -24,6 +24,7 @@ from dartlens._earnings_export import run_export
 from dartlens._http import get_bytes, get_json
 from dartlens._metrics import read_dart_call_status, track_metrics
 from dartlens import _result_meta as rmeta
+from datetime import date, timedelta
 from dartlens import diagnostics
 from dartlens._order_backlog import (
     OrderBacklogSeries,
@@ -145,6 +146,17 @@ DART 분기/반기 보고서의 손익은 두 가지 금액이 함께 존재합�
   - 긴 보고서 본문 미반환 → 학습지식으로 메우지 말고 `find=`로 다시 조회하세요.
 - 메타 블록은 내부용입니다. JSON을 사용자에게 그대로 보여주지 말고 필요한 사실만
   문장으로 옮기세요.
+
+## 📌 정정공시
+
+정기보고서는 나중에 정정되는 일이 흔합니다(최근 표본에서 5건 중 1건). 재무 조회
+결과에 `⚠️ 이 보고서는 **정정공시가 있습니다**`가 붙으면:
+
+- 표의 수치는 **정정 반영본이라 지금은 맞습니다.** 숫자를 의심하지 마세요.
+- 다만 사용자가 **예전에 받아둔 값과 다를 수 있다**는 사실을 함께 알려주세요.
+- 무엇이 어떻게 바뀌었는지 확인하려면 안내된 rcept_no로 `get_disclosure_detail`을
+  부르세요. 정정 사유와 정정 전후 대비표가 본문에 들어 있습니다.
+- 경고가 없으면 그 보고서에 정정이 없다는 뜻입니다. 굳이 언급하지 마세요.
 """,
 )
 
@@ -529,6 +541,74 @@ def _fmt_won(value) -> str:
     return f"{sign}{n:,}"
 
 
+# 정기보고서 정정공시는 이름에 대상 기간이 붙는다: "[기재정정]반기보고서 (2026.06)".
+# reprt_code → 그 기간 표기의 월. 이걸로 "이 재무수치의 근거 보고서가 정정됐는지"를
+# 가린다. 최근 5일 공시 100건 중 20건이 정정이었고, 부방은 2024 사업보고서를
+# 2026-08-14에 정정했다 — 1년 8개월 뒤다. 그 사이 조회한 사람은 다른 숫자를 받았다.
+_REPRT_PERIOD_MONTH = {"11011": "12", "11013": "03", "11012": "06", "11014": "09"}
+
+# 정정을 얼마나 거슬러 찾을지. 기간 종료일부터 오늘까지 훑되 3년으로 자른다.
+_CORRECTION_LOOKBACK_YEARS = 3
+
+
+@cached(ttl_seconds=6 * 3600)
+async def _fetch_corrections(corp_code: str, bgn_de: str, end_de: str) -> list[dict]:
+    """해당 회사의 정기공시(A) 중 정정 건만."""
+    try:
+        data = await get_json(
+            "/list.json",
+            params={
+                "corp_code": corp_code,
+                "bgn_de": bgn_de,
+                "end_de": end_de,
+                "pblntf_ty": "A",
+                "page_count": "100",
+            },
+        )
+    except DartApiError:
+        return []
+    return [r for r in (data.get("list") or []) if "정정" in (r.get("report_nm") or "")]
+
+
+async def find_correction(corp_code: str, bsns_year: str, reprt_code: str) -> dict | None:
+    """이 정기보고서에 대한 정정공시가 있으면 가장 최근 건을 돌려준다.
+
+    DART API는 정정 반영본을 주므로 **숫자 자체는 최신이 맞다.** 문제는 그게
+    정정된 값이라는 사실을 말할 방법이 없다는 것. 예전에 같은 조회를 한 사람은
+    다른 숫자를 봤고, 그걸 알 방법이 없었다.
+    """
+    month = _REPRT_PERIOD_MONTH.get(reprt_code)
+    if not month:
+        return None
+    marker = f"({bsns_year}.{month})"
+
+    period_end = date(int(bsns_year), int(month), 28)
+    today = date.today()
+    if period_end > today:
+        return None
+    bgn = max(period_end, today - timedelta(days=365 * _CORRECTION_LOOKBACK_YEARS))
+
+    rows = await _fetch_corrections(
+        corp_code, bgn.strftime("%Y%m%d"), today.strftime("%Y%m%d")
+    )
+    hits = [r for r in rows if marker in (r.get("report_nm") or "")]
+    if not hits:
+        return None
+    return max(hits, key=lambda r: (r.get("rcept_dt", ""), r.get("rcept_no", "")))
+
+
+def _correction_note(correction: dict | None) -> str | None:
+    if not correction:
+        return None
+    dt = (correction.get("rcept_dt") or "")
+    dt = f"{dt[:4]}-{dt[4:6]}-{dt[6:]}" if len(dt) == 8 else dt
+    return (
+        f"⚠️ 이 보고서는 **정정공시가 있습니다** — {dt} `{correction.get('report_nm')}` "
+        f"(rcept_no=`{correction.get('rcept_no')}`). 위 수치는 정정 반영본이지만, "
+        "예전에 받아둔 값과 다를 수 있습니다. 원문 대조가 필요하면 이 접수번호를 보세요."
+    )
+
+
 def _identity_meta(entry) -> dict:
     """search_company 전용 — 식별자 변환 결과 자체가 이 도구의 산출물이다.
 
@@ -786,6 +866,9 @@ async def get_major_accounts(
     "삼성전자 영업이익" 같은 흔한 질문에 가장 빠르게 답하는 도구. 사업보고서면
     3개년 비교, 분기/반기는 2개년.
 
+    정정공시가 있으면 표 아래에 안내가 붙습니다 — 수치는 정정 반영본이지만
+    사용자가 예전에 받아둔 값과 다를 수 있습니다.
+
     **분기/반기 손익은 3개월과 누적이 별도 컬럼으로 나옵니다** (예: 반기보고서 →
     `2분기(3개월)` / `상반기 누적` / `전년 2분기` / `전년 상반기`). "상반기 매출"을
     물었으면 누적 컬럼을 쓰세요 — 보고서가 반기라고 모든 숫자가 누적인 게 아닙니다.
@@ -804,12 +887,18 @@ async def get_major_accounts(
     rc = normalize_reprt_code(reprt_code)
     data = await _fetch_major_accounts(cc, yr, rc)
     rows = data.get("list") or []
+    correction = await find_correction(cc, yr, rc) if rows else None
+    note = _correction_note(correction)
+    body = _format_major_accounts(data, corp_code=cc, bsns_year=yr, reprt_code=rc)
+    if note:
+        body = f"{body}\n\n{note}"
     return rmeta.append_meta(
-        _format_major_accounts(data, corp_code=cc, bsns_year=yr, reprt_code=rc),
+        body,
         _dart_meta(
             rows=rows, corp_code=cc,
             data_period=f"{yr} {reprt_code_label(rc)}",
             data_completeness=rmeta.COMPLETE if rows else rmeta.NONE,
+            warnings=[note] if note else None,
         ),
     )
 
@@ -943,14 +1032,20 @@ async def get_full_financial(
     sj = normalize_sj_div(sj_div)
     data = await _fetch_full_financial(cc, yr, rc, fs)
     rows = data.get("list") or []
+    correction = await find_correction(cc, yr, rc) if rows else None
+    note = _correction_note(correction)
+    body = _format_full_financial(
+        data, corp_code=cc, bsns_year=yr, reprt_code=rc, fs_div=fs, sj_div=sj
+    )
+    if note:
+        body = f"{body}\n\n{note}"
     return rmeta.append_meta(
-        _format_full_financial(
-            data, corp_code=cc, bsns_year=yr, reprt_code=rc, fs_div=fs, sj_div=sj
-        ),
+        body,
         _dart_meta(
             rows=rows, corp_code=cc,
             data_period=f"{yr} {reprt_code_label(rc)} ({fs})",
             data_completeness=rmeta.COMPLETE if rows else rmeta.NONE,
+            warnings=[note] if note else None,
         ),
     )
 
