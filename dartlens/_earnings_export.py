@@ -17,7 +17,7 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from dartlens._cache import EarningsCache
-from dartlens._earnings import ScanRow, collect_scan_rows
+from dartlens._earnings import ScanRow, basis_note, collect_scan_rows
 from dartlens._metrics import get_data_dir
 
 EXPORT_HEADERS = [
@@ -64,6 +64,7 @@ class ExportResult:
     missing: int
     amount_unit: str
     warnings: list[str]
+    basis_note: str = ""
 
     def to_markdown(self) -> str:
         unit_label = "억원" if self.amount_unit == "eok" else "원"
@@ -71,7 +72,7 @@ class ExportResult:
             "# 실적 스캔 파일 생성",
             "",
             f"검증: {self.row_count}행 × {self.column_count}열 정상 확인",
-            f"금액 단위: {unit_label} 숫자",
+            f"금액 단위: {unit_label} 숫자 / 금액 기준: {self.basis_note or '보고서 기준'}",
             f"조회 회사: {self.universe_size} / 데이터 보유: {self.data_count} / 결측: {self.missing}",
             "",
             "| 형식 | 파일 | 크기 | 검증 |",
@@ -386,4 +387,5 @@ async def run_export(
         missing=scan.missing,
         amount_unit=amount_unit,
         warnings=warnings,
+        basis_note=basis_note(scan.reprt_code, scan.rows),
     )

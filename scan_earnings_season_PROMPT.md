@@ -69,11 +69,15 @@ GET https://opendart.fss.or.kr/api/fnlttMultiAcnt.json
 - `account_nm`: "매출액" | "영업이익" | "당기순이익" | "자산총계" | ...
 - `fs_div`: "CFS"(연결) | "OFS"(개별)
 - `sj_div`: "BS"(재무상태표) | "IS"(손익) | "CIS"(포괄손익) | "CF"(현금흐름)
-- `thstrm_amount`: 당기 금액 (문자열, 콤마 포함 가능)
+- `thstrm_amount`: 당기 금액 — **분기/반기 IS는 해당 3개월치** (문자열, 콤마 포함 가능)
+- `thstrm_add_amount`: 당기 누적 (분기/반기 IS에만 존재)
 - `frmtrm_amount`: 전기 동기(직전 동일 보고서) 금액
+- `frmtrm_add_amount`: 전기 동기 누적
 - `bfefrmtrm_amount`: 전전기
 
-**Q1 보고서의 IS 계정 한정:** `thstrm_amount` = 누적 = 분기 금액 (동일). Q2 이후는 누적/분기 구분이 필요하지만 **v1은 누적 기준으로만 처리하고 비고에 명시**.
+**3개월 vs 누적 (2026-08-16 수정):** `thstrm_amount`는 분기/반기 IS에서 **해당 3개월**이고 `thstrm_nm`은 보고서 종류명("제39기 반기")만 준다. 라벨을 그대로 믿으면 3개월치가 누적으로 읽힌다 — 디오 2026 반기 매출 449억(2분기)을 상반기로 오독한 고객 문의가 실제로 나왔다. Q1은 3개월=누적이라 두 값이 같다.
+
+스캔은 `period`가 약속한 기간(2026H1=상반기)에 맞춰 **`thstrm_add_amount`(누적)를 우선 사용**한다. 3개월 값은 `_q_cur`/`_q_prev`에 보존하고, 어느 쪽을 썼는지는 `basis`("annual"/"cum"/"3m")로 표시. 누적 미제출 회사는 비고에 `⚠3개월값`.
 
 **YoY 계산:** `frmtrm_amount`로 1차 YoY 가능. 단 일부 회사는 frmtrm 결측 — 그 경우 전년도 같은 `(bsns_year-1, reprt_code)`를 별도 chunk로 호출해 보완.
 
@@ -158,7 +162,7 @@ _데이터 결측 41건 · API 실패 0건 · 캐시 hit 740 / API fetch 81._
 - 잠정실적공시(주요사항보고서) 머지 → v2
 - KOSPI200 · 섹터별 universe → v2 (v1은 all/kospi/kosdaq/corp_code 리스트만)
 - 컨센서스 대비 서프라이즈 → stocklens 영역, 별도 통합 작업
-- Q2/Q3 누적이 아닌 분기별 환산 → v2
+- ~~Q2/Q3 누적이 아닌 분기별 환산 → v2~~ (2026-08-16 해결: `thstrm_add_amount`가 누적, `thstrm_amount`가 3개월. 스캔은 누적, 3개월은 `_q_cur`에 보존)
 - Q4 / H2 → v2 (잠정실적과 함께)
 - 시총 필터(`min_market_cap`) → 시총 데이터 source 별도, v2
 - OFS 폴백 → v2

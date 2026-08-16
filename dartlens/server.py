@@ -108,6 +108,24 @@ Claude가 조정자입니다.
 - reprt_code: "annual"(사업), "Q1"(1분기), "H1"(반기), "Q3"(3분기) — 한글 라벨도 인식.
 - fs_div: "CFS"(연결재무제표 — 기본), "OFS"(별도재무제표).
 - sj_div: "BS"(재무상태표), "IS"(손익계산서), "CIS"(포괄손익), "CF"(현금흐름표), "SCE"(자본변동표).
+
+## 🚨 분기·반기 손익: 3개월 vs 누적 (반드시 컬럼명을 읽으세요)
+
+DART 분기/반기 보고서의 손익은 두 가지 금액이 함께 존재합니다. 표의 컬럼명이
+어느 쪽인지 이미 말해주고 있으니 **컬럼명을 그대로 인용**하세요.
+
+- `2분기(3개월)` / `3분기(3개월)` — 그 분기 3개월치만
+- `상반기 누적` / `3분기 누적` — 연초부터 쌓인 값
+
+반기보고서를 조회했다고 그 숫자가 상반기 누적인 게 아닙니다. 예: 디오 2026 반기
+매출은 2분기 449억 / 상반기 누적 862억으로 컬럼이 따로 나옵니다. "상반기 매출"을
+물었으면 **누적 컬럼**을, "2분기 실적"을 물었으면 3개월 컬럼을 쓰세요.
+
+재무상태표는 시점 값이라 누적이 없고, 전기 컬럼은 전년 **말**(12/31)입니다 —
+전년 반기말이 아닙니다. 손익의 전기 컬럼만 전년 동기입니다.
+
+`⚠️ 3개월/누적 구분이 불가` 경고가 붙으면 그 회사는 누적을 제출하지 않은 것이니
+금액을 누적으로 단정하지 말고 `get_disclosure_detail`로 원문 매출실적표를 대조하세요.
 """,
 )
 
@@ -484,13 +502,116 @@ def _fmt_won(value) -> str:
     return f"{sign}{n:,}"
 
 
+def _has_amount(value) -> bool:
+    """DART 금액 필드에 실제 값이 있는지. 결측은 None / "" / "-" 셋 다 온다."""
+    if value is None:
+        return False
+    return str(value).strip() not in ("", "-")
+
+
+def _amount_key(value) -> str:
+    """금액 동일성 비교용 — 콤마·공백 표기 차이 무시."""
+    return str(value or "").replace(",", "").strip()
+
+
+# fnlttSinglAcntAll은 분기/반기 손익의 전년동기를 frmtrm_amount가 아니라
+# frmtrm_q_amount로 내려보낸다. 한쪽만 읽으면 전기 컬럼이 통째로 비어버린다.
+_PREV_KEYS = ("frmtrm_amount", "frmtrm_q_amount")
+
+
+def _pick_amount(row: dict, keys: tuple[str, ...]):
+    """후보 필드 중 값이 있는 첫 번째."""
+    for k in keys:
+        v = row.get(k)
+        if _has_amount(v):
+            return v
+    return None
+
+
+# 분기·반기 정기보고서 손익 컬럼 라벨 (3개월 / 누적 / 전년 3개월 / 전년 누적).
+# DART는 thstrm_amount에 '해당 3개월', thstrm_add_amount에 '당해 누적'을 담으면서
+# thstrm_nm으로는 보고서 종류명("제 39 기 반기")만 준다. 그 라벨을 그대로 붙이면
+# 3개월 값이 누적치로 읽힌다 (디오 2026 반기 매출: 3개월 449억 / 누적 863억).
+_QUARTER_COLS = {
+    "11013": ("1분기(3개월)", "1분기 누적", "전년 1분기", "전년 1분기 누적"),
+    "11012": ("2분기(3개월)", "상반기 누적", "전년 2분기", "전년 상반기"),
+    "11014": ("3분기(3개월)", "3분기 누적", "전년 3분기", "전년 3분기 누적"),
+}
+
+_CUM_MISSING_NOTE = (
+    "_⚠️ 이 보고서는 손익에 누적 컬럼이 없어 3개월/누적 구분이 불가합니다. "
+    "위 금액을 누적으로 단정하지 말고 DART 원문 표를 대조하세요._"
+)
+
+
+def _period_columns(
+    rows: list[dict], reprt_code: str
+) -> tuple[list[tuple[str, tuple[str, ...]]], bool]:
+    """이 표에 쓸 (컬럼 헤더, 값 후보 필드) 목록과 '3개월/누적 구분 불가' 플래그.
+
+    같은 보고서 안에서도 재무상태표(시점)와 손익계산서(기간)는 기간이 다르다.
+    반기보고서 BS의 전기는 '제38기말'(전년 12/31)인데 IS의 전기는 '제38기 반기'다.
+    라벨을 보고서 전체에 하나로 뭉치면 BS 비교 시점이 틀리므로 표 단위로 호출한다.
+    """
+
+    def first_nm(*keys: str) -> str:
+        for k in keys:
+            for r in rows:
+                v = (r.get(k) or "").strip()
+                if v:
+                    return v
+        return ""
+
+    is_income = any((r.get("sj_div") or "").strip() in ("IS", "CIS") for r in rows)
+    has_cum = any(_has_amount(r.get("thstrm_add_amount")) for r in rows)
+    # 1분기는 3개월 = 누적이라 두 값이 같다. 같은 숫자를 두 컬럼에 낼 이유가 없다.
+    cum_differs = any(
+        _has_amount(r.get("thstrm_add_amount"))
+        and _amount_key(r["thstrm_add_amount"]) != _amount_key(r.get("thstrm_amount"))
+        for r in rows
+    )
+
+    if has_cum and cum_differs and reprt_code in _QUARTER_COLS:
+        q, cum, prev_q, prev_cum = _QUARTER_COLS[reprt_code]
+        return [
+            (q, ("thstrm_amount",)),
+            (cum, ("thstrm_add_amount",)),
+            (prev_q, _PREV_KEYS),
+            (prev_cum, ("frmtrm_add_amount",)),
+        ], False
+
+    cols = [
+        (first_nm("thstrm_nm") or "당기", ("thstrm_amount",)),
+        (first_nm("frmtrm_nm", "frmtrm_q_nm") or "전기", _PREV_KEYS),
+    ]
+    if any(_has_amount(r.get("bfefrmtrm_amount")) for r in rows):
+        cols.append((first_nm("bfefrmtrm_nm") or "전전기", ("bfefrmtrm_amount",)))
+
+    # 반기/3분기인데 누적 컬럼이 아예 없으면 thstrm_amount가 3개월인지 누적인지 모른다.
+    return cols, is_income and reprt_code in ("11012", "11014") and not has_cum
+
+
+def _render_amount_table(
+    rows: list[dict], cols: list[tuple[str, tuple[str, ...]]]
+) -> list[str]:
+    lines = [
+        "| 계정 | " + " | ".join(h for h, _ in cols) + " |",
+        "|---" + "|---:" * len(cols) + "|",
+    ]
+    for r in rows:
+        acc = (r.get("account_nm") or "").strip() or "(이름없음)"
+        cells = " | ".join(_fmt_won(_pick_amount(r, keys)) for _, keys in cols)
+        lines.append(f"| {acc} | {cells} |")
+    return lines
+
+
 def _dedup_account_rows(items: list[dict]) -> list[dict]:
     """DART fnlttSinglAcnt가 동일 항목을 두 번 내려보내는 노이즈 제거.
 
     예: 삼성전자 사업보고서에서 '당기순이익(손실)'이 IS 안에 ord=29와 ord=61로 두 번 박힘.
     fs_div, sj_div, account_nm, 모든 amount가 100% 같음 (ord만 다름).
 
-    안전을 위해 6중 키가 정확히 일치할 때만 dedup. amount 한 글자라도 다르면 보존
+    안전을 위해 전 키가 정확히 일치할 때만 dedup. amount 한 글자라도 다르면 보존
     (지배/비지배 구분 같은 의미 있는 행일 수 있음). 낮은 ord 우선 보존.
     """
     seen: dict[tuple, tuple[int, dict]] = {}
@@ -500,7 +621,9 @@ def _dedup_account_rows(items: list[dict]) -> list[dict]:
             (r.get("sj_div") or "").strip(),
             (r.get("account_nm") or "").strip(),
             (r.get("thstrm_amount") or "").strip(),
+            (r.get("thstrm_add_amount") or "").strip(),
             (r.get("frmtrm_amount") or "").strip(),
+            (r.get("frmtrm_add_amount") or "").strip(),
             (r.get("bfefrmtrm_amount") or "").strip(),
         )
         try:
@@ -527,30 +650,16 @@ def _format_major_accounts(
 
     # fs_div(CFS/OFS) → sj_nm(재무제표명) → rows
     grouped: dict[str, dict[str, list[dict]]] = {}
-    nm_periods: dict[str, str] = {"thstrm": "", "frmtrm": "", "bfefrmtrm": ""}
     for r in items:
         fs = r.get("fs_div") or ""
         sj = r.get("sj_nm") or "(미분류)"
         grouped.setdefault(fs, {}).setdefault(sj, []).append(r)
-        # 기간 라벨 (마지막으로 본 값으로)
-        for k in nm_periods:
-            v = r.get(f"{k}_nm")
-            if v:
-                nm_periods[k] = v
 
     fs_label = {"CFS": "연결재무제표", "OFS": "별도재무제표"}
     lines = [title]
 
     # CFS를 먼저 보여주기 (대부분의 분석 표준)
     fs_order = sorted(grouped.keys(), key=lambda x: 0 if x == "CFS" else 1)
-
-    has_bfe = any(
-        (r.get("bfefrmtrm_amount") or "").strip() not in ("", "-")
-        for r in items
-    )
-    cur_label = nm_periods["thstrm"] or "당기"
-    prev_label = nm_periods["frmtrm"] or "전기"
-    bfe_label = nm_periods["bfefrmtrm"] or "전전기"
 
     for fs in fs_order:
         lines.append("")
@@ -563,23 +672,13 @@ def _format_major_accounts(
                     int(r.get("ord", "999") or 999),
                 ),
             )
+            cols, ambiguous = _period_columns(rows_sorted, reprt_code)
             lines.append("")
             lines.append(f"### {sj}")
-            if has_bfe:
-                lines.append(f"| 계정 | {cur_label} | {prev_label} | {bfe_label} |")
-                lines.append("|---|---:|---:|---:|")
-            else:
-                lines.append(f"| 계정 | {cur_label} | {prev_label} |")
-                lines.append("|---|---:|---:|")
-            for r in rows_sorted:
-                acc = (r.get("account_nm") or "").strip() or "(이름없음)"
-                cur = _fmt_won(r.get("thstrm_amount"))
-                prev = _fmt_won(r.get("frmtrm_amount"))
-                if has_bfe:
-                    bfe = _fmt_won(r.get("bfefrmtrm_amount"))
-                    lines.append(f"| {acc} | {cur} | {prev} | {bfe} |")
-                else:
-                    lines.append(f"| {acc} | {cur} | {prev} |")
+            lines.extend(_render_amount_table(rows_sorted, cols))
+            if ambiguous:
+                lines.append("")
+                lines.append(_CUM_MISSING_NOTE)
 
     # 통화 단위 안내
     currency = (items[0].get("currency") or "KRW").strip()
@@ -598,8 +697,13 @@ async def get_major_accounts(
 ) -> str:
     """주요계정 — 정기보고서의 핵심 재무 (매출/영업이익/순이익/자산/부채/자본 등).
 
-    "삼성전자 영업이익" 같은 흔한 질문에 가장 빠르게 답하는 도구. 당기/전기/(전전기)
-    까지 비교해서 마크다운 표로 반환합니다. 사업보고서면 3개년 비교, 분기/반기는 2개년.
+    "삼성전자 영업이익" 같은 흔한 질문에 가장 빠르게 답하는 도구. 사업보고서면
+    3개년 비교, 분기/반기는 2개년.
+
+    **분기/반기 손익은 3개월과 누적이 별도 컬럼으로 나옵니다** (예: 반기보고서 →
+    `2분기(3개월)` / `상반기 누적` / `전년 2분기` / `전년 상반기`). "상반기 매출"을
+    물었으면 누적 컬럼을 쓰세요 — 보고서가 반기라고 모든 숫자가 누적인 게 아닙니다.
+    재무상태표는 시점 값이라 전기 컬럼이 전년 **말**(12/31)입니다.
 
     Args:
         corp_code: DART 8자리 고유번호. 모르면 search_company를 먼저.
@@ -697,40 +801,14 @@ def _format_full_financial(
         return "\n".join(lines)
 
     # sj_div 지정 → 표 출력
-    nm_periods: dict[str, str] = {"thstrm": "", "frmtrm": "", "bfefrmtrm": ""}
-    for r in items:
-        for k in nm_periods:
-            v = r.get(f"{k}_nm")
-            if v and not nm_periods[k]:
-                nm_periods[k] = v
-
-    has_bfe = any(
-        (r.get("bfefrmtrm_amount") or "").strip() not in ("", "-")
-        for r in items
-    )
-    cur_label = nm_periods["thstrm"] or "당기"
-    prev_label = nm_periods["frmtrm"] or "전기"
-    bfe_label = nm_periods["bfefrmtrm"] or "전전기"
-
     items_sorted = sorted(items, key=lambda r: int(r.get("ord", "999") or 999))
+    cols, ambiguous = _period_columns(items_sorted, reprt_code)
 
     lines = [title, "", f"## {_SJ_DIV_LABEL.get(sj_div, sj_div)} ({len(items_sorted)}행)"]
-    if has_bfe:
-        lines.append(f"| 계정 | {cur_label} | {prev_label} | {bfe_label} |")
-        lines.append("|---|---:|---:|---:|")
-    else:
-        lines.append(f"| 계정 | {cur_label} | {prev_label} |")
-        lines.append("|---|---:|---:|")
-
-    for r in items_sorted:
-        acc = (r.get("account_nm") or "").strip() or "(이름없음)"
-        cur = _fmt_won(r.get("thstrm_amount"))
-        prev = _fmt_won(r.get("frmtrm_amount"))
-        if has_bfe:
-            bfe = _fmt_won(r.get("bfefrmtrm_amount"))
-            lines.append(f"| {acc} | {cur} | {prev} | {bfe} |")
-        else:
-            lines.append(f"| {acc} | {cur} | {prev} |")
+    lines.extend(_render_amount_table(items_sorted, cols))
+    if ambiguous:
+        lines.append("")
+        lines.append(_CUM_MISSING_NOTE)
 
     currency = (items[0].get("currency") or "KRW").strip()
     lines.append("")
@@ -752,6 +830,9 @@ async def get_full_financial(
 
     행이 많으므로 (손익만 30~70행, 전체 200+) **반드시 sj_div로 한 표만 골라 호출**.
     sj_div를 비우면 구분별 행 수만 요약하고 표는 안 줌 (토큰 절약).
+
+    분기/반기 손익(IS/CIS)은 `2분기(3개월)` / `상반기 누적`처럼 3개월과 누적이
+    별도 컬럼으로 나옵니다. 컬럼명을 그대로 인용하세요.
 
     Args:
         corp_code: DART 8자리 고유번호.

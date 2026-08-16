@@ -102,7 +102,7 @@ dartlens-setup --plaintext <KEY>
 | `search_company` | 종목명/종목코드 → corp_code + 기업개황 |
 | `list_disclosures` | 기간·유형별 공시 목록 (rcept_no 반환) |
 | `get_disclosure_detail` | 짧은 공시는 본문 발췌, 긴 보고서는 인덱스 + viewer URL. `find="키워드"`로 본문 검색 |
-| `get_major_accounts` | 정기보고서 핵심 재무 (매출/영업이익/순이익/자산/부채/자본 — 당기·전기·전전기 비교) |
+| `get_major_accounts` | 정기보고서 핵심 재무 (매출/영업이익/순이익/자산/부채/자본). 분기·반기 손익은 3개월/누적 컬럼 분리 |
 | `get_full_financial` | 전체 재무제표. sj_div(BS/IS/CIS/CF/SCE) 필수 |
 | `get_order_backlog` | 사업/분기/반기보고서 표에서 수주잔고·계약잔액 추이를 구조화 |
 | `get_major_holders` | 5%룰 대량보유 변동 — 외인/펀드/행동주의 진입 추적 |

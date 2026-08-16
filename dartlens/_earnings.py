@@ -220,14 +220,21 @@ _NI_NAMES = {
 
 
 def extract_accounts(
-    rows: list[dict], corp_code: str, fs_div: str
+    rows: list[dict], corp_code: str, fs_div: str, reprt_code: str = ""
 ) -> dict | None:
     """한 회사의 fnlttMultiAcnt 행들에서 (매출/영업이익/순이익) 당기·전기 추출.
 
     fs_div 일치 행만 사용. 같은 계정이 IS/CIS 양쪽에 있으면 먼저 본 값 우선.
     핵심 세 계정이 모두 결측이면 None (데이터 미보유로 간주, 캐시 안 함).
-    반환: {corp_name, rcept_no, filing_date, rev_cur, rev_prev, op_cur,
-    op_prev, ni_cur, ni_prev}
+
+    **기준 주의**: DART는 분기/반기 보고서 손익에 thstrm_amount(해당 3개월)와
+    thstrm_add_amount(당해 누적)를 함께 준다. period="2026H1"은 상반기를 뜻하므로
+    누적이 있으면 누적을 `_cur`/`_prev`로 쓴다. 3개월 값은 `_q_cur`/`_q_prev`에
+    따로 보존. 어느 쪽을 썼는지는 `basis`가 알려준다
+    ("annual" | "cum"=누적 | "3m"=누적 미제출로 3개월 사용 | "unknown").
+
+    반환: {corp_name, rcept_no, filing_date, basis,
+    rev_cur, rev_prev, rev_q_cur, rev_q_prev, op_*, ni_*}
     """
     corp_rows = [
         r
@@ -258,10 +265,31 @@ def extract_accounts(
         return None
 
     out: dict = {"corp_name": corp_name, "rcept_no": rcept_no, "filing_date": filing_date}
+    used_cum = False
     for bucket in ("rev", "op", "ni"):
         r = picked.get(bucket)
-        out[f"{bucket}_cur"] = parse_won(r.get("thstrm_amount")) if r else None
-        out[f"{bucket}_prev"] = parse_won(r.get("frmtrm_amount")) if r else None
+        q_cur = parse_won(r.get("thstrm_amount")) if r else None
+        q_prev = parse_won(r.get("frmtrm_amount")) if r else None
+        cum_cur = parse_won(r.get("thstrm_add_amount")) if r else None
+        cum_prev = parse_won(r.get("frmtrm_add_amount")) if r else None
+        if cum_cur is not None:
+            used_cum = True
+            out[f"{bucket}_cur"] = cum_cur
+            out[f"{bucket}_prev"] = cum_prev if cum_prev is not None else q_prev
+        else:
+            out[f"{bucket}_cur"] = q_cur
+            out[f"{bucket}_prev"] = q_prev
+        out[f"{bucket}_q_cur"] = q_cur
+        out[f"{bucket}_q_prev"] = q_prev
+
+    if reprt_code == "11011":
+        out["basis"] = "annual"          # 사업보고서엔 누적 개념이 없다
+    elif used_cum:
+        out["basis"] = "cum"
+    elif reprt_code in ("11012", "11013", "11014"):
+        out["basis"] = "3m"              # 누적 미제출 → 3개월 값만 있음
+    else:
+        out["basis"] = "unknown"
     return out
 
 
@@ -288,6 +316,7 @@ class ScanRow:
     flagged: bool = False
     sector: str = ""   # KRX 업종(KSIC)
     product: str = ""  # KRX 주요제품(free-text)
+    basis: str = ""    # 금액 기준: annual / cum(누적) / 3m(누적 미제출) / unknown
 
 
 @dataclass
@@ -349,6 +378,10 @@ def compute_row(corp_code: str, acc: dict) -> ScanRow:
     if flagged:
         notes.insert(0, "⚠원본확인")
 
+    # 표 전체는 누적 기준인데 이 회사만 누적 미제출 → 3개월 값이라 나란히 못 읽는다.
+    if acc.get("basis") == "3m":
+        notes.insert(0, "⚠3개월값")
+
     return ScanRow(
         corp_code=corp_code,
         corp_name=acc.get("corp_name") or "",
@@ -364,6 +397,7 @@ def compute_row(corp_code: str, acc: dict) -> ScanRow:
         rcept_no=acc.get("rcept_no") or "",
         filing_date=acc.get("filing_date") or "",
         flagged=flagged,
+        basis=acc.get("basis") or "",
     )
 
 
@@ -411,14 +445,15 @@ _CHUNK = 100  # DART fnlttMultiAcnt 회사 한도
 _MAX_CONCURRENT_CHUNKS = 5
 
 
-def _has_receipt_schema(acc: dict) -> bool:
-    """v2 cache schema guard.
+def _has_current_schema(acc: dict) -> bool:
+    """cache schema guard.
 
-    bea5cd3 이전 EarningsCache payload에는 rcept_no/filing_date가 없어
-    새 출력에서 공시일이 N/A가 된다. 값이 빈 문자열일 수는 있으므로
-    truthiness가 아니라 키 존재 여부로 새 스키마를 판정한다.
+    v2: bea5cd3 이전 payload에는 rcept_no/filing_date가 없어 공시일이 N/A가 된다.
+    v3: 누적/3개월 분리 이전 payload는 _cur가 3개월 값인데 누적으로 표시되므로
+        (`basis` 키 부재로 판별) 반드시 재조회한다.
+    값이 빈 문자열/None일 수는 있으므로 truthiness가 아니라 키 존재로 판정한다.
     """
-    return "rcept_no" in acc and "filing_date" in acc
+    return "rcept_no" in acc and "filing_date" in acc and "basis" in acc
 
 
 async def _fetch_year(
@@ -442,7 +477,7 @@ async def _fetch_year(
     result: dict[str, dict] = {}
     misses: list[str] = []
     for cc, k in keys.items():
-        if k in cached and _has_receipt_schema(cached[k]):
+        if k in cached and _has_current_schema(cached[k]):
             result[cc] = cached[k]
         else:
             misses.append(cc)
@@ -464,7 +499,7 @@ async def _fetch_year(
             api_calls += 1
             out: dict[str, dict] = {}
             for cc in chunk:
-                acc = extract_accounts(rows, cc, fs_div)
+                acc = extract_accounts(rows, cc, fs_div, reprt_code)
                 if acc is not None:
                     out[cc] = acc
             return out
@@ -816,6 +851,28 @@ def _format_sector_markdown(
     return "\n".join(lines)
 
 
+_BASIS_LABEL = {
+    "11011": "연간 기준",
+    "11013": "1분기 기준(3개월=누적)",
+    "11012": "상반기 누적 기준",
+    "11014": "3분기 누적(1~9월) 기준",
+}
+
+
+def basis_note(reprt_code: str, rows: list[ScanRow]) -> str:
+    """금액이 누적인지 3개월인지 명시. 예전 각주는 'Q2 이후는 누적 기준'이라
+    적어놓고 실제로는 3개월 값(thstrm_amount)을 써서 정반대였다.
+    """
+    note = _BASIS_LABEL.get(reprt_code, "보고서 기준")
+    three_m = sum(1 for r in rows if r.basis == "3m")
+    if three_m:
+        note += (
+            f". ⚠3개월값 {three_m}건은 누적 미제출로 해당 분기(3개월) 금액이라 "
+            "누적과 나란히 비교 불가"
+        )
+    return note
+
+
 def _format_markdown(
     *,
     top: list[ScanRow],
@@ -870,7 +927,7 @@ def _format_markdown(
     lines.append("")
     lines.append(
         f"_금액 단위: 조/억 자동 절사. YoY는 전년동기({prev_label}) 대비. "
-        "Q2 이후는 누적 기준(분기 환산은 v2)._"
+        f"{basis_note(reprt_code, top)}_"
     )
     lines.append(
         f"_시간축: 실적 기간은 {period}, 공시 접수일은 회사별로 다릅니다. "
