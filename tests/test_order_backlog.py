@@ -298,3 +298,61 @@ class OrderBacklogToolTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrderBacklogUnitProvenanceTests(unittest.TestCase):
+    """단위 표기가 없는 표를 억원으로 '확정' 라벨링하던 회귀 방지.
+
+    수주잔고 표는 백만원·천원 표기가 흔하다. 단위를 못 찾았는데 '단위: 억원'이라고
+    박으면 100배·10만배 틀린 숫자가 확정 사실처럼 나간다.
+    """
+
+    NO_UNIT = DocumentTable(
+        caption="가. 수주 현황",
+        rows=[["구분", "2024", "2025", "2026"],
+              ["수주잔고", "1,250,000", "1,480,000", "1,610,000"]],
+    )
+    TABLE_UNIT = DocumentTable(
+        caption="(단위: 백만원)",
+        rows=[["구분", "2024", "2025"], ["수주잔고", "1,250,000", "1,480,000"]],
+    )
+    CELL_UNIT = DocumentTable(
+        caption="수주현황",
+        rows=[["구분", "2024", "2025"], ["수주잔고", "3.2조", "4,100억원"]],
+    )
+
+    def _fmt(self, table):
+        series = extract_order_backlog_series([table], limit=3)
+        self.assertIsNotNone(series)
+        return series, format_order_backlog_series(
+            corp_code="00000000", report_name="사업보고서",
+            rcept_no="20260101000001", series=series,
+        )
+
+    def test_missing_unit_is_flagged_as_assumed(self):
+        series, text = self._fmt(self.NO_UNIT)
+        self.assertEqual(series.unit_source, "assumed")
+        self.assertIn("추정", text)
+        self.assertIn("원문 표를 반드시 대조", text)
+
+    def test_table_declared_unit_is_not_flagged(self):
+        series, text = self._fmt(self.TABLE_UNIT)
+        self.assertEqual(series.unit_source, "declared")
+        self.assertNotIn("추정", text)
+        self.assertIn("원문 표기 기준", text)
+        self.assertIn("2024=12,500", text)  # 1,250,000 백만원 = 12,500억
+
+    def test_inline_cell_unit_is_not_flagged(self):
+        series, text = self._fmt(self.CELL_UNIT)
+        self.assertEqual(series.unit_source, "declared")
+        self.assertNotIn("추정", text)
+        self.assertIn("2024=32,000", text)  # 3.2조 = 32,000억
+
+    def test_monthly_periods_are_not_labelled_annual(self):
+        table = DocumentTable(
+            caption="(단위: 억원)",
+            rows=[["구분", "2025.12", "2026.06"], ["수주잔고", "1,200", "1,400"]],
+        )
+        _, text = self._fmt(table)
+        self.assertIn("[기간]", text)
+        self.assertNotIn("[연간]", text)

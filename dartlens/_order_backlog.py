@@ -24,6 +24,7 @@ class OrderBacklogSeries:
     unit: str
     points: list[OrderBacklogPoint]
     table_caption: str = ""
+    unit_source: str = "declared"  # "declared" = 표에 단위 표기 있음 / "assumed" = 없음
 
 
 def extract_order_backlog_series(tables: list[DocumentTable], *, limit: int = 3) -> OrderBacklogSeries | None:
@@ -55,18 +56,27 @@ def format_order_backlog_series(
     sources: list[str] | None = None,
 ) -> str:
     values = " | ".join(f"{point.period}={_format_value(point.value)}" for point in series.points)
-    lines = [
-        f"# {series.metric} 추이 (corp_code={corp_code})",
-        "",
-        f"단위: {series.unit}",
-    ]
+    lines = [f"# {series.metric} 추이 (corp_code={corp_code})", ""]
+    if series.unit_source == "assumed":
+        lines.append(
+            f"⚠️ 단위: {series.unit} **추정** — 원문 표에 단위 표기가 없어 숫자를 "
+            f"{series.unit} 그대로 읽었습니다. 원문이 백만원·천원 표기면 실제 값은 "
+            "100배·10만배 다릅니다. 아래 rcept_no로 원문 표를 반드시 대조하세요."
+        )
+    else:
+        lines.append(f"단위: {series.unit} (원문 표기 기준)")
     if sources:
         lines.append("출처:")
         lines.extend(f"- {source}" for source in sources)
     else:
         lines.append(f"출처: {report_name} rcept_no={rcept_no}")
-    lines.extend(["", f"{series.metric}:", f"  [연간] {values}"])
+    lines.extend(["", f"{series.metric}:", f"  {_period_scope(series.points)} {values}"])
     return "\n".join(lines)
+
+
+def _period_scope(points: list[OrderBacklogPoint]) -> str:
+    """기간 라벨에 월이 섞여 있으면 '[연간]'이라 못 박지 않는다."""
+    return "[연간]" if all("." not in p.period for p in points) else "[기간]"
 
 
 def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeries | None:
@@ -85,8 +95,22 @@ def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeri
                 unit="억원",
                 points=points[-limit:],
                 table_caption=table.caption,
+                # 셀에도 표에도 단위 표기가 없으면 숫자를 억원으로 "가정"한 것이다.
+                # 수주잔고 표는 백만원·천원 표기가 흔해 가정이 틀리면 100배·10만배
+                # 어긋난다. 라벨에 확정 단위를 박지 않도록 출처를 같이 들고 간다.
+                unit_source=(
+                    "declared"
+                    if (default_unit or _row_has_inline_unit(row))
+                    else "assumed"
+                ),
             )
     return None
+
+
+def _row_has_inline_unit(row: list[str]) -> bool:
+    """셀 자체가 단위를 품고 있는지 (예: '4,100억원', '3.2조')."""
+    joined = "".join(row)
+    return any(unit in joined for unit in ("조", "억원", "억", "백만원", "천원", "원"))
 
 
 def _extract_ending_point_from_table(table: DocumentTable, *, period: str) -> OrderBacklogPoint | None:
