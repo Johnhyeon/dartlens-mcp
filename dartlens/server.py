@@ -23,6 +23,7 @@ from dartlens._earnings import run_scan
 from dartlens._earnings_export import run_export
 from dartlens._http import get_bytes, get_json
 from dartlens._metrics import read_dart_call_status, track_metrics
+from dartlens import _result_meta as rmeta
 from dartlens import diagnostics
 from dartlens._order_backlog import (
     OrderBacklogSeries,
@@ -126,6 +127,24 @@ DART 분기/반기 보고서의 손익은 두 가지 금액이 함께 존재합�
 
 `⚠️ 3개월/누적 구분이 불가` 경고가 붙으면 그 회사는 누적을 제출하지 않은 것이니
 금액을 누적으로 단정하지 말고 `get_disclosure_detail`로 원문 매출실적표를 대조하세요.
+
+## 🕐 결과 메타 봉투 (RESULT_META_JSON) — 기준일과 이어달리기
+
+대부분의 도구는 응답 끝에 `RESULT_META_JSON_START…END` 블록을 붙입니다.
+
+- `data_as_of` = **근거 공시의 접수일**. "이 실적은 언제 공시된 것인가"의 답입니다.
+  `as_of`(조회 시각)와 혼동하지 마세요. 사용자에게 말할 날짜는 `data_as_of`입니다.
+- `data_period` = 그 숫자가 덮는 기간(예: `2026 반기보고서`). 날짜가 아니라 기간이
+  기준인 재무 데이터는 여기를 보세요.
+- `entity`에 **corp_code(8자리)와 stock_code(6자리)가 함께** 들어 있습니다.
+  - 시세·수급·차트로 넘어갈 때 `stock_code`를 그대로 쓰세요 (StockLens `code=`).
+  - 종목을 다시 검색하거나 코드를 추측하지 마세요.
+  - 공시 반응을 볼 때는 `data_as_of`를 그대로 `event_date=`로 넘기면 됩니다.
+- `warnings`를 반드시 읽으세요. 특히:
+  - `find=` 매치 0건 → **"본문에 없다"는 뜻이 아닙니다.** 부정 결론 금지.
+  - 긴 보고서 본문 미반환 → 학습지식으로 메우지 말고 `find=`로 다시 조회하세요.
+- 메타 블록은 내부용입니다. JSON을 사용자에게 그대로 보여주지 말고 필요한 사실만
+  문장으로 옮기세요.
 """,
 )
 
@@ -214,7 +233,7 @@ async def search_company(query: str, listed_only: bool = True) -> str:
     entry = await resolve_identifier(q)
     if entry is not None:
         profile = await _fetch_company(entry.corp_code)
-        return _format_company(entry, profile)
+        return rmeta.append_meta(_format_company(entry, profile), _identity_meta(entry))
 
     # 2) 이름 검색
     candidates = await search_by_name(q, listed_only=listed_only, limit=20)
@@ -237,7 +256,7 @@ async def search_company(query: str, listed_only: bool = True) -> str:
     if len(candidates) == 1:
         entry = candidates[0]
         profile = await _fetch_company(entry.corp_code)
-        return _format_company(entry, profile)
+        return rmeta.append_meta(_format_company(entry, profile), _identity_meta(entry))
 
     return _format_candidates(candidates, q)
 
@@ -384,7 +403,15 @@ async def list_disclosures(
         bgn, end = days_to_range(days)
 
     data = await _fetch_disclosure_list(cc, bgn, end, pblntf_ty, limit)
-    return _format_disclosures(data, corp_code=cc, bgn_de=bgn, end_de=end, kind=kind)
+    items = data.get("list") or []
+    return rmeta.append_meta(
+        _format_disclosures(data, corp_code=cc, bgn_de=bgn, end_de=end, kind=kind),
+        _dart_meta(
+            rows=items, corp_code=cc,
+            data_period=f"{bgn} ~ {end}",
+            data_completeness=rmeta.COMPLETE if items else rmeta.NONE,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +527,65 @@ def _fmt_won(value) -> str:
     if n >= EOK:
         return f"{sign}{n // EOK:,}억"
     return f"{sign}{n:,}"
+
+
+def _identity_meta(entry) -> dict:
+    """search_company 전용 — 식별자 변환 결과 자체가 이 도구의 산출물이다.
+
+    corp_code(8) ↔ stock_code(6) 대응은 시점 데이터가 아니라 매핑이므로 filing
+    기준일이 없다. 대신 entity를 채워, 이어지는 StockLens/TelegramLens 호출이
+    6자리 코드를 다시 찾거나 추측하지 않게 한다.
+    """
+    return rmeta.build_meta(
+        lens="dartlens",
+        data_basis=rmeta.BASIS_FILING,
+        market="KR",
+        entity_info=rmeta.entity(
+            stock_code=getattr(entry, "stock_code", None),
+            corp_code=getattr(entry, "corp_code", None),
+            name=getattr(entry, "corp_name", None),
+        ),
+    )
+
+
+def _dart_meta(
+    *,
+    rows: list[dict] | None = None,
+    corp_code: str | None = None,
+    stock_code: str | None = None,
+    name: str | None = None,
+    rcept_no: str | None = None,
+    rcept_dt: str | None = None,
+    data_period: str | None = None,
+    data_completeness: str = rmeta.COMPLETE,
+    warnings: list[str] | None = None,
+) -> dict:
+    """DART 도구용 결과 메타. 기준일은 **근거 공시의 접수일**이다.
+
+    DART 응답 행에는 corp_code와 stock_code가 함께 들어 있다(예: 00115931 /
+    039840). 이 둘을 메타로 흘려주면 StockLens·TelegramLens가 종목 재검색 없이
+    바로 이어받을 수 있고, 코드를 추측할 유인이 사라진다.
+
+    rcept_dt를 안 주면 rcept_no 앞 8자리(YYYYMMDD)에서 접수일을 뽑는다.
+    """
+    first = (rows or [{}])[0] if rows else {}
+    no = rcept_no or (first.get("rcept_no") or "")
+    day = rcept_dt or (no[:8] if len(no) >= 8 and no[:8].isdigit() else None)
+
+    return rmeta.build_meta(
+        lens="dartlens",
+        data_basis=rmeta.BASIS_FILING,
+        data_as_of=day,
+        data_period=data_period,
+        market="KR",
+        data_completeness=data_completeness,
+        entity_info=rmeta.entity(
+            stock_code=stock_code or first.get("stock_code"),
+            corp_code=corp_code or first.get("corp_code"),
+            name=name or first.get("corp_name"),
+        ),
+        warnings=warnings,
+    )
 
 
 def _has_amount(value) -> bool:
@@ -717,7 +803,15 @@ async def get_major_accounts(
     yr = normalize_bsns_year(bsns_year)
     rc = normalize_reprt_code(reprt_code)
     data = await _fetch_major_accounts(cc, yr, rc)
-    return _format_major_accounts(data, corp_code=cc, bsns_year=yr, reprt_code=rc)
+    rows = data.get("list") or []
+    return rmeta.append_meta(
+        _format_major_accounts(data, corp_code=cc, bsns_year=yr, reprt_code=rc),
+        _dart_meta(
+            rows=rows, corp_code=cc,
+            data_period=f"{yr} {reprt_code_label(rc)}",
+            data_completeness=rmeta.COMPLETE if rows else rmeta.NONE,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -848,8 +942,16 @@ async def get_full_financial(
     fs = normalize_fs_div(fs_div)
     sj = normalize_sj_div(sj_div)
     data = await _fetch_full_financial(cc, yr, rc, fs)
-    return _format_full_financial(
-        data, corp_code=cc, bsns_year=yr, reprt_code=rc, fs_div=fs, sj_div=sj
+    rows = data.get("list") or []
+    return rmeta.append_meta(
+        _format_full_financial(
+            data, corp_code=cc, bsns_year=yr, reprt_code=rc, fs_div=fs, sj_div=sj
+        ),
+        _dart_meta(
+            rows=rows, corp_code=cc,
+            data_period=f"{yr} {reprt_code_label(rc)} ({fs})",
+            data_completeness=rmeta.COMPLETE if rows else rmeta.NONE,
+        ),
     )
 
 
@@ -1010,7 +1112,12 @@ async def get_major_holders(corp_code: str, limit: int = 10) -> str:
     if not isinstance(limit, int) or limit < 1 or limit > 50:
         raise ValueError(f"limit은 1~50 사이의 정수여야 합니다 (받음: {limit}).")
     data = await _fetch_major_holders(cc)
-    return _format_major_holders(data, corp_code=cc, limit=limit)
+    rows = data.get("list") or []
+    return rmeta.append_meta(
+        _format_major_holders(data, corp_code=cc, limit=limit),
+        _dart_meta(rows=rows, corp_code=cc,
+                   data_completeness=rmeta.COMPLETE if rows else rmeta.NONE),
+    )
 
 
 @mcp.tool()
@@ -1034,7 +1141,12 @@ async def get_insider_trades(corp_code: str, limit: int = 10) -> str:
     if not isinstance(limit, int) or limit < 1 or limit > 50:
         raise ValueError(f"limit은 1~50 사이의 정수여야 합니다 (받음: {limit}).")
     data = await _fetch_insider_trades(cc)
-    return _format_insider_trades(data, corp_code=cc, limit=limit)
+    rows = data.get("list") or []
+    return rmeta.append_meta(
+        _format_insider_trades(data, corp_code=cc, limit=limit),
+        _dart_meta(rows=rows, corp_code=cc,
+                   data_completeness=rmeta.COMPLETE if rows else rmeta.NONE),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1248,13 +1360,40 @@ async def get_disclosure_detail(rcept_no: str, find: str | None = None) -> str:
 
     if find and find.strip():
         matches = _find_matches(text, find.strip())
-        return _format_find_results(
-            no=no, keyword=find.strip(), matches=matches, total_len=len(text)
+        # 매치 0건은 "본문에 없다"가 아니라 "이 키워드로는 못 찾았다"이다.
+        # 표 안 텍스트나 다른 표기(현금배당 등)면 실제로 있어도 0건이 나온다.
+        return rmeta.append_meta(
+            _format_find_results(
+                no=no, keyword=find.strip(), matches=matches, total_len=len(text)
+            ),
+            _dart_meta(
+                rcept_no=no,
+                data_completeness=rmeta.COMPLETE if matches else rmeta.PARTIAL,
+                warnings=None if matches else [
+                    f"'{find.strip()}' 매치 0건 — 본문에 해당 내용이 **없다는 뜻이 아니다**. "
+                    "표기가 다르거나 표 안에 있어 텍스트 추출에서 빠졌을 수 있으니 "
+                    "부정 결론을 내리지 말고 다른 키워드나 viewer URL로 확인하라."
+                ],
+            ),
         )
 
     if len(text) > _LONG_REPORT_THRESHOLD:
-        return _format_long_report(no=no, names=names, text=text)
-    return _format_short_disclosure(no=no, names=names, text=text)
+        # 본문을 안 준 상태다. 학습지식으로 메우면 안 된다는 사실을 메타로 못 박는다.
+        return rmeta.append_meta(
+            _format_long_report(no=no, names=names, text=text),
+            _dart_meta(
+                rcept_no=no,
+                data_completeness=rmeta.PARTIAL,
+                warnings=[
+                    "긴 보고서라 본문을 반환하지 않았다. 내용을 물으면 find= 로 다시 "
+                    "조회하라. 본문 없이 학습지식으로 답하지 마라."
+                ],
+            ),
+        )
+    return rmeta.append_meta(
+        _format_short_disclosure(no=no, names=names, text=text),
+        _dart_meta(rcept_no=no),
+    )
 
 
 # ---------------------------------------------------------------------------
