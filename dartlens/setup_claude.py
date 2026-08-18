@@ -710,6 +710,18 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _has_codex() -> bool:
+    """codex 타겟을 쓸 수 있는 환경인지 — Codex CLI 또는 ChatGPT 데스크탑 앱.
+    통합 이후 둘은 같은 `~/.codex/config.toml` 을 읽으므로 하나로 본다.
+
+    ChatGPT 앱을 깔았지만 MCP 설정을 한 번도 안 건드린 사람은 이 폴더가 없을 수 있다 —
+    그때는 auto 판정이 결국 claude-desktop 으로 떨어진다(앱 자체를 찾아내는 일은 OS별
+    설치 경로 탐색이 필요해서 LeetKit Manager 쪽이 담당한다)."""
+    if shutil.which("codex"):
+        return True
+    return get_codex_config_path().parent.exists()
+
+
 def _resolve_targets(arg: str) -> list[str]:
     """`--target` 인자를 실제 타겟 리스트로 해석. `auto`는 환경 감지."""
     if arg == "both":
@@ -725,7 +737,9 @@ def _resolve_targets(arg: str) -> list[str]:
         # 자동 감지:
         #   1. `claude` CLI 존재 = Claude Code 사용 환경
         #   2. Claude Desktop config 디렉토리 존재 = Desktop 사용 환경
-        #   3. 둘 다면 both, 둘 다 아니면 claude-desktop (가장 흔한 케이스)
+        #   3. 둘 다면 both
+        #   4. Claude 가 하나도 없으면 codex (ChatGPT 앱·Codex CLI가 같은 설정을 읽는다)
+        #   5. 아무것도 못 찾으면 claude-desktop (가장 흔한 케이스)
         has_code = shutil.which("claude") is not None
         desktop_dir = get_claude_desktop_config_path().parent
         has_desktop = desktop_dir.exists()
@@ -734,6 +748,12 @@ def _resolve_targets(arg: str) -> list[str]:
             return ["claude-desktop", "claude-code"]
         if has_code:
             return ["claude-code"]
+        if has_desktop:
+            return ["claude-desktop"]
+        # ChatGPT 만 쓰는 사람에게 **없는 앱의 설정 파일**을 만들고 "등록 완료"라고
+        # 말하던 자리다 — 시킨 대로 다 했는데 도구가 안 보인다.
+        if _has_codex():
+            return ["codex"]
         return ["claude-desktop"]
     raise ValueError(f"Invalid target: {arg}")
 
