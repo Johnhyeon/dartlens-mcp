@@ -676,6 +676,7 @@ def _dart_meta(
     data_period: str | None = None,
     data_completeness: str = rmeta.COMPLETE,
     coverage: dict | None = None,
+    extra: dict | None = None,
     warnings: list[str] | None = None,
 ) -> dict:
     """DART 도구용 결과 메타. 기준일은 **근거 공시의 접수일**이다.
@@ -708,7 +709,7 @@ def _dart_meta(
         no = rcept_no or (first.get("rcept_no") or "")
         day = no[:8] if len(no) >= 8 and no[:8].isdigit() else None
 
-    return rmeta.build_meta(
+    meta = rmeta.build_meta(
         lens="dartlens",
         data_basis=rmeta.BASIS_FILING,
         data_as_of=day,
@@ -723,6 +724,10 @@ def _dart_meta(
         ),
         warnings=warnings,
     )
+    # 판정에 영향을 주지 않는 v3 부가 필드(match_coverage 등).
+    for key, value in (extra or {}).items():
+        meta[key] = value
+    return meta
 
 
 def _has_amount(value) -> bool:
@@ -1383,16 +1388,36 @@ def _guess_title(text: str) -> str:
     return head[:80]
 
 
-def _find_matches(text: str, keyword: str) -> list[dict]:
-    """case-insensitive 키워드 매치. 위치 + 컨텍스트 리스트 반환."""
-    results: list[dict] = []
+def _find_all_matches(text: str, keyword: str) -> list[int]:
+    """키워드가 나오는 **모든** 위치. 스니펫은 만들지 않는다.
+
+    세는 일과 보여주는 일을 나눈다. 5건만 만들어 놓고 "매치 5건"이라고 적으면
+    17건 중 5건을 본 사람이 5건이 전부라고 읽는다. 그렇다고 전체에 스니펫을 다
+    붙이면(1건당 600자) 흔한 단어 하나에 응답이 폭발한다. 위치는 전부 세고
+    스니펫은 표시할 것만 만든다.
+    """
+    if not keyword:
+        return []
     lower = text.lower()
     kw_lower = keyword.lower()
+    out: list[int] = []
     pos = 0
-    while len(results) < _FIND_MAX_MATCHES:
+    while True:
         idx = lower.find(kw_lower, pos)
         if idx < 0:
-            break
+            return out
+        out.append(idx)
+        pos = idx + len(keyword)
+
+
+def _find_matches(
+    text: str, keyword: str, positions: list[int] | None = None
+) -> list[dict]:
+    """표시용 스니펫. positions 를 주면 그 위치들만, 안 주면 앞 5건."""
+    if positions is None:
+        positions = _find_all_matches(text, keyword)[:_FIND_MAX_MATCHES]
+    results: list[dict] = []
+    for idx in positions:
         start = max(0, idx - _FIND_CONTEXT_CHARS)
         end = min(len(text), idx + len(keyword) + _FIND_CONTEXT_CHARS)
         left = text[start:idx]
@@ -1404,7 +1429,6 @@ def _find_matches(text: str, keyword: str) -> list[dict]:
         if end < len(text):
             snippet = snippet + "…"
         results.append({"pos": idx, "snippet": snippet})
-        pos = idx + len(keyword)
     return results
 
 
@@ -1465,7 +1489,8 @@ def _format_long_report(*, no: str, names: list[str], text: str) -> str:
 
 
 def _format_find_results(
-    *, no: str, keyword: str, matches: list[dict], total_len: int
+    *, no: str, keyword: str, matches: list[dict], total_len: int,
+    total_matches: int | None = None,
 ) -> str:
     lines = [
         f"# 공시 본문 키워드 검색 (rcept_no={no})",
@@ -1479,15 +1504,23 @@ def _format_find_results(
         lines.append(f"'{keyword}' 매치 없음. 다른 키워드로 시도하거나 viewer URL에서 직접 확인하세요.")
         return "\n".join(lines)
 
-    lines.append(f"**매치:** {len(matches)}건 (최대 {_FIND_MAX_MATCHES}건 표시)")
+    total = len(matches) if total_matches is None else total_matches
+    # 라벨과 값이 어긋나면 안 된다. "매치 5건"은 실제 5건일 때만 맞다.
+    if total > len(matches):
+        lines.append(f"**매치:** 전체 {total}건 중 {len(matches)}건 표시")
+    else:
+        lines.append(f"**매치:** {total}건 (최대 {_FIND_MAX_MATCHES}건 표시)")
     for i, m in enumerate(matches, 1):
         lines.append("")
         lines.append(f"## 매치 {i} (위치 ~{m['pos']:,})")
         lines.append("")
         lines.append(m["snippet"])
-    if len(matches) >= _FIND_MAX_MATCHES:
+    if total > len(matches):
         lines.append("")
-        lines.append(f"_최대 {_FIND_MAX_MATCHES}건까지 표시. 더 많은 결과는 viewer에서._")
+        lines.append(
+            f"_나머지 {total - len(matches)}건은 표시되지 않았습니다. "
+            "더 좁은 키워드로 다시 찾거나 viewer URL에서 확인하세요._"
+        )
     return "\n".join(lines)
 
 
@@ -1511,16 +1544,36 @@ async def get_disclosure_detail(rcept_no: str, find: str | None = None) -> str:
     names, text = _parse_document_zip(raw)
 
     if find and find.strip():
-        matches = _find_matches(text, find.strip())
-        # 매치 0건은 "본문에 없다"가 아니라 "이 키워드로는 못 찾았다"이다.
-        # 표 안 텍스트나 다른 표기(현금배당 등)면 실제로 있어도 0건이 나온다.
+        kw = find.strip()
+        positions = _find_all_matches(text, kw)
+        matches = _find_matches(text, kw, positions[:_FIND_MAX_MATCHES])
+        total_matches = len(positions)
+        truncated = total_matches > len(matches)
+        # 0건은 "본문에 없다"가 아니라 "이 키워드로는 못 찾았다"이다. 표 안
+        # 텍스트나 다른 표기(현금배당 등)면 실제로 있어도 0건이 나온다.
+        # 잘렸어도 다 본 게 아니다. 둘 다 complete 라고 말할 수 없다.
+        match_coverage = {
+            "keyword": kw,
+            "total_matches": total_matches,
+            "displayed_matches": len(matches),
+            "truncated": truncated,
+            "coverage_complete": bool(matches) and not truncated,
+        }
+        extra = {"match_coverage": match_coverage}
+        if total_matches == 0:
+            extra["absence_confirmed"] = False
         return rmeta.append_meta(
             _format_find_results(
-                no=no, keyword=find.strip(), matches=matches, total_len=len(text)
+                no=no, keyword=kw, matches=matches, total_len=len(text),
+                total_matches=total_matches,
             ),
             _dart_meta(
                 rcept_no=no,
-                data_completeness=rmeta.COMPLETE if matches else rmeta.PARTIAL,
+                data_completeness=(rmeta.COMPLETE
+                                   if match_coverage["coverage_complete"]
+                                   else rmeta.PARTIAL),
+                coverage=None,
+                extra=extra,
                 warnings=None if matches else [
                     f"'{find.strip()}' 매치 0건 — 본문에 해당 내용이 **없다는 뜻이 아니다**. "
                     "표기가 다르거나 표 안에 있어 텍스트 추출에서 빠졌을 수 있으니 "
