@@ -435,6 +435,46 @@ class CacheSchemaGuardTests(unittest.TestCase):
     def test_current_payload_accepted(self):
         rows = [_scan_row("매출액", "100", "90", "200", "180")]
         self.assertTrue(_has_current_schema(extract_accounts(rows, "00115931", "CFS", "11012")))
+# ---------------------------------------------------------------------------
+# 8. 연결·별도가 섞여도 기간 컬럼은 각 표 기준을 지킨다 (v3 financial_scope 회귀)
+# ---------------------------------------------------------------------------
+
+
+class MixedScopePeriodColumnsTests(unittest.TestCase):
+    """DL-03 으로 범위 혼재 경고가 붙었다. 그 경고가 기간 라벨을 건드리면 안 된다.
+
+    범위가 둘이면 표도 둘이다. 한쪽 표의 기간 컬럼을 다른 쪽이 물려받으면
+    3개월 값이 누적으로 읽히는 원래 문제가 그대로 재발한다.
+    """
+
+    def _ofs(self, rows):
+        out = []
+        for r in rows:
+            copy = dict(r)
+            copy["fs_div"] = "OFS"
+            out.append(copy)
+        return out
+
+    def test_both_scopes_keep_their_own_cumulative_columns(self):
+        out = _major(DIO_H1_IS + self._ofs(DIO_H1_IS), "11012")
+        self.assertIn("## 연결재무제표", out)
+        self.assertIn("## 별도재무제표", out)
+        self.assertEqual(
+            out.count("| 2분기(3개월) | 상반기 누적 | 전년 2분기 | 전년 상반기 |"), 2
+        )
+        self.assertEqual(out.count("| 매출액 | 449억 | 862억 | 400억 | 759억 |"), 2)
+
+    def test_scope_warning_is_not_baked_into_the_formatter(self):
+        """경고는 도구가 붙인다. 포매터가 붙이면 기간 테스트들이 통째로 흔들린다."""
+        self.assertNotIn("합산", _major(DIO_H1_IS + self._ofs(DIO_H1_IS), "11012"))
+
+    def test_scope_detection_matches_what_the_table_shows(self):
+        from dartlens.server import _financial_scope
+
+        scope = _financial_scope(DIO_H1_IS + self._ofs(DIO_H1_IS))
+        self.assertEqual(scope["scopes_present"], ["CFS", "OFS"])
+        self.assertTrue(scope["scope_mixed_in_response"])
+        self.assertEqual(scope["currency"], "KRW")
 
 
 if __name__ == "__main__":

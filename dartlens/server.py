@@ -590,7 +590,12 @@ _CORRECTION_LOOKBACK_YEARS = 3
 
 @cached(ttl_seconds=6 * 3600)
 async def _fetch_corrections(corp_code: str, bgn_de: str, end_de: str) -> list[dict]:
-    """해당 회사의 정기공시(A) 중 정정 건만."""
+    """해당 회사의 정기공시(A) 중 정정 건만.
+
+    조회 실패를 빈 목록으로 바꾸지 않는다. 실패를 [] 로 삼키면 "정정 없음"과
+    구분이 사라져, 정정된 보고서를 정정 없는 것으로 보여주게 된다. 부르는 쪽이
+    "확인 못 했다"고 적을 수 있어야 한다.
+    """
     try:
         data = await get_json(
             "/list.json",
@@ -602,8 +607,10 @@ async def _fetch_corrections(corp_code: str, bgn_de: str, end_de: str) -> list[d
                 "page_count": "100",
             },
         )
-    except DartApiError:
-        return []
+    except DartApiError as e:
+        if e.status == "013":   # 조회된 데이터 없음 = 정말 정정이 없다
+            return []
+        raise
     return [r for r in (data.get("list") or []) if "정정" in (r.get("report_nm") or "")]
 
 
@@ -632,6 +639,96 @@ async def find_correction(corp_code: str, bsns_year: str, reprt_code: str) -> di
     if not hits:
         return None
     return max(hits, key=lambda r: (r.get("rcept_dt", ""), r.get("rcept_no", "")))
+
+
+_SCOPE_MIX_NOTE = (
+    "⚠️ 연결(CFS)과 별도(OFS)가 **한 응답에 같이** 들어 있습니다. 두 범위를 합산하면 "
+    "존재하지 않는 회사의 숫자가 됩니다. 한쪽을 골라 쓰고, 어느 쪽인지 함께 적으세요."
+)
+
+
+def _financial_scope(rows: list[dict] | None, requested_fs: str | None = None) -> dict:
+    """이 응답에 어떤 재무 범위가 들어 있는가.
+
+    fnlttSinglAcnt.json 은 연결과 별도를 한 번에 준다. 표는 나눠 그리지만
+    메타에는 그 사실이 없어서, 행을 그대로 집계하는 소비자가 둘을 더해버린다.
+    """
+    present = sorted({(r.get("fs_div") or "").strip() for r in (rows or [])} - {""})
+    # fnlttSinglAcntAll.json 행에는 fs_div 가 없다(실측: 141행 전부 None). 이
+    # 엔드포인트는 요청 인자로 범위를 가르므로, 표기가 없다고 비워 두면 "무슨
+    # 범위인지 모른다"로 읽힌다. 실제로는 요청한 그 범위다.
+    if not present and rows and requested_fs:
+        present = [requested_fs]
+    if "CFS" in present:
+        preferred = "CFS"
+    elif present:
+        preferred = present[0]
+    else:
+        preferred = requested_fs
+    currency = ""
+    for r in rows or []:
+        currency = (r.get("currency") or "").strip()
+        if currency:
+            break
+    return {
+        "scopes_present": present,
+        "preferred_scope": preferred,
+        "scope_mixed_in_response": len(present) > 1,
+        "currency": currency or "KRW",
+    }
+
+
+def _filing_day(rows: list[dict] | None) -> str | None:
+    """행들의 접수일 중 가장 최근 날짜(YYYY-MM-DD). 없으면 None."""
+    days = []
+    for r in rows or []:
+        d = str(r.get("rcept_dt") or "").strip()
+        if not (len(d) == 8 and d.isdigit()):
+            n = str(r.get("rcept_no") or "")
+            d = n[:8] if len(n) >= 8 and n[:8].isdigit() else ""
+        if d:
+            days.append(d)
+    return rmeta.normalize_day(max(days)) if days else None
+
+
+async def _check_correction(corp_code: str, bsns_year: str, reprt_code: str):
+    """정정 조회를 결과와 실패로 나눠 돌려준다: (correction, checked, error_name).
+
+    조회가 깨졌는데 None 을 돌려주면 "정정 없음"과 똑같이 보인다. 그러면 정정된
+    보고서를 정정 없는 것으로 안내하게 된다.
+    """
+    try:
+        return await find_correction(corp_code, bsns_year, reprt_code), True, None
+    except Exception as e:
+        return None, False, type(e).__name__
+
+
+def _filing_state(
+    *, bsns_year: str, reprt_code: str, rows: list[dict] | None,
+    correction: dict | None, checked: bool,
+) -> dict:
+    day = None
+    if correction:
+        day = rmeta.normalize_day(
+            correction.get("rcept_dt") or correction.get("rcept_no")
+        )
+    return {
+        "business_year": bsns_year,
+        "report_code": reprt_code,
+        "filing_date": _filing_day(rows),
+        "correction_checked": checked,
+        "correction_applied": bool(correction),
+        "latest_correction_date": day,
+    }
+
+
+def _correction_unchecked_note(error_name: str | None) -> str:
+    return (
+        "정정공시 확인에 실패했습니다"
+        + (f"({error_name})" if error_name else "")
+        + ". 이 수치가 정정 반영본인지 **확인되지 않았습니다** - "
+        "정정이 없다는 뜻이 아닙니다."
+    )
 
 
 def _correction_note(correction: dict | None) -> str | None:
@@ -949,18 +1046,37 @@ async def get_major_accounts(
     rc = normalize_reprt_code(reprt_code)
     data = await _fetch_major_accounts(cc, yr, rc)
     rows = data.get("list") or []
-    correction = await find_correction(cc, yr, rc) if rows else None
+    correction, checked, err = (
+        await _check_correction(cc, yr, rc) if rows else (None, True, None)
+    )
     note = _correction_note(correction)
+    scope = _financial_scope(rows)
     body = _format_major_accounts(data, corp_code=cc, bsns_year=yr, reprt_code=rc)
+    warns: list[str] = []
+    # 이 응답에 연결과 별도가 같이 들어 있으면, 표를 안 보고 행만 집계하는 쪽이
+    # 둘을 더한다. 본문과 메타 양쪽에 적는다.
+    if scope["scope_mixed_in_response"]:
+        body = f"{body}\n\n{_SCOPE_MIX_NOTE}"
+        warns.append(_SCOPE_MIX_NOTE)
     if note:
         body = f"{body}\n\n{note}"
+        warns.append(note)
+    if rows and not checked:
+        warns.append(_correction_unchecked_note(err))
     return rmeta.append_meta(
         body,
         _dart_meta(
             rows=rows, corp_code=cc,
             data_period=f"{yr} {reprt_code_label(rc)}",
             data_completeness=rmeta.COMPLETE if rows else rmeta.NONE,
-            warnings=[note] if note else None,
+            extra={
+                "financial_scope": scope,
+                "filing_state": _filing_state(
+                    bsns_year=yr, reprt_code=rc, rows=rows,
+                    correction=correction, checked=checked,
+                ),
+            },
+            warnings=warns or None,
         ),
     )
 
@@ -1094,20 +1210,37 @@ async def get_full_financial(
     sj = normalize_sj_div(sj_div)
     data = await _fetch_full_financial(cc, yr, rc, fs)
     rows = data.get("list") or []
-    correction = await find_correction(cc, yr, rc) if rows else None
+    correction, checked, err = (
+        await _check_correction(cc, yr, rc) if rows else (None, True, None)
+    )
     note = _correction_note(correction)
+    scope = _financial_scope(rows, requested_fs=fs)
     body = _format_full_financial(
         data, corp_code=cc, bsns_year=yr, reprt_code=rc, fs_div=fs, sj_div=sj
     )
+    warns: list[str] = []
+    if scope["scope_mixed_in_response"]:
+        body = f"{body}\n\n{_SCOPE_MIX_NOTE}"
+        warns.append(_SCOPE_MIX_NOTE)
     if note:
         body = f"{body}\n\n{note}"
+        warns.append(note)
+    if rows and not checked:
+        warns.append(_correction_unchecked_note(err))
     return rmeta.append_meta(
         body,
         _dart_meta(
             rows=rows, corp_code=cc,
             data_period=f"{yr} {reprt_code_label(rc)} ({fs})",
             data_completeness=rmeta.COMPLETE if rows else rmeta.NONE,
-            warnings=[note] if note else None,
+            extra={
+                "financial_scope": scope,
+                "filing_state": _filing_state(
+                    bsns_year=yr, reprt_code=rc, rows=rows,
+                    correction=correction, checked=checked,
+                ),
+            },
+            warnings=warns or None,
         ),
     )
 

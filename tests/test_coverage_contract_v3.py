@@ -194,6 +194,162 @@ class FindMatchCoverageTests(unittest.IsolatedAsyncioTestCase):
         picked = server._find_matches(doc, "조기상환", positions[:2])
         self.assertEqual(len(picked), 2)
         self.assertEqual(picked[0]["pos"], positions[0])
+# ---------------------------------------------------------------------------
+# DL-03/04. 연결과 별도가 섞였는가 · 이 숫자가 정정 반영본인가
+# ---------------------------------------------------------------------------
+
+
+def _acct(fs_div, account_nm, amount, ord_="1", currency="KRW"):
+    return {
+        "rcept_no": "20260814003699",
+        "corp_code": "00126380",
+        "stock_code": "005930",
+        "fs_div": fs_div,
+        "fs_nm": "연결재무제표" if fs_div == "CFS" else "재무제표",
+        "sj_div": "IS",
+        "sj_nm": "손익계산서",
+        "account_nm": account_nm,
+        "ord": ord_,
+        "currency": currency,
+        "thstrm_nm": "제 58 기 반기",
+        "thstrm_amount": amount,
+        "thstrm_add_amount": amount,
+        "frmtrm_nm": "제 57 기 반기",
+        "frmtrm_amount": amount,
+        "frmtrm_add_amount": amount,
+    }
+
+
+class FinancialScopeTests(unittest.IsolatedAsyncioTestCase):
+    """연결(CFS)과 별도(OFS)를 더하면 그 회사는 존재하지 않는 회사가 된다.
+
+    fnlttSinglAcnt.json 은 두 범위를 한 응답에 같이 준다. 표는 나눠 그리지만
+    메타에는 그 사실이 없어서, 행을 그대로 집계하는 소비자가 합산해 버린다.
+    """
+
+    async def _major(self, rows, correction=None, correction_raises=None):
+        find = (AsyncMock(side_effect=correction_raises) if correction_raises
+                else AsyncMock(return_value=correction))
+        with patch.object(server, "_fetch_major_accounts", AsyncMock(return_value={"list": rows})),              patch.object(server, "find_correction", find):
+            return await server.get_major_accounts(
+                corp_code="00126380", bsns_year=2026, reprt_code="H1"
+            )
+
+    async def test_mixed_scope_is_reported_and_warned(self):
+        rows = [_acct("CFS", "매출액", "1000"), _acct("OFS", "매출액", "600")]
+        text = await self._major(rows)
+        meta = extract_meta(text)
+        self.assertEqual(meta["financial_scope"], {
+            "scopes_present": ["CFS", "OFS"],
+            "preferred_scope": "CFS",
+            "scope_mixed_in_response": True,
+            "currency": "KRW",
+        })
+        self.assertIn("합산", text)
+
+    async def test_single_scope_is_not_flagged_as_mixed(self):
+        text = await self._major([_acct("CFS", "매출액", "1000")])
+        meta = extract_meta(text)
+        self.assertEqual(meta["financial_scope"]["scopes_present"], ["CFS"])
+        self.assertIs(meta["financial_scope"]["scope_mixed_in_response"], False)
+        self.assertNotIn("합산", text)
+
+    async def test_ofs_only_prefers_ofs(self):
+        """연결이 없는 회사도 있다. 그때 preferred 를 CFS 로 적으면 거짓이다."""
+        text = await self._major([_acct("OFS", "매출액", "600")])
+        meta = extract_meta(text)
+        self.assertEqual(meta["financial_scope"]["preferred_scope"], "OFS")
+
+    async def test_currency_is_taken_from_rows(self):
+        text = await self._major([_acct("CFS", "매출액", "1000", currency="USD")])
+        meta = extract_meta(text)
+        self.assertEqual(meta["financial_scope"]["currency"], "USD")
+
+
+class FilingStateTests(unittest.IsolatedAsyncioTestCase):
+    """정정 확인에 실패한 것과 정정이 없는 것은 다르다.
+
+    _fetch_corrections 가 조회 실패를 빈 목록으로 삼키면 둘이 같아진다. 그러면
+    정정된 보고서를 "정정 없음"으로 보여주게 된다.
+    """
+
+    async def _major(self, **kw):
+        return await FinancialScopeTests._major(self, [_acct("CFS", "매출액", "1000")], **kw)
+
+    async def test_no_correction_is_checked_and_clean(self):
+        text = await self._major(correction=None)
+        meta = extract_meta(text)
+        self.assertEqual(meta["filing_state"], {
+            "business_year": "2026",
+            "report_code": "11012",
+            "filing_date": "2026-08-14",
+            "correction_checked": True,
+            "correction_applied": False,
+            "latest_correction_date": None,
+        })
+
+    async def test_applied_correction_records_its_date(self):
+        text = await self._major(correction={
+            "rcept_dt": "20260814",
+            "rcept_no": "20260814004258",
+            "report_nm": "[기재정정]반기보고서 (2026.06)",
+        })
+        meta = extract_meta(text)
+        self.assertIs(meta["filing_state"]["correction_applied"], True)
+        self.assertEqual(meta["filing_state"]["latest_correction_date"], "2026-08-14")
+        self.assertIn("정정 반영본", text)
+
+    async def test_failed_check_is_not_reported_as_clean(self):
+        text = await self._major(correction_raises=RuntimeError("DART 응답 없음"))
+        meta = extract_meta(text)
+        self.assertIs(meta["filing_state"]["correction_checked"], False)
+        self.assertIs(meta["filing_state"]["correction_applied"], False)
+        self.assertTrue(
+            any("정정" in w and "확인" in w for w in meta["warnings"]), meta["warnings"]
+        )
+
+    async def test_correction_lookup_failure_does_not_kill_the_tool(self):
+        """수치는 받았다. 정정 확인만 실패했다고 표를 통째로 버리면 안 된다."""
+        text = await self._major(correction_raises=RuntimeError("DART 응답 없음"))
+        self.assertIn("주요계정", text)
+        self.assertIn("매출액", text)
+
+
+class FullFinancialScopeTests(unittest.IsolatedAsyncioTestCase):
+    """get_full_financial 은 fs_div 하나만 가져온다. 섞일 수 없다는 사실도 적는다."""
+
+    async def _run(self, fs_div, rows):
+        with patch.object(server, "_fetch_full_financial", AsyncMock(return_value={"list": rows})),              patch.object(server, "find_correction", AsyncMock(return_value=None)):
+            return await server.get_full_financial(
+                corp_code="00126380", bsns_year=2026, reprt_code="H1",
+                fs_div=fs_div, sj_div="IS",
+            )
+
+    async def test_single_scope_request_is_never_mixed(self):
+        text = await self._run("OFS", [_acct("OFS", "매출액", "600")])
+        meta = extract_meta(text)
+        self.assertEqual(meta["financial_scope"]["scopes_present"], ["OFS"])
+        self.assertEqual(meta["financial_scope"]["preferred_scope"], "OFS")
+        self.assertIs(meta["financial_scope"]["scope_mixed_in_response"], False)
+
+    async def test_rows_without_fs_div_use_the_requested_scope(self):
+        """실측: fnlttSinglAcntAll.json 행에는 fs_div 가 아예 없다(141행 전부 None).
+
+        이 엔드포인트는 요청 인자로 범위를 가르므로, 행에 표기가 없다고
+        scopes_present 를 비워 두면 "무슨 범위인지 모른다"로 읽힌다. 실제로는 안다.
+        """
+        rows = [{k: v for k, v in _acct("OFS", "매출액", "600").items() if k != "fs_div"}]
+        text = await self._run("OFS", rows)
+        meta = extract_meta(text)
+        self.assertEqual(meta["financial_scope"]["scopes_present"], ["OFS"])
+        self.assertEqual(meta["financial_scope"]["preferred_scope"], "OFS")
+        self.assertIs(meta["financial_scope"]["scope_mixed_in_response"], False)
+
+    async def test_filing_state_present(self):
+        text = await self._run("CFS", [_acct("CFS", "매출액", "1000")])
+        meta = extract_meta(text)
+        self.assertIs(meta["filing_state"]["correction_checked"], True)
+        self.assertEqual(meta["filing_state"]["business_year"], "2026")
 
 
 if __name__ == "__main__":
