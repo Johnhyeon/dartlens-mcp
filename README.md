@@ -165,8 +165,12 @@ get_insider_trades(corp_code, limit=10) → 임원·주요주주 자사주 매�
 
 ```json
 "coverage": {
-  "requested": {"unit": "item", "value": 20},
-  "effective": {"unit": "item", "value": 20},
+  "requested": {
+    "bgn_de": "20250826",
+    "end_de": "20260826",
+    "kind": "all",
+    "limit": 20
+  },
   "returned_count": 20,
   "total_count": 2894,
   "truncated": true,
@@ -174,6 +178,10 @@ get_insider_trades(corp_code, limit=10) → 임원·주요주주 자사주 매�
   "reason": "pagination"
 }
 ```
+
+`requested` 에는 조회 조건이 통째로 들어갑니다. `limit` 만 남기면 메타만 받은
+소비자가 어느 기간의 어떤 유형을 본 것인지 복원할 수 없고, 공시 유형은 본문에도
+코드가 아니라 라벨로만 나옵니다.
 
 전체가 다 왔으면 `truncated=false`·`coverage_complete=true`·`complete`입니다.
 원천이 `total_count`를 주지 않으면 다 봤는지 알 수 없으므로 `total_count=null`,

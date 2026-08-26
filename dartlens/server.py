@@ -439,9 +439,11 @@ async def list_disclosures(
         complete = not truncated
         reason = "pagination" if truncated else None
 
+    # 메타만 받은 소비자가 이 조회를 그대로 재현할 수 있어야 한다. limit 만
+    # 남기면 어느 기간의 어떤 유형을 본 것인지 복원할 수 없고, 공시 유형은
+    # 본문에도 코드가 아니라 라벨로만 나온다.
     coverage = {
-        "requested": {"unit": "item", "value": limit},
-        "effective": {"unit": "item", "value": len(items)},
+        "requested": {"bgn_de": bgn, "end_de": end, "kind": kind, "limit": limit},
         "returned_count": len(items),
         "total_count": total,
         "truncated": truncated,

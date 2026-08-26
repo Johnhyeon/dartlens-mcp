@@ -101,11 +101,33 @@ class DisclosureCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["coverage"]["reason"], "unknown")
         self.assertEqual(meta["data_completeness"], "partial")
 
-    async def test_limit_is_reported_as_requested_range(self):
-        text = await self._run({"total_count": 2894, "list": _rows(20)})
+    async def test_requested_preserves_the_whole_query(self):
+        """메타만 받은 소비자가 이 조회를 그대로 재현할 수 있어야 한다.
+
+        limit 만 남기면 어느 기간의 어떤 유형을 본 것인지 복원할 수 없다.
+        특히 공시 유형은 결과 본문에도 코드가 아니라 라벨로만 나온다.
+        """
+        text = await self._run(
+            {"total_count": 2894, "list": _rows(20)}, kind="material"
+        )
         meta = extract_meta(text)
-        self.assertEqual(meta["coverage"]["requested"], {"unit": "item", "value": 20})
-        self.assertEqual(meta["coverage"]["effective"], {"unit": "item", "value": 20})
+        self.assertEqual(meta["coverage"]["requested"], {
+            "bgn_de": "20250826",
+            "end_de": "20260826",
+            "kind": "material",
+            "limit": 20,
+        })
+
+    async def test_requested_reflects_days_shorthand(self):
+        """days 로 물어도 실제로 조회한 날짜 구간이 남아야 한다."""
+        with patch.object(server, "_fetch_disclosure_list",
+                          AsyncMock(return_value={"total_count": 3, "list": _rows(3)})):
+            text = await server.list_disclosures(corp_code="00126380", days=30, limit=20)
+        req = extract_meta(text)["coverage"]["requested"]
+        self.assertEqual(req["limit"], 20)
+        self.assertEqual(req["kind"], "all")
+        self.assertRegex(req["bgn_de"], r"^\d{8}$")
+        self.assertRegex(req["end_de"], r"^\d{8}$")
 
     async def test_body_table_shape_is_unchanged(self):
         text = await self._run({"total_count": 8, "list": _rows(8)})
