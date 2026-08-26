@@ -646,11 +646,29 @@ def _dart_meta(
     039840). 이 둘을 메타로 흘려주면 StockLens·TelegramLens가 종목 재검색 없이
     바로 이어받을 수 있고, 코드를 추측할 유인이 사라진다.
 
-    rcept_dt를 안 주면 rcept_no 앞 8자리(YYYYMMDD)에서 접수일을 뽑는다.
+    rcept_dt를 안 주면 행들의 접수일 중 **가장 최근 날짜**를 쓴다.
+
+    rows[0]이 항상 최신인 것은 아니다 — 대량보유(5%룰)·임원소유 목록은 DART가
+    오래된 순으로 돌려주는 경우가 있어, 첫 행을 기준일로 삼으면 표에는 올해
+    공시가 떠 있는데 메타만 몇 년 전을 가리킨다(실측: 표 최신 2026-07-01,
+    메타 2024-09-12). 기준일이 틀리면 소비자가 최신 공시를 과거 것으로 옮겨 적는다.
     """
     first = (rows or [{}])[0] if rows else {}
-    no = rcept_no or (first.get("rcept_no") or "")
-    day = rcept_dt or (no[:8] if len(no) >= 8 and no[:8].isdigit() else None)
+
+    def _row_day(row: dict) -> str | None:
+        d = str(row.get("rcept_dt") or "").strip()
+        if len(d) == 8 and d.isdigit():
+            return d
+        n = str(row.get("rcept_no") or "")
+        return n[:8] if len(n) >= 8 and n[:8].isdigit() else None
+
+    day = rcept_dt
+    if not day and rows:
+        days = [d for d in (_row_day(r) for r in rows) if d]
+        day = max(days) if days else None
+    if not day:
+        no = rcept_no or (first.get("rcept_no") or "")
+        day = no[:8] if len(no) >= 8 and no[:8].isdigit() else None
 
     return rmeta.build_meta(
         lens="dartlens",
