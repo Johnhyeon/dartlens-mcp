@@ -370,6 +370,10 @@ def _format_disclosures(
     if len(items) < total:
         lines.append("")
         lines.append(f"_표시 {len(items)}건 / 전체 {total}건. 더 많은 결과는 days·limit 조정._")
+        lines.append(
+            "_이 목록은 전체가 아닙니다. 빠짐없이 보려면 기간(bgn_de·end_de)을 좁히거나 "
+            "kind 로 공시유형을 지정해 나눠 조회하세요._"
+        )
     lines.append("")
     lines.append("_rcept_no는 향후 get_disclosure_detail 도구의 입력값으로 사용됩니다._")
     return "\n".join(lines)
@@ -416,12 +420,45 @@ async def list_disclosures(
 
     data = await _fetch_disclosure_list(cc, bgn, end, pblntf_ty, limit)
     items = data.get("list") or []
+
+    # DART는 조건에 맞는 전체 건수를 total_count 로 알려준다. limit 에 걸려 잘린
+    # 응답에 complete 가 붙어 있으면, 2,894건 중 20건을 보고 "최근 1년 공시를 다
+    # 봤다"고 읽는다. 본문의 "표시 N건 / 전체 M건"은 그 줄을 안 읽으면 그만이다.
+    raw_total = data.get("total_count")
+    try:
+        total = int(raw_total) if raw_total is not None else None
+    except (TypeError, ValueError):
+        total = None
+
+    if total is None:
+        # 전체 건수를 모르면 다 봤는지도 알 수 없다. 모른다고 적는다.
+        truncated, complete, reason = False, False, "unknown"
+    else:
+        truncated = len(items) < total
+        complete = not truncated
+        reason = "pagination" if truncated else None
+
+    coverage = {
+        "requested": {"unit": "item", "value": limit},
+        "effective": {"unit": "item", "value": len(items)},
+        "returned_count": len(items),
+        "total_count": total,
+        "truncated": truncated,
+        "coverage_complete": complete,
+        "reason": reason,
+    }
+    if items:
+        completeness = rmeta.COMPLETE if complete else rmeta.PARTIAL
+    else:
+        completeness = rmeta.NONE
+
     return rmeta.append_meta(
         _format_disclosures(data, corp_code=cc, bgn_de=bgn, end_de=end, kind=kind),
         _dart_meta(
             rows=items, corp_code=cc,
             data_period=f"{bgn} ~ {end}",
-            data_completeness=rmeta.COMPLETE if items else rmeta.NONE,
+            data_completeness=completeness,
+            coverage=coverage,
         ),
     )
 
@@ -638,6 +675,7 @@ def _dart_meta(
     rcept_dt: str | None = None,
     data_period: str | None = None,
     data_completeness: str = rmeta.COMPLETE,
+    coverage: dict | None = None,
     warnings: list[str] | None = None,
 ) -> dict:
     """DART 도구용 결과 메타. 기준일은 **근거 공시의 접수일**이다.
@@ -677,6 +715,7 @@ def _dart_meta(
         data_period=data_period,
         market="KR",
         data_completeness=data_completeness,
+        coverage=coverage,
         entity_info=rmeta.entity(
             stock_code=stock_code or first.get("stock_code"),
             corp_code=corp_code or first.get("corp_code"),
