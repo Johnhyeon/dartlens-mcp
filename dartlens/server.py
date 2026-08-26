@@ -28,6 +28,7 @@ from dartlens import _result_meta as rmeta
 from datetime import date, timedelta
 from dartlens import diagnostics
 from dartlens._order_backlog import (
+    extract_order_backlog_snapshot,
     OrderBacklogSeries,
     extract_order_backlog_point,
     extract_order_backlog_series,
@@ -1773,6 +1774,96 @@ async def get_disclosure_detail(rcept_no: str, find: str | None = None) -> str:
 # get_order_backlog — DART report table parser
 # ---------------------------------------------------------------------------
 
+def _finish_order_backlog(
+    *,
+    body: str,
+    corp_code: str,
+    years: int,
+    periods: list[str],
+    source_filings: list[dict],
+    table_provenance: list[dict],
+    warnings: list[str],
+    failed_periods: dict[str, str],
+    reports: list[dict],
+) -> str:
+    """수주잔고 응답에 원문 근거·누락 사유·meta v3 를 단다(DL-01).
+
+    실측(두산에너빌리티): 2019·2020·2025 세 점이 나갔는데 2021~2024 추출이
+    실패했다는 사실이 어디에도 없어, 읽는 쪽은 그 사이가 "없는 해"인지
+    "못 읽은 해"인지 구분할 수 없었다.
+    """
+    # 수집된 기간 사이의 구멍 = 못 읽은 해. 시계열을 기대한 요청에서 이건
+    # 표시하지 않으면 안 되는 사실이다(요구 3).
+    # 같은 경고가 연도마다 반복되면 소음이다. 순서를 지키며 중복만 걷어낸다.
+    warnings = list(dict.fromkeys(warnings))
+    year_nums = sorted(int(p[:4]) for p in periods if p[:4].isdigit())
+    missing: list[str] = []
+    if year_nums:
+        span = set(range(year_nums[0], year_nums[-1] + 1))
+        have = set(year_nums)
+        missing = [str(y) for y in sorted(span - have, reverse=True)]
+
+    lines = [body]
+    if table_provenance:
+        lines.append("")
+        lines.append("원문 표 근거:")
+        for info in table_provenance:
+            pd = info.get("period")
+            lines.append(
+                "- " + (f"{pd}: " if pd else "")
+                + f"'{(info.get('caption') or '무제')[:40]}' 단위={info.get('unit')}"
+                + (f" 원문 {info['source_rows']}행 중 {info['rows_used']}행 사용"
+                   if info.get("source_rows") else "")
+                + f" [{info.get('method')}]"
+            )
+    if missing or failed_periods:
+        lines.append("")
+        lines.append("⚠️ 빠진 기간:")
+        for y in missing:
+            lines.append(f"- {y}: " + failed_periods.get(y, "해당 연도 보고서에서 추출 실패"))
+        for pd, why in sorted(failed_periods.items(), reverse=True):
+            if pd not in missing:
+                lines.append(f"- {pd}: {why}")
+    for w in warnings:
+        lines.append(f"⚠️ {w}")
+
+    incomplete = bool(missing) or bool(failed_periods)
+    coverage = {
+        "requested": {"years": years},
+        "returned_count": len(periods),
+        "missing_periods": missing or sorted(failed_periods, reverse=True),
+        "truncated": False,
+        "coverage_complete": not incomplete,
+        "reason": "source_limit" if incomplete else None,
+    }
+    meta = _dart_meta(
+        rows=reports,
+        corp_code=corp_code,
+        data_period=(f"{periods[0]} ~ {periods[-1]}" if len(periods) > 1 else
+                     (periods[0] if periods else None)),
+        data_completeness=rmeta.PARTIAL if incomplete else rmeta.COMPLETE,
+        coverage=coverage,
+        extra={"backlog_extraction": {
+            "source_filings": source_filings,
+            "tables": table_provenance,
+            "unit_normalization": {
+                "target_unit": "억원",
+                "per_table_raw_and_converted": [
+                    {"caption": (i.get("caption") or "")[:40],
+                     "unit": i.get("unit"),
+                     "raw_sum": i.get("raw_sum"),
+                     "eok_sum": i.get("eok_sum")}
+                    for i in table_provenance
+                ],
+            },
+        }},
+        warnings=(warnings + [
+            f"기간 {', '.join(missing)} 은 원문에서 추출하지 못했습니다."
+        ] if missing else warnings) or None,
+    )
+    return rmeta.append_meta("\n".join(lines), meta)
+
+
 _ORDER_BACKLOG_SCAN_LIMIT = 50
 _ORDER_BACKLOG_MAX_REPORTS = 10
 
@@ -1846,6 +1937,14 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
     yearly_points = []
     sources: list[str] = []
     seen_periods: set[str] = set()
+    # DL-01: 값만 들고 다니지 않는다. 어떤 표에서 몇 행을 어떤 단위로 읽었는지,
+    # 어느 연도 추출이 실패했는지, 검산 경고가 있었는지를 전부 모아 메타로 낸다.
+    source_filings: list[dict] = []
+    table_provenance: list[dict] = []
+    extraction_warnings: list[str] = []
+    failed_periods: dict[str, str] = {}
+    used_reports: list[dict] = []
+    point_unit = "억원"
     for report in candidates[:_ORDER_BACKLOG_MAX_REPORTS]:
         rcept_no = normalize_rcept_no(str(report.get("rcept_no") or ""))
         report_name = _order_backlog_report_name(report)
@@ -1854,32 +1953,67 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
         tables = extract_document_tables(raw)
         series = extract_order_backlog_series(tables, limit=years)
         if series is not None and len(series.points) >= 2:
-            return format_order_backlog_series(
-                corp_code=cc,
-                report_name=report_name,
-                rcept_no=rcept_no,
-                series=series,
+            return _finish_order_backlog(
+                body=format_order_backlog_series(
+                    corp_code=cc, report_name=report_name,
+                    rcept_no=rcept_no, series=series,
+                ),
+                corp_code=cc, years=years,
+                periods=[pt.period for pt in series.points],
+                source_filings=[{"rcept_no": rcept_no, "report": report_name}],
+                table_provenance=[{"caption": series.table_caption[:80],
+                                   "unit": series.unit,
+                                   "unit_source": series.unit_source,
+                                   "method": "trend_table"}],
+                warnings=[], failed_periods={}, reports=[report],
             )
         period = _order_backlog_report_period(report)
         if period is None or period in seen_periods:
             continue
-        point = extract_order_backlog_point(tables, period=period)
-        if point is None:
+        snapshot = extract_order_backlog_snapshot(tables, period=period)
+        if snapshot is None:
+            failed_periods[period] = "구조화 가능한 수주잔고 표 없음"
             continue
+        if snapshot.anomalous:
+            # 요구 5: 단일 세부 계약보다 작은 전체 잔고를 자동 확정하지 않는다.
+            failed_periods[period] = "검산 이상(전체 잔고 < 단일 세부 계약) - 산정 불가"
+            extraction_warnings.extend(snapshot.warnings)
+            continue
+        if yearly_points and snapshot.value_unit != point_unit:
+            failed_periods[period] = (
+                f"단위 상이({snapshot.value_unit} vs {point_unit}) - 한 시계열로 묶지 않음"
+            )
+            continue
+        point_unit = snapshot.value_unit
         seen_periods.add(period)
-        yearly_points.append(point)
+        yearly_points.append(snapshot.point)
         sources.append(f"{period}: {report_name} rcept_no={rcept_no}")
+        source_filings.append({"period": period, "rcept_no": rcept_no,
+                               "report": report_name})
+        for info in snapshot.tables:
+            table_provenance.append({"period": period, **info})
+        extraction_warnings.extend(snapshot.warnings)
+        used_reports.append(report)
         if len(yearly_points) >= years:
             break
 
     if yearly_points:
         yearly_points = sorted(yearly_points, key=lambda point: point.period)[-years:]
-        return format_order_backlog_series(
+        body = format_order_backlog_series(
             corp_code=cc,
             report_name="복수 정기보고서",
             rcept_no=", ".join(point.period for point in yearly_points),
-            series=OrderBacklogSeries(metric="수주잔고", unit="억원", points=yearly_points),
+            series=OrderBacklogSeries(metric="수주잔고", unit=point_unit, points=yearly_points),
             sources=sources[-len(yearly_points):],
+        )
+        return _finish_order_backlog(
+            body=body, corp_code=cc, years=years,
+            periods=[pt.period for pt in yearly_points],
+            source_filings=source_filings,
+            table_provenance=table_provenance,
+            warnings=extraction_warnings,
+            failed_periods=failed_periods,
+            reports=used_reports,
         )
 
     lines = [
@@ -1890,6 +2024,10 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
         "확인한 보고서:",
     ]
     lines.extend(f"- {item}" for item in attempted)
+    if failed_periods:
+        lines.append("")
+        lines.append("추출 실패 사유:")
+        lines.extend(f"- {pd}: {why}" for pd, why in sorted(failed_periods.items(), reverse=True))
     lines.extend(
         [
             "",
@@ -1897,7 +2035,22 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             "`find='계약잔액'`, `find='수주상황'`을 사용하세요.",
         ]
     )
-    return "\n".join(lines)
+    return rmeta.append_meta(
+        "\n".join(lines),
+        _dart_meta(
+            corp_code=cc,
+            data_completeness=rmeta.NONE,
+            coverage={
+                "requested": {"years": years},
+                "returned_count": 0,
+                "missing_periods": sorted(failed_periods, reverse=True),
+                "truncated": False,
+                "coverage_complete": False,
+                "reason": "source_limit",
+            },
+            warnings=extraction_warnings or None,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
