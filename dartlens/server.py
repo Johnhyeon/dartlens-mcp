@@ -317,11 +317,12 @@ async def _fetch_disclosure_list(
     end_de: str,
     pblntf_ty: str,
     page_count: int,
+    page_no: int = 1,
 ) -> dict:
     params: dict = {
         "bgn_de": bgn_de,
         "end_de": end_de,
-        "page_no": 1,
+        "page_no": page_no,
         "page_count": page_count,
         "sort": "date",
         "sort_mth": "desc",
@@ -391,6 +392,7 @@ async def list_disclosures(
     limit: int = 20,
     bgn_de: str | None = None,
     end_de: str | None = None,
+    page_no: int = 1,
 ) -> str:
     """공시목록 — DART에 접수된 공시 리스트를 기간·유형으로 필터링.
 
@@ -402,15 +404,19 @@ async def list_disclosures(
         days: 오늘 기준 최근 N일 (기본 30, 최대 3650). bgn_de/end_de 주면 무시.
         kind: 공시유형. "all"/"regular"(정기)/"material"(주요사항)/"issuance"(발행)/
             "ownership"(지분)/"audit"(외부감사)/"exchange"(거래소). 한글 라벨·DART 코드(A~J)도 가능.
-        limit: 반환 건수 (기본 20, 최대 100).
+        limit: 페이지당 건수 (기본 20, 최대 100).
         bgn_de: 시작일 YYYYMMDD (선택, days보다 우선).
         end_de: 종료일 YYYYMMDD (선택, days보다 우선).
+        page_no: 페이지 번호 (기본 1). 결과가 잘리면 meta coverage.pages 의
+            next_page_no 로 같은 조건을 끝까지 순회할 수 있습니다.
     """
     cc = normalize_corp_code(corp_code) if corp_code is not None else None
     pblntf_ty = _resolve_kind(kind)
 
     if not isinstance(limit, int) or limit < 1 or limit > 100:
         raise ValueError(f"limit은 1~100 사이의 정수여야 합니다 (받음: {limit}).")
+    if not isinstance(page_no, int) or page_no < 1:
+        raise ValueError(f"page_no는 1 이상의 정수여야 합니다 (받음: {page_no}).")
 
     if bgn_de or end_de:
         bgn = normalize_yyyymmdd(bgn_de, field="bgn_de")
@@ -420,7 +426,7 @@ async def list_disclosures(
     else:
         bgn, end = days_to_range(days)
 
-    data = await _fetch_disclosure_list(cc, bgn, end, pblntf_ty, limit)
+    data = await _fetch_disclosure_list(cc, bgn, end, pblntf_ty, limit, page_no)
     items = data.get("list") or []
 
     # DART는 조건에 맞는 전체 건수를 total_count 로 알려준다. limit 에 걸려 잘린
@@ -432,37 +438,84 @@ async def list_disclosures(
     except (TypeError, ValueError):
         total = None
 
+    # 페이지 순회 손잡이(DL-02). 실측: 국내 15종목 중 14종목은 1년 목록이
+    # 100건에서 잘렸는데 다음 페이지로 갈 방법이 없어 끝까지 볼 수 없었다.
+    total_pages = None
+    next_page = None
+    if total is not None and total > 0:
+        total_pages = -(-total // limit)
+        next_page = page_no + 1 if page_no < total_pages else None
+
+    seen_before = (page_no - 1) * limit
     if total is None:
         # 전체 건수를 모르면 다 봤는지도 알 수 없다. 모른다고 적는다.
         truncated, complete, reason = False, False, "unknown"
     else:
-        truncated = len(items) < total
-        complete = not truncated
-        reason = "pagination" if truncated else None
+        # 이 응답 하나가 전체를 덮는가. 마지막 페이지여도 앞 페이지들 없이는
+        # 전체가 아니다 - 합산은 페이지별 returned_count 를 순회하며 만든다.
+        complete = page_no == 1 and len(items) >= total
+        truncated = (seen_before + len(items)) < (total or 0)
+        reason = "pagination" if not complete else None
 
-    # 메타만 받은 소비자가 이 조회를 그대로 재현할 수 있어야 한다. limit 만
-    # 남기면 어느 기간의 어떤 유형을 본 것인지 복원할 수 없고, 공시 유형은
-    # 본문에도 코드가 아니라 라벨로만 나온다.
+    # 정정 공시는 지우지 않는다(요구 3). 원공시와 정정공시가 각각 행이라
+    # 건수를 그대로 합치면 같은 사건이 두 번 세어진다는 사실만 알린다.
+    correction_rows = [r for r in items if "정정" in (r.get("report_nm") or "")]
+
     coverage = {
-        "requested": {"bgn_de": bgn, "end_de": end, "kind": kind, "limit": limit},
+        "requested": {"bgn_de": bgn, "end_de": end, "kind": kind,
+                      "limit": limit, "page_no": page_no},
         "returned_count": len(items),
         "total_count": total,
+        "pages": {"page_no": page_no, "total_pages": total_pages,
+                  "next_page_no": next_page},
         "truncated": truncated,
         "coverage_complete": complete,
         "reason": reason,
     }
+    warns: list[str] = []
+    if not items and total:
+        warns.append(
+            f"page_no={page_no} 는 결과 범위 밖입니다(전체 {total}건, "
+            f"{total_pages}페이지). 0건은 공시가 없다는 뜻이 아닙니다."
+        )
     if items:
         completeness = rmeta.COMPLETE if complete else rmeta.PARTIAL
     else:
-        completeness = rmeta.NONE
+        completeness = rmeta.PARTIAL if total else rmeta.NONE
+
+    body = _format_disclosures(data, corp_code=cc, bgn_de=bgn, end_de=end, kind=kind)
+    extra_lines: list[str] = []
+    if next_page is not None:
+        extra_lines.append(
+            f"_다음 페이지: `page_no={next_page}` (전체 {total_pages}페이지 중 "
+            f"{page_no}페이지). 같은 조건으로 끝까지 순회하면 returned 합이 "
+            f"total_count({total})와 일치해야 합니다._"
+        )
+    if correction_rows:
+        extra_lines.append(
+            f"_정정 공시 {len(correction_rows)}건 포함 - 원공시와 정정공시가 각각 "
+            "행으로 존재하므로 건수를 그대로 합치면 같은 사건이 중복 집계됩니다._"
+        )
+    if extra_lines:
+        body = body + "\n" + "\n".join(extra_lines)
+
+    meta_extra = None
+    if correction_rows:
+        meta_extra = {"corrections": {
+            "count": len(correction_rows),
+            "rcept_nos": [r.get("rcept_no") for r in correction_rows][:20],
+            "note": "원공시와 정정공시가 각각 행으로 존재합니다. 건수 합산 시 중복 주의.",
+        }}
 
     return rmeta.append_meta(
-        _format_disclosures(data, corp_code=cc, bgn_de=bgn, end_de=end, kind=kind),
+        body,
         _dart_meta(
             rows=items, corp_code=cc,
             data_period=f"{bgn} ~ {end}",
             data_completeness=completeness,
             coverage=coverage,
+            extra=meta_extra,
+            warnings=warns or None,
         ),
     )
 

@@ -116,6 +116,7 @@ class DisclosureCoverageTests(unittest.IsolatedAsyncioTestCase):
             "end_de": "20260826",
             "kind": "material",
             "limit": 20,
+            "page_no": 1,
         })
 
     async def test_requested_reflects_days_shorthand(self):
@@ -372,6 +373,108 @@ class FullFinancialScopeTests(unittest.IsolatedAsyncioTestCase):
         meta = extract_meta(text)
         self.assertIs(meta["filing_state"]["correction_checked"], True)
         self.assertEqual(meta["filing_state"]["business_year"], "2026")
+# ---------------------------------------------------------------------------
+# DL-02. 공시 전체 페이지 순회
+#
+# 실측(UAT): 1년 전체유형 조회는 100건에서 잘림을 정확히 알렸지만 다음 페이지로
+# 갈 방법이 없어, 국내 15종목 중 14종목은 1년 목록을 끝까지 확인할 수 없었다.
+# ---------------------------------------------------------------------------
+
+
+class PaginationTests(unittest.IsolatedAsyncioTestCase):
+
+    def _page(self, page_no, page_count, total, n=None):
+        n = page_count if n is None else n
+        start = (page_no - 1) * page_count
+        return {
+            "total_count": total,
+            "total_page": -(-total // page_count),
+            "page_no": page_no,
+            "page_count": page_count,
+            "list": [
+                {"rcept_no": f"2026082600{start + i:04d}", "rcept_dt": "20260826",
+                 "corp_name": "삼성전자", "report_nm": f"공시 {start + i}",
+                 "corp_code": "00126380", "stock_code": "005930"}
+                for i in range(n)
+            ],
+        }
+
+    async def _run(self, payloads_by_page, **kw):
+        async def fake(cc, bgn, end, ty, count, page_no=1):
+            return payloads_by_page[page_no]
+
+        opts = dict(corp_code="00126380", bgn_de="20250827", end_de="20260827",
+                    limit=100)
+        opts.update(kw)
+        with patch.object(server, "_fetch_disclosure_list", AsyncMock(side_effect=fake)):
+            return await server.list_disclosures(**opts)
+
+    async def test_page_navigation_is_exposed(self):
+        """요구 1: 다음 페이지로 갈 수 있는 손잡이가 응답에 있다."""
+        pages = {1: self._page(1, 100, 250)}
+        text = await self._run(pages)
+        meta = extract_meta(text)
+        pg = meta["coverage"]["pages"]
+        self.assertEqual(pg["page_no"], 1)
+        self.assertEqual(pg["total_pages"], 3)
+        self.assertEqual(pg["next_page_no"], 2)
+        self.assertIn("page_no=2", text)     # 본문에도 다음 페이지 안내
+
+    async def test_full_traversal_sums_to_total(self):
+        """수용 1: 페이지를 끝까지 돌면 returned 합 == total_count."""
+        total, per = 250, 100
+        pages = {1: self._page(1, per, total), 2: self._page(2, per, total),
+                 3: self._page(3, per, total, n=50)}
+        got = 0
+        for page_no in (1, 2, 3):
+            text = await self._run(pages, page_no=page_no)
+            meta = extract_meta(text)
+            got += meta["coverage"]["returned_count"]
+            self.assertEqual(meta["coverage"]["total_count"], total)
+        self.assertEqual(got, total)
+
+    async def test_last_page_says_no_next(self):
+        pages = {3: self._page(3, 100, 250, n=50)}
+        text = await self._run(pages, page_no=3)
+        pg = extract_meta(text)["coverage"]["pages"]
+        self.assertIsNone(pg["next_page_no"])
+        # 마지막 페이지여도 이 응답 하나가 전체는 아니다
+        self.assertFalse(extract_meta(text)["coverage"]["coverage_complete"])
+
+    async def test_single_page_covering_all_is_complete(self):
+        pages = {1: self._page(1, 100, 8, n=8)}
+        text = await self._run(pages)
+        meta = extract_meta(text)
+        self.assertTrue(meta["coverage"]["coverage_complete"])
+        self.assertIsNone(meta["coverage"]["pages"]["next_page_no"])
+        self.assertEqual(meta["data_completeness"], "complete")
+
+    async def test_corrections_are_flagged_not_deduped(self):
+        """요구 3: 정정 공시는 지우지 않고 세어 알린다 - 원공시와 각각 행이다."""
+        page = self._page(1, 100, 3, n=3)
+        page["list"][1]["report_nm"] = "[기재정정]반기보고서 (2026.06)"
+        text = await self._run({1: page})
+        body = text.split(rmeta.MARKER_START)[0]
+        self.assertIn("[기재정정]반기보고서", body)          # 행 보존
+        meta = extract_meta(text)
+        self.assertEqual(meta["corrections"]["count"], 1)
+        self.assertIn("중복", meta["corrections"]["note"])
+
+    async def test_out_of_range_page_is_not_an_empty_universe(self):
+        """범위 밖 페이지의 0건은 '공시 없음'이 아니다."""
+        pages = {9: self._page(9, 100, 250, n=0)}
+        text = await self._run(pages, page_no=9)
+        meta = extract_meta(text)
+        self.assertEqual(meta["coverage"]["returned_count"], 0)
+        self.assertEqual(meta["coverage"]["total_count"], 250)
+        self.assertFalse(meta["coverage"]["coverage_complete"])
+        self.assertTrue(any("범위" in w or "페이지" in w for w in meta["warnings"]))
+
+    async def test_invalid_page_no_is_rejected(self):
+        # safe_tool 이 ValueError 를 사용자 메시지로 바꾼다
+        text = await server.list_disclosures(corp_code="00126380", page_no=0)
+        self.assertIn("page_no", text)
+        self.assertIn("1 이상", text)
 
 
 if __name__ == "__main__":
