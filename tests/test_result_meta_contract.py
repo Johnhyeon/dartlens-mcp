@@ -31,7 +31,7 @@ from dartlens.server import _dart_meta, _identity_meta
 class ContractVersionTests(unittest.TestCase):
     def test_meta_version_matches_other_lenses(self):
         """세 Lens가 같은 규약을 쓰는지 확인하는 유일한 표식. 올릴 땐 셋 다 함께."""
-        self.assertEqual(rmeta.META_VERSION, 3)
+        self.assertEqual(rmeta.META_VERSION, 4)
 
     def test_marker_matches_stocklens(self):
         """StockLens가 먼저 쓰던 마커를 그대로 승계한다(파서 호환)."""
@@ -135,9 +135,9 @@ class ContractV3Tests(unittest.TestCase):
 
     LENS = "dartlens"
 
-    def test_meta_version_is_three(self):
+    def test_meta_version_is_four(self):
         """세 Lens가 같은 규약을 쓰는지 확인하는 유일한 표식. 올릴 땐 셋 다 함께."""
-        self.assertEqual(rmeta.META_VERSION, 3)
+        self.assertEqual(rmeta.META_VERSION, 4)
 
     def test_coverage_is_optional_and_preserved(self):
         coverage = {
