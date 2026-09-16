@@ -9,7 +9,7 @@ from dartlens import _tls as _tls_bootstrap
 
 _tls_bootstrap.apply()
 
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+from dartlens._tool_schema import LensFastMCP  # noqa: E402
 
 from dartlens._cache import cached
 from dartlens._corp_code import (
@@ -47,7 +47,7 @@ from dartlens._validate import (
     reprt_code_label,
 )
 
-mcp = FastMCP(
+mcp = LensFastMCP(
     "DART",
     instructions="""DART MCP — 금융감독원 전자공시(OpenDART API) 래퍼.
 
