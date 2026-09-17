@@ -50,6 +50,9 @@ from dartlens._validate import (
 
 mcp = LensFastMCP(
     "DART",
+    # 파일을 만드는 도구. 나머지는 읽기 전용(readOnlyHint)으로 표시돼 Codex·ChatGPT 앱이
+    # 승인 없이 부른다(_tool_schema.py 참고).
+    write_tools=("export_earnings_scan",),
     instructions="""DART MCP — 금융감독원 전자공시(OpenDART API) 래퍼.
 
 ## 정체성
@@ -2453,6 +2456,7 @@ async def dartlens_status(check_online: bool = False) -> str:
 
 def main() -> None:
     """`dartlens` 진입점 — stdio MCP 서버 실행."""
+    mcp.check_write_tools()  # write_tools 오타를 서버 기동 시점에 잡는다
     mcp.run()
 
 
