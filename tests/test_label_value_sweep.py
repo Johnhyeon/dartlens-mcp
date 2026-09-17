@@ -474,5 +474,63 @@ class KstDateRangeTests(unittest.TestCase):
         self.assertEqual((bgn, end), ("20260917", "20260918"))
 
 
+# ---------------------------------------------------------------------------
+# 5. 정정공시 검색 구간이 잘렸으면 "확인함"이라 적지 않는다
+# ---------------------------------------------------------------------------
+
+
+def _account_row(bsns_year="2020"):
+    return {
+        "rcept_no": f"{int(bsns_year) + 1}0315000001", "corp_code": "00126380",
+        "stock_code": "005930", "fs_div": "CFS", "sj_div": "IS", "sj_nm": "손익계산서",
+        "account_nm": "매출액", "ord": "1", "currency": "KRW",
+        "thstrm_nm": "제 52 기", "thstrm_amount": "1000", "frmtrm_nm": "제 51 기",
+        "frmtrm_amount": "900",
+    }
+
+
+class CorrectionWindowTests(unittest.TestCase):
+    def test_old_report_window_is_clipped(self):
+        bgn, end, clipped = server._correction_window("2020", "11011", today=date(2026, 9, 17))
+        self.assertEqual((bgn, end, clipped), (date(2023, 9, 18), date(2026, 9, 17), True))
+
+    def test_recent_report_window_is_whole(self):
+        bgn, end, clipped = server._correction_window("2026", "11012", today=date(2026, 9, 17))
+        self.assertEqual((bgn, end, clipped), (date(2026, 6, 28), date(2026, 9, 17), False))
+
+
+class CorrectionRangeToolTests(_Licensed):
+    async def _major(self, rows, bsns_year):
+        fetch_corr = AsyncMock(return_value=[])
+        with patch.object(server, "_fetch_major_accounts", AsyncMock(return_value={"list": rows})), \
+             patch.object(server, "_fetch_corrections", fetch_corr), \
+             patch.object(server, "kst_today", return_value=date(2026, 9, 17)):
+            text = await server.get_major_accounts(
+                corp_code="00126380", bsns_year=bsns_year, reprt_code="annual")
+        return text, fetch_corr
+
+    async def test_clipped_search_is_not_reported_as_checked(self):
+        text, fetch_corr = await self._major([_account_row("2020")], 2020)
+        fetch_corr.assert_awaited_once_with("00126380", "20230918", "20260917")
+        meta = extract_meta(text)
+        state = meta["filing_state"]
+        self.assertIs(state["correction_checked"], False)
+        self.assertEqual(state["correction_search_range"],
+                         {"bgn_de": "2023-09-18", "end_de": "2026-09-17"})
+        self.assertTrue(any("2023-09-18" in w and "정정" in w for w in meta["warnings"]),
+                        meta["warnings"])
+
+    async def test_whole_window_stays_checked_without_range(self):
+        text, _ = await self._major([_account_row("2025")], 2025)
+        state = extract_meta(text)["filing_state"]
+        self.assertIs(state["correction_checked"], True)
+        self.assertNotIn("correction_search_range", state)
+
+    async def test_empty_result_does_not_claim_a_check(self):
+        text, fetch_corr = await self._major([], 2025)
+        fetch_corr.assert_not_awaited()
+        self.assertIs(extract_meta(text)["filing_state"]["correction_checked"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

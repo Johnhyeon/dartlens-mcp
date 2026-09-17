@@ -37,6 +37,7 @@ from dartlens._order_backlog import (
 from dartlens._safe import DartApiError, safe_tool
 from dartlens._validate import (
     days_to_range,
+    kst_today,
     normalize_bsns_year,
     normalize_corp_code,
     normalize_fs_div,
@@ -671,6 +672,41 @@ async def _fetch_corrections(corp_code: str, bgn_de: str, end_de: str) -> list[d
     return [r for r in (data.get("list") or []) if "정정" in (r.get("report_nm") or "")]
 
 
+def _correction_window(
+    bsns_year: str, reprt_code: str, today: date | None = None
+) -> tuple[date, date, bool] | None:
+    """정정공시를 찾는 접수일 구간 (시작, 끝, 잘렸는가). 찾을 대상이 없으면 None.
+
+    기간 종료일부터 오늘(KST)까지 훑되 최근 3년으로 자른다. 잘린 구간에서
+    못 찾은 것은 "정정 없음"이 아니라 "그 전은 확인 안 함"이다.
+    """
+    month = _REPRT_PERIOD_MONTH.get(reprt_code)
+    if not month:
+        return None
+    period_end = date(int(bsns_year), int(month), 28)
+    today = today or kst_today()
+    if period_end > today:
+        return None
+    floor = today - timedelta(days=365 * _CORRECTION_LOOKBACK_YEARS)
+    return max(period_end, floor), today, floor > period_end
+
+
+def _correction_clipped_range(bsns_year: str, reprt_code: str) -> dict | None:
+    """정정 검색 구간이 잘렸으면 실제로 훑은 구간(YYYY-MM-DD). 안 잘렸으면 None."""
+    window = _correction_window(bsns_year, reprt_code)
+    if window is None or not window[2]:
+        return None
+    bgn, end, _ = window
+    return {"bgn_de": bgn.isoformat(), "end_de": end.isoformat()}
+
+
+def _correction_partial_note(searched: dict) -> str:
+    return (
+        f"정정공시는 {searched['bgn_de']} ~ {searched['end_de']} 접수분만 확인했습니다. "
+        "그 전에 나온 정정은 확인되지 않았습니다 - 정정이 없다는 뜻이 아닙니다."
+    )
+
+
 async def find_correction(corp_code: str, bsns_year: str, reprt_code: str) -> dict | None:
     """이 정기보고서에 대한 정정공시가 있으면 가장 최근 건을 돌려준다.
 
@@ -678,16 +714,11 @@ async def find_correction(corp_code: str, bsns_year: str, reprt_code: str) -> di
     정정된 값이라는 사실을 말할 방법이 없다는 것. 예전에 같은 조회를 한 사람은
     다른 숫자를 봤고, 그걸 알 방법이 없었다.
     """
-    month = _REPRT_PERIOD_MONTH.get(reprt_code)
-    if not month:
+    window = _correction_window(bsns_year, reprt_code)
+    if window is None:
         return None
-    marker = f"({bsns_year}.{month})"
-
-    period_end = date(int(bsns_year), int(month), 28)
-    today = date.today()
-    if period_end > today:
-        return None
-    bgn = max(period_end, today - timedelta(days=365 * _CORRECTION_LOOKBACK_YEARS))
+    bgn, today, _clipped = window
+    marker = f"({bsns_year}.{_REPRT_PERIOD_MONTH[reprt_code]})"
 
     rows = await _fetch_corrections(
         corp_code, bgn.strftime("%Y%m%d"), today.strftime("%Y%m%d")
@@ -762,21 +793,25 @@ async def _check_correction(corp_code: str, bsns_year: str, reprt_code: str):
 
 def _filing_state(
     *, bsns_year: str, reprt_code: str, rows: list[dict] | None,
-    correction: dict | None, checked: bool,
+    correction: dict | None, checked: bool, searched_range: dict | None = None,
 ) -> dict:
     day = None
     if correction:
         day = rmeta.normalize_day(
             correction.get("rcept_dt") or correction.get("rcept_no")
         )
-    return {
+    state = {
         "business_year": bsns_year,
         "report_code": reprt_code,
         "filing_date": _filing_day(rows),
-        "correction_checked": checked,
+        # 검색 구간이 잘렸으면 전부 확인한 게 아니다. 훑은 구간을 같이 적는다.
+        "correction_checked": checked and not searched_range,
         "correction_applied": bool(correction),
         "latest_correction_date": day,
     }
+    if searched_range:
+        state["correction_search_range"] = searched_range
+    return state
 
 
 def _correction_unchecked_note(error_name: str | None) -> str:
@@ -1136,8 +1171,10 @@ async def get_major_accounts(
     data = await _fetch_major_accounts(cc, yr, rc)
     rows = data.get("list") or []
     correction, checked, err = (
-        await _check_correction(cc, yr, rc) if rows else (None, True, None)
+        # 행이 없으면 정정을 찾지 않았다. 찾지 않은 것을 checked 로 적지 않는다.
+        await _check_correction(cc, yr, rc) if rows else (None, False, None)
     )
+    searched = _correction_clipped_range(yr, rc) if rows and checked else None
     note = _correction_note(correction)
     scope = _financial_scope(rows)
     body = _format_major_accounts(data, corp_code=cc, bsns_year=yr, reprt_code=rc)
@@ -1152,6 +1189,8 @@ async def get_major_accounts(
         warns.append(note)
     if rows and not checked:
         warns.append(_correction_unchecked_note(err))
+    if searched:
+        warns.append(_correction_partial_note(searched))
     return rmeta.append_meta(
         body,
         _dart_meta(
@@ -1163,6 +1202,7 @@ async def get_major_accounts(
                 "filing_state": _filing_state(
                     bsns_year=yr, reprt_code=rc, rows=rows,
                     correction=correction, checked=checked,
+                    searched_range=searched,
                 ),
             },
             warnings=warns or None,
@@ -1300,8 +1340,10 @@ async def get_full_financial(
     data = await _fetch_full_financial(cc, yr, rc, fs)
     rows = data.get("list") or []
     correction, checked, err = (
-        await _check_correction(cc, yr, rc) if rows else (None, True, None)
+        # 행이 없으면 정정을 찾지 않았다. 찾지 않은 것을 checked 로 적지 않는다.
+        await _check_correction(cc, yr, rc) if rows else (None, False, None)
     )
+    searched = _correction_clipped_range(yr, rc) if rows and checked else None
     note = _correction_note(correction)
     scope = _financial_scope(rows, requested_fs=fs)
     body = _format_full_financial(
@@ -1316,6 +1358,8 @@ async def get_full_financial(
         warns.append(note)
     if rows and not checked:
         warns.append(_correction_unchecked_note(err))
+    if searched:
+        warns.append(_correction_partial_note(searched))
     return rmeta.append_meta(
         body,
         _dart_meta(
@@ -1327,6 +1371,7 @@ async def get_full_financial(
                 "filing_state": _filing_state(
                     bsns_year=yr, reprt_code=rc, rows=rows,
                     correction=correction, checked=checked,
+                    searched_range=searched,
                 ),
             },
             warnings=warns or None,
