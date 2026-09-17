@@ -1407,6 +1407,27 @@ def _fmt_signed(value) -> str:
     return s
 
 
+def _limited_list_coverage(rows: list[dict], limit: int) -> tuple[dict, str]:
+    """DART 가 준 전체 목록 중 최신 limit 건만 표로 낼 때의 coverage·완결성.
+
+    majorstock/elestock 은 그 회사의 보고서 전체를 준다. 300건 중 10건을 보여주고
+    complete 라고 적으면 "대량보유 변동을 다 봤다"로 읽힌다.
+    """
+    total = len(rows)
+    truncated = total > limit
+    coverage = {
+        "requested": {"limit": limit},
+        "returned_count": min(limit, total),
+        "total_count": total,
+        "truncated": truncated,
+        "coverage_complete": not truncated,
+        "reason": "server_cap" if truncated else None,
+    }
+    if not rows:
+        return coverage, rmeta.NONE
+    return coverage, rmeta.PARTIAL if truncated else rmeta.COMPLETE
+
+
 @cached(ttl_seconds=5 * 60)
 async def _fetch_major_holders(corp_code: str) -> dict:
     try:
@@ -1537,10 +1558,11 @@ async def get_major_holders(corp_code: str, limit: int = 10) -> str:
         raise ValueError(f"limit은 1~50 사이의 정수여야 합니다 (받음: {limit}).")
     data = await _fetch_major_holders(cc)
     rows = data.get("list") or []
+    coverage, completeness = _limited_list_coverage(rows, limit)
     return rmeta.append_meta(
         _format_major_holders(data, corp_code=cc, limit=limit),
         _dart_meta(rows=rows, corp_code=cc,
-                   data_completeness=rmeta.COMPLETE if rows else rmeta.NONE),
+                   data_completeness=completeness, coverage=coverage),
     )
 
 
@@ -1566,10 +1588,11 @@ async def get_insider_trades(corp_code: str, limit: int = 10) -> str:
         raise ValueError(f"limit은 1~50 사이의 정수여야 합니다 (받음: {limit}).")
     data = await _fetch_insider_trades(cc)
     rows = data.get("list") or []
+    coverage, completeness = _limited_list_coverage(rows, limit)
     return rmeta.append_meta(
         _format_insider_trades(data, corp_code=cc, limit=limit),
         _dart_meta(rows=rows, corp_code=cc,
-                   data_completeness=rmeta.COMPLETE if rows else rmeta.NONE),
+                   data_completeness=completeness, coverage=coverage),
     )
 
 

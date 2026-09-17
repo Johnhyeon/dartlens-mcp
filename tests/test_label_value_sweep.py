@@ -532,5 +532,51 @@ class CorrectionRangeToolTests(_Licensed):
         self.assertIs(extract_meta(text)["filing_state"]["correction_checked"], False)
 
 
+# ---------------------------------------------------------------------------
+# 6. 대량보유·임원소유 목록: 잘라 보여주면 complete 가 아니다
+# ---------------------------------------------------------------------------
+
+
+def _holder_rows(n):
+    return [
+        {"rcept_no": f"202601{(i % 28) + 1:02d}{i:06d}", "rcept_dt": f"202601{(i % 28) + 1:02d}",
+         "corp_code": "00126380", "corp_name": "삼성전자", "stock_code": "005930",
+         "repror": f"보고자{i}", "stkqy": "100", "stkrt": "5.0"}
+        for i in range(n)
+    ]
+
+
+class HolderListCoverageTests(_Licensed):
+    async def _both(self, rows, limit):
+        data = {"list": rows}
+        with patch.object(server, "_fetch_major_holders", AsyncMock(return_value=data)), \
+             patch.object(server, "_fetch_insider_trades", AsyncMock(return_value=data)):
+            return [
+                extract_meta(await server.get_major_holders(corp_code="00126380", limit=limit)),
+                extract_meta(await server.get_insider_trades(corp_code="00126380", limit=limit)),
+            ]
+
+    async def test_cut_list_is_partial_with_truthful_counts(self):
+        for meta in await self._both(_holder_rows(12), limit=10):
+            self.assertEqual(meta["data_completeness"], "partial")
+            cov = meta["coverage"]
+            self.assertEqual((cov["returned_count"], cov["total_count"]), (10, 12))
+            self.assertIs(cov["truncated"], True)
+            self.assertIs(cov["coverage_complete"], False)
+            self.assertEqual(cov["reason"], "server_cap")
+
+    async def test_whole_list_is_complete(self):
+        for meta in await self._both(_holder_rows(3), limit=10):
+            self.assertEqual(meta["data_completeness"], "complete")
+            self.assertEqual((meta["coverage"]["returned_count"],
+                              meta["coverage"]["total_count"]), (3, 3))
+            self.assertIs(meta["coverage"]["truncated"], False)
+
+    async def test_empty_list_is_none(self):
+        for meta in await self._both([], limit=10):
+            self.assertEqual(meta["data_completeness"], "none")
+            self.assertEqual(meta["coverage"]["total_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
