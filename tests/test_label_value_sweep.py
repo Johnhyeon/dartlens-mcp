@@ -578,5 +578,34 @@ class HolderListCoverageTests(_Licensed):
             self.assertEqual(meta["coverage"]["total_count"], 0)
 
 
+# ---------------------------------------------------------------------------
+# 9. 자가진단: IP 차단(012)을 "키 거부"로 적지 않는다
+# ---------------------------------------------------------------------------
+
+import os
+
+from dartlens import diagnostics
+
+
+class IpBlockedDiagnosisTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, code, message):
+        with patch.dict(os.environ, {"DART_API_KEY": "a" * 40}), \
+             patch.object(diagnostics, "check_dart_key_online",
+                          AsyncMock(return_value=(code, {"message": message}))):
+            return await diagnostics.diagnose_dart_api_key_online()
+
+    async def test_012_says_ip_not_key(self):
+        diag = await self._run("012", "접근할 수 없는 IP입니다.")
+        self.assertIn("IP", diag.message)
+        self.assertNotIn("키를 거부", diag.message)
+        # status·error_code 는 Manager 계약이라 그대로다.
+        self.assertEqual(diag.status, "invalid")
+        self.assertEqual(diag.error_code, diagnostics.DART_API_KEY_INVALID)
+
+    async def test_010_still_says_key_rejected(self):
+        diag = await self._run("010", "등록되지 않은 인증키입니다.")
+        self.assertIn("키를 거부", diag.message)
+
+
 if __name__ == "__main__":
     unittest.main()

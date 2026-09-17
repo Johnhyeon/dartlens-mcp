@@ -178,6 +178,8 @@ RATE_LIMIT_CODES = {"020", "021"}
 # 그대로 사용자에게 전달된다. "서비스 문제라 당신 잘못 아님"이라고 오도하지 않기 위함.
 SERVICE_ISSUE_CODES = {"800", "900"}
 SUCCESS_CODES = {"000", "013"}  # 013 = 조회 결과 없음. 연결 성공으로 취급.
+# 012 = 접근할 수 없는 IP. 키 값 문제가 아니라 접속 위치 문제다.
+IP_BLOCKED_CODES = {"012"}
 
 
 async def check_dart_key_online(api_key: str) -> tuple[str, dict]:
@@ -260,6 +262,22 @@ async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = Non
             key_tail_masked=base.key_tail_masked,
             error_code=DART_NETWORK_UNREACHABLE,
             message=f"DART 서비스 자체 문제로 보입니다 (응답 {code}: {data.get('message', '')}). 키 문제가 아닙니다.",
+        )
+
+    if code in IP_BLOCKED_CODES:
+        # 키 값이 틀린 게 아니라 이 PC의 IP가 막힌 것이다. "키를 거부했다"로 적으면
+        # 멀쩡한 키를 다시 발급·등록하게 된다. status·error_code 는 LeetKit Manager
+        # 계약이라 그대로 두고 문구만 원인대로 적는다.
+        return DartApiDiagnosis(
+            status="invalid",
+            storage=storage,
+            key_tail_masked=base.key_tail_masked,
+            error_code=DART_API_KEY_INVALID,
+            message=(
+                f"DART가 이 PC의 IP 접속을 막았습니다 (응답 {code}: "
+                f"{data.get('message', '접근할 수 없는 IP입니다')}). 키 값이 틀렸다는 뜻은 "
+                "아닙니다 - 키를 다시 등록하지 말고 LeetKit Manager의 [지원 문의]로 알려주세요."
+            ),
         )
 
     return DartApiDiagnosis(
