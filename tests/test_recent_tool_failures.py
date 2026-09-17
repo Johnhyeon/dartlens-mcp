@@ -165,7 +165,7 @@ def test_doctor_json_includes_check_non_critical(monkeypatch, tmp_path):
     check = next(c for c in report["checks"] if c["id"] == "RECENT_TOOL_FAILURES")
     assert check["status"] == "warn"
     assert check["critical"] is False
-    assert check["error_code"] == "RECENT_TOOL_FAILURES_BLOCKED"
+    assert check["details"]["error_code"] == "RECENT_TOOL_FAILURES_BLOCKED"  # StockLens·TelegramLens 와 같은 자리
     assert "[지원 문의]" in check["action"]
     # 기존 최상위 필드·검사 ID 는 그대로다.
     ids = [c["id"] for c in report["checks"]]

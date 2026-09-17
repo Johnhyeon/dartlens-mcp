@@ -707,7 +707,8 @@ def build_report(state: dict, *, online: bool) -> dict:
             item["critical"] = False
             recent = state.get("recent_failures_diag")
             if recent is not None and recent.error_code:
-                item["error_code"] = recent.error_code
+                # StockLens·TelegramLens 와 같은 자리(details.error_code) — Manager 계약.
+                item.setdefault("details", {})["error_code"] = recent.error_code
             checks_list.append(item)
         else:
             checks_list.append(c.to_contract_dict(_CHECK_IDS[key]))
