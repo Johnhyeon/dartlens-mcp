@@ -522,7 +522,8 @@ def diagnose_recent_tool_failures(records: list) -> RecentFailuresDiagnosis:
     """최근 호출 기록(시간순)으로 '아직 풀리지 않은 실패'가 있는지 본다.
 
     같은 도구가 실패 뒤에 성공했으면 풀린 것으로 본다 — 한 번 삐끗한 기록 때문에
-    이틀 내내 카드가 '주의'로 남으면 진단을 믿지 않게 된다. AI 앱이 취소한 호출
+    이틀 내내 카드가 '주의'로 남으면 진단을 믿지 않게 된다. 끝에 남은 실패가 아직
+    실패인지는 `_error_class.still_failing`이 정한다(세 Lens 공통). AI 앱이 취소한 호출
     (CancelledError)은 DartLens 고장이 아니라서 실패로 세지 않고, 앞선 상태도 바꾸지
     않는다.
     """
@@ -537,10 +538,10 @@ def diagnose_recent_tool_failures(records: list) -> RecentFailuresDiagnosis:
     failure_count = 0
     for row in records:
         tool = str(row.get("tool") or "unknown")
-        info = per_tool.setdefault(tool, {"failed": [], "cancelled": [], "last_failed": False})
+        info = per_tool.setdefault(tool, {"failed": [], "cancelled": [], "trailing": []})
         error_type = row.get("error")
         if not error_type:
-            info["last_failed"] = False
+            info["trailing"] = []
             continue
         category = _error_class.classify_error(str(error_type), row.get("error_detail"))
         if category == "cancelled":
@@ -548,7 +549,7 @@ def diagnose_recent_tool_failures(records: list) -> RecentFailuresDiagnosis:
             continue
         failure_count += 1
         info["failed"].append((row, category))
-        info["last_failed"] = True
+        info["trailing"].append(category)
 
     def _line(tool: str, count_text: str, row: dict, category: str) -> str:
         detail = _mask_secrets(str(row.get("error_detail") or ""))[:_RECENT_DETAIL_PREVIEW]
@@ -566,10 +567,12 @@ def diagnose_recent_tool_failures(records: list) -> RecentFailuresDiagnosis:
         return str(item[1]["failed"][-1][0].get("timestamp") or "")
 
     outstanding = sorted(
-        ((t, i) for t, i in per_tool.items() if i["last_failed"]), key=_last_failed_at, reverse=True
+        ((t, i) for t, i in per_tool.items() if _error_class.still_failing(i["trailing"])),
+        key=_last_failed_at,
+        reverse=True,
     )
     resolved = sorted(
-        ((t, i) for t, i in per_tool.items() if i["failed"] and not i["last_failed"]),
+        ((t, i) for t, i in per_tool.items() if i["failed"] and not _error_class.still_failing(i["trailing"])),
         key=_last_failed_at,
         reverse=True,
     )
@@ -584,7 +587,7 @@ def diagnose_recent_tool_failures(records: list) -> RecentFailuresDiagnosis:
     if not outstanding:
         return RecentFailuresDiagnosis(
             status="ok",
-            summary=f"최근 이틀 동안 조회 {total}번 중 {failure_count}번이 실패했지만, 그 뒤에는 정상이었어요.",
+            summary=f"최근 이틀 동안 조회 {total}번 중 {failure_count}번이 실패했지만, 계속 실패하고 있지는 않아요.",
             lines=lines,
         )
 

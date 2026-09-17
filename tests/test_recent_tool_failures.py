@@ -47,7 +47,7 @@ def test_failure_then_same_tool_success_is_resolved():
     ]
     d = diagnostics.diagnose_recent_tool_failures(rows)
     assert d.status == "ok"
-    assert d.summary == "최근 이틀 동안 조회 3번 중 1번이 실패했지만, 그 뒤에는 정상이었어요."
+    assert d.summary == "최근 이틀 동안 조회 3번 중 1번이 실패했지만, 계속 실패하고 있지는 않아요."
     assert d.action is None
     assert any("search_company: 실패 1번" in line and "분류 dns" in line for line in d.lines)
 
@@ -69,6 +69,20 @@ def test_last_call_failed_is_warn_with_category_action():
     assert line.startswith("get_major_accounts: 실패 1번, 마지막 11:40, 분류 tls, ConnectError: ")
 
 
+def test_single_unclear_failure_is_not_warn_but_repeat_is():
+    """AI 앱이 인자를 한 번 잘못 넣은 호출로 카드가 이틀 내내 '주의'가 되면 안 된다.
+    다시 불러도 또 실패하면 그때는 진짜 결함으로 본다."""
+    once = [_row("list_disclosures", 30, "ValueError", "page_no는 1 이상의 정수여야 합니다 (받음: 0).")]
+    d = diagnostics.diagnose_recent_tool_failures(once)
+    assert d.status == "ok"
+    assert any(line.startswith("list_disclosures: 실패 1번") for line in d.lines)
+
+    twice = once + [_row("list_disclosures", 20, "ValueError", "page_no는 1 이상의 정수여야 합니다 (받음: 0).")]
+    d = diagnostics.diagnose_recent_tool_failures(twice)
+    assert d.status == "warn"
+    assert d.error_code == "RECENT_TOOL_FAILURES_OTHER"
+
+
 def test_cancelled_only_is_not_a_failure():
     rows = [
         _row("get_full_financial", 30, "CancelledError", None),
@@ -84,6 +98,7 @@ def test_cancelled_only_is_not_a_failure():
 def test_cancel_after_failure_does_not_hide_the_failure():
     rows = [
         _row("search_company", 30, "ReadTimeout", "timed out"),
+        _row("search_company", 20, "ReadTimeout", "timed out"),
         _row("search_company", 10, "CancelledError", None),
     ]
     d = diagnostics.diagnose_recent_tool_failures(rows)
@@ -93,7 +108,7 @@ def test_cancel_after_failure_does_not_hide_the_failure():
 
 def test_details_mask_keys_and_cap_lines():
     key = "a1b2c3d4" * 5  # 40자리 hex (DART 인증키 모양)
-    rows = [_row(f"tool_{i}", 60 - i, "RuntimeError", f"boom {key}") for i in range(12)]
+    rows = [_row(f"tool_{i}", 60 - i * 2 - j, "RuntimeError", f"boom {key}") for i in range(12) for j in range(2)]
     d = diagnostics.diagnose_recent_tool_failures(rows)
     assert len(d.lines) <= 8
     assert key not in json.dumps(d.lines, ensure_ascii=False)
