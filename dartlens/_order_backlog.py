@@ -35,6 +35,7 @@ class BacklogSnapshot:
     max_single_detail: float    # value_unit 기준. 전체 잔고가 이보다 작으면 말이 안 된다
     anomalous: bool = False
     value_unit: str = "억원"    # 외화 표는 원문 단위 그대로(환산하지 않는다)
+    unit_source: str = "declared"  # "declared" = 원문에 단위 표기 있음 / "assumed" = 억원 가정
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class OrderBacklogSeries:
     points: list[OrderBacklogPoint]
     table_caption: str = ""
     unit_source: str = "declared"  # "declared" = 표에 단위 표기 있음 / "assumed" = 없음
+    source_unit: str | None = None  # 원문 표의 단위 표기(없으면 None)
 
 
 def extract_order_backlog_series(tables: list[DocumentTable], *, limit: int = 3) -> OrderBacklogSeries | None:
@@ -70,22 +72,10 @@ def extract_order_backlog_snapshot(
     """
     # 1) 기말계약잔액 - 원문이 스스로 합계를 말해주는 가장 신뢰되는 형태
     for table in tables:
-        point = _extract_ending_point_from_table(table, period=period)
-        if point is not None:
-            return BacklogSnapshot(
-                point=point,
-                tables=[{
-                    "caption": table.caption[:80],
-                    "unit": _table_unit(table) or "표기 없음(억원 가정)",
-                    "source_rows": len(table.rows),
-                    "rows_used": 1,
-                    "raw_sum": None,
-                    "eok_sum": point.value,
-                    "method": "ending_balance",
-                }],
-                warnings=[],
-                max_single_detail=point.value,
-            )
+        found = _ending_value_from_table(table)
+        if found is not None:
+            return _single_row_snapshot(
+                table, found, period=period, method="ending_balance")
 
     # 2) 계약별 상세표 - 부문별 표를 전부 합친다 (동일 표 dedup)
     seen: set[int] = set()
@@ -145,29 +135,71 @@ def extract_order_backlog_snapshot(
             max_single_detail=round(max_detail, 2),
             anomalous=anomalous,
             value_unit=value_unit,
+            unit_source=(
+                "assumed" if any(i.get("unit_source") == "assumed" for i in extracted)
+                else "declared"
+            ),
         )
 
     # 3) 단일 값 표 - 검산에 실패한 상세표는 여기서도 쓰지 않는다
     for table in tables:
         if hash(tuple(tuple(row) for row in table.rows)) in failed_keys:
             continue
-        point = _extract_fallback_point_from_table(table, period=period)
-        if point is not None:
-            return BacklogSnapshot(
-                point=point,
-                tables=[{
-                    "caption": table.caption[:80],
-                    "unit": _table_unit(table) or "표기 없음(억원 가정)",
-                    "source_rows": len(table.rows),
-                    "rows_used": 1,
-                    "raw_sum": None,
-                    "eok_sum": point.value,
-                    "method": "single_value",
-                }],
-                warnings=[],
-                max_single_detail=point.value,
-            )
+        found = _fallback_value_from_table(table)
+        if found is not None:
+            return _single_row_snapshot(
+                table, found, period=period, method="single_value")
     return None
+
+
+_ASSUMED_UNIT_WARNING = "표에 단위 표기가 없어 억원으로 가정했습니다. 원문 대조가 필요합니다."
+
+
+def _foreign_unit_warning(unit: str) -> str:
+    return (
+        f"외화 표({unit})입니다. 원화로 환산하지 않고 원문 단위 "
+        "그대로 보고합니다 - 억원과 나란히 놓고 비교하면 안 됩니다."
+    )
+
+
+def _single_row_snapshot(
+    table: DocumentTable, found: tuple[float, list[str]], *, period: str, method: str
+) -> BacklogSnapshot:
+    """한 행에서 읽은 값에 원문 그대로의 단위를 붙인다.
+
+    예전엔 이 경로가 단위를 늘 '억원'으로 적었다. '(단위: 백만달러)' 표의 12,355 는
+    12,355억원으로, 단위 표기가 없는 표의 값은 '원문 표기 기준' 억원으로 나갔다.
+    """
+    value, row = found
+    unit = _table_unit(table)
+    warnings: list[str] = []
+    if _is_foreign_unit(unit):
+        value_unit, unit_source, unit_label = unit, "declared", unit
+        warnings.append(_foreign_unit_warning(unit))
+    elif unit:
+        value_unit, unit_source, unit_label = "억원", "declared", unit
+    elif _row_has_inline_unit(row):
+        value_unit, unit_source, unit_label = "억원", "declared", "셀 표기"
+    else:
+        value_unit, unit_source, unit_label = "억원", "assumed", "표기 없음(억원 가정)"
+        warnings.append(_ASSUMED_UNIT_WARNING)
+    return BacklogSnapshot(
+        point=OrderBacklogPoint(period=period, value=value),
+        tables=[{
+            "caption": table.caption[:80],
+            "unit": unit_label,
+            "unit_source": unit_source,
+            "source_rows": len(table.rows),
+            "rows_used": 1,
+            "raw_sum": None,
+            "eok_sum": value,
+            "method": method,
+        }],
+        warnings=warnings,
+        max_single_detail=value,
+        value_unit=value_unit,
+        unit_source=unit_source,
+    )
 
 
 _TOTAL_LABELS = {"합계", "총계", "계", "소계"}
@@ -280,17 +312,13 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
                 )
         raw = total_val if total_val is not None else detail_sum
         if default_unit is None:
-            warnings.append(
-                "표에 단위 표기가 없어 억원으로 가정했습니다. 원문 대조가 필요합니다."
-            )
+            warnings.append(_ASSUMED_UNIT_WARNING)
         if foreign:
-            warnings.append(
-                f"외화 표({default_unit})입니다. 원화로 환산하지 않고 원문 단위 "
-                "그대로 보고합니다 - 억원과 나란히 놓고 비교하면 안 됩니다."
-            )
+            warnings.append(_foreign_unit_warning(default_unit))
         return {
             "caption": table.caption[:80],
             "unit": default_unit or "표기 없음(억원 가정)",
+            "unit_source": "declared" if default_unit else "assumed",
             "currency": "foreign" if foreign else "KRW",
             "source_rows": len(rows),
             "rows_used": len(detail_vals) if total_val is None else len(detail_vals),
@@ -337,6 +365,9 @@ def _period_scope(points: list[OrderBacklogPoint]) -> str:
 
 def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeries | None:
     default_unit = _table_unit(table)
+    # 외화 표는 _amount_to_eok 가 숫자를 환산하지 않고 그대로 돌려준다. 그 값에 '억원'을
+    # 붙이면 12,355 백만달러가 12,355억원이 된다. 단위도 원문 그대로 적는다.
+    foreign = _is_foreign_unit(default_unit)
     for index, row in enumerate(table.rows):
         metric = _metric_name(row)
         if metric is None:
@@ -348,7 +379,7 @@ def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeri
         if points:
             return OrderBacklogSeries(
                 metric=metric,
-                unit="억원",
+                unit=default_unit if foreign else "억원",
                 points=points[-limit:],
                 table_caption=table.caption,
                 # 셀에도 표에도 단위 표기가 없으면 숫자를 억원으로 "가정"한 것이다.
@@ -359,6 +390,7 @@ def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeri
                     if (default_unit or _row_has_inline_unit(row))
                     else "assumed"
                 ),
+                source_unit=default_unit,
             )
     return None
 
@@ -369,7 +401,8 @@ def _row_has_inline_unit(row: list[str]) -> bool:
     return any(unit in joined for unit in ("조", "억원", "억", "백만원", "천원", "원"))
 
 
-def _extract_ending_point_from_table(table: DocumentTable, *, period: str) -> OrderBacklogPoint | None:
+def _ending_value_from_table(table: DocumentTable) -> tuple[float, list[str]] | None:
+    """기말잔액 행의 값과 그 행. 단위 판정에 행이 필요해 같이 돌려준다."""
     if not _table_has_backlog_context(table):
         return None
     if _is_intangible_backlog_table(table):
@@ -379,11 +412,11 @@ def _extract_ending_point_from_table(table: DocumentTable, *, period: str) -> Or
         if _is_ending_balance_row(row):
             value = _balance_value_from_row(table.rows, index, default_unit=default_unit)
             if value is not None:
-                return OrderBacklogPoint(period=period, value=value)
+                return value, row
     return None
 
 
-def _extract_fallback_point_from_table(table: DocumentTable, *, period: str) -> OrderBacklogPoint | None:
+def _fallback_value_from_table(table: DocumentTable) -> tuple[float, list[str]] | None:
     if not _table_has_backlog_context(table):
         return None
     if _is_intangible_backlog_table(table):
@@ -393,8 +426,18 @@ def _extract_fallback_point_from_table(table: DocumentTable, *, period: str) -> 
         if _is_header_backlog_value_row(table.rows, index):
             value = _balance_value_from_row(table.rows, index, default_unit=default_unit)
             if value is not None:
-                return OrderBacklogPoint(period=period, value=value)
+                return value, row
     return None
+
+
+def _extract_ending_point_from_table(table: DocumentTable, *, period: str) -> OrderBacklogPoint | None:
+    found = _ending_value_from_table(table)
+    return OrderBacklogPoint(period=period, value=found[0]) if found else None
+
+
+def _extract_fallback_point_from_table(table: DocumentTable, *, period: str) -> OrderBacklogPoint | None:
+    found = _fallback_value_from_table(table)
+    return OrderBacklogPoint(period=period, value=found[0]) if found else None
 
 
 def _metric_name(row: list[str]) -> str | None:

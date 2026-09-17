@@ -163,5 +163,202 @@ class DocumentFetchErrorTests(_Licensed):
         self.assertIn("원문 파일 없음(DART 014)", body)
 
 
+# ---------------------------------------------------------------------------
+# 2. 수주잔고 단위 라벨은 원문 표에서 온다
+# ---------------------------------------------------------------------------
+
+from dartlens._document_tables import DocumentTable
+from dartlens._order_backlog import (
+    OrderBacklogSeries,
+    extract_order_backlog_series,
+    extract_order_backlog_snapshot,
+    format_order_backlog_series,
+)
+
+
+class BacklogUnitLabelTests(unittest.TestCase):
+    def test_usd_trend_table_is_not_labelled_eok(self):
+        table = DocumentTable(
+            caption="수주현황 (단위: 백만달러)",
+            rows=[["구분", "2023", "2024", "2025"], ["수주잔고", "8,000", "10,704", "12,355"]],
+        )
+        series = extract_order_backlog_series([table], limit=3)
+        self.assertEqual(series.unit, "백만달러")
+        self.assertEqual(series.source_unit, "백만달러")
+        text = format_order_backlog_series(
+            corp_code="00000000", report_name="사업보고서", rcept_no="20260320000001",
+            series=series)
+        self.assertIn("단위: 백만달러", text)
+        self.assertNotIn("억원", text)
+
+    def test_usd_ending_balance_keeps_its_unit(self):
+        table = DocumentTable(
+            caption="계약잔액 (단위: 백만달러)",
+            rows=[["구분", "합계"], ["기말계약잔액", "12,355"]],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertEqual(snap.value_unit, "백만달러")
+        self.assertEqual(snap.point.value, 12355.0)
+        self.assertTrue(any("외화" in w for w in snap.warnings), snap.warnings)
+
+    def test_unitless_ending_balance_is_assumed_and_warned(self):
+        table = DocumentTable(
+            caption="계약잔액",
+            rows=[["구분", "합계"], ["기말계약잔액", "1,250,000"]],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertEqual(snap.unit_source, "assumed")
+        self.assertEqual(snap.tables[0]["unit_source"], "assumed")
+        self.assertTrue(any("억원으로 가정" in w for w in snap.warnings), snap.warnings)
+
+    def test_unitless_single_value_is_assumed(self):
+        table = DocumentTable(
+            caption="수주 현황",
+            rows=[["구분", "수주잔고"], ["합계", "1,250,000"]],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.unit_source, "assumed")
+
+    def test_declared_krw_ending_balance_stays_declared(self):
+        table = DocumentTable(
+            caption="계약잔액 (단위: 백만원)",
+            rows=[["구분", "합계"], ["기말계약잔액", "1,250,000"]],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertEqual(snap.value_unit, "억원")
+        self.assertEqual(snap.unit_source, "declared")
+        self.assertEqual(snap.point.value, 12500.0)
+        self.assertEqual(snap.warnings, [])
+
+
+def _backlog_report(name: str, rcept_no: str, rcept_dt: str) -> dict:
+    return {"report_nm": name, "rcept_no": rcept_no, "rcept_dt": rcept_dt}
+
+
+class _BacklogToolBase(_Licensed):
+    async def _run(self, reports, tables_by_rcept, years=3):
+        fetched: list[str] = []
+
+        async def fake_zip(rcept_no):
+            fetched.append(rcept_no)
+            return rcept_no.encode()
+
+        def fake_tables(raw):
+            return tables_by_rcept.get(raw.decode(), [])
+
+        with patch.object(server, "_fetch_disclosure_list", AsyncMock(return_value={"list": reports})), \
+             patch.object(server, "_fetch_document_zip", AsyncMock(side_effect=fake_zip)), \
+             patch.object(server, "extract_document_tables", side_effect=fake_tables):
+            text = await server.get_order_backlog("00126380", years=years)
+        return text, fetched
+
+
+class BacklogToolUnitTests(_BacklogToolBase):
+    async def test_unitless_snapshots_are_not_called_declared(self):
+        unitless = DocumentTable(caption="계약잔액",
+                                 rows=[["구분", "합계"], ["기말계약잔액", "1,250,000"]])
+        reports = [
+            _backlog_report("사업보고서 (2025.12)", "20260320000001", "20260320"),
+            _backlog_report("사업보고서 (2024.12)", "20250320000001", "20250320"),
+        ]
+        text, _ = await self._run(
+            reports, {"20260320000001": [unitless], "20250320000001": [unitless]}, years=2)
+        body = text.split(rmeta.MARKER_START)[0]
+        self.assertNotIn("원문 표기 기준", body)
+        self.assertIn("추정", body)
+
+    async def test_usd_snapshots_carry_usd_target_unit(self):
+        usd = DocumentTable(caption="계약잔액 (단위: 백만달러)",
+                            rows=[["구분", "합계"], ["기말계약잔액", "12,355"]])
+        reports = [
+            _backlog_report("사업보고서 (2025.12)", "20260320000001", "20260320"),
+            _backlog_report("사업보고서 (2024.12)", "20250320000001", "20250320"),
+        ]
+        text, _ = await self._run(
+            reports, {"20260320000001": [usd], "20250320000001": [usd]}, years=2)
+        body = text.split(rmeta.MARKER_START)[0]
+        self.assertIn("단위: 백만달러", body)
+        meta = extract_meta(text)
+        self.assertEqual(
+            meta["backlog_extraction"]["unit_normalization"]["target_unit"], "백만달러")
+
+
+# ---------------------------------------------------------------------------
+# 7. 수주잔고 기간 라벨은 보고서 기간에서 온다 / 8. 채운 기간은 다시 받지 않는다
+# ---------------------------------------------------------------------------
+
+
+class ReportPeriodLabelTests(unittest.TestCase):
+    def test_labels(self):
+        cases = {
+            "사업보고서 (2025.12)": "2025",
+            "[기재정정]사업보고서 (2024.12)": "2024",
+            "반기보고서 (2026.06)": "2026.06",
+            "분기보고서 (2026.03)": "2026.03",
+            "분기보고서 (2025.09)": "2025.09",
+            "사업보고서 (2025.03)": "2025.03",   # 3월 결산 - 연말 값이 아니다
+        }
+        for name, want in cases.items():
+            got = server._order_backlog_report_period({"report_nm": name, "rcept_dt": "20260814"})
+            self.assertEqual(got, want, name)
+
+    def test_unknown_period_is_not_invented(self):
+        self.assertIsNone(server._order_backlog_report_period(
+            {"report_nm": "반기보고서", "rcept_dt": "20260814"}))
+        # 사업보고서만 접수 연도 - 1 로 추정한다(기존 동작).
+        self.assertEqual(server._order_backlog_report_period(
+            {"report_nm": "사업보고서", "rcept_dt": "20260320"}), "2025")
+
+
+class BacklogPeriodToolTests(_BacklogToolBase):
+    @staticmethod
+    def _table():
+        return DocumentTable(caption="계약잔액 (단위: 억원)",
+                             rows=[["구분", "합계"], ["기말계약잔액", "5,000"]])
+
+    async def test_half_year_point_is_not_labelled_annual(self):
+        reports = [
+            _backlog_report("사업보고서 (2025.12)", "20260320000001", "20260320"),
+            _backlog_report("사업보고서 (2024.12)", "20250320000001", "20250320"),   # 추출 실패
+            _backlog_report("사업보고서 (2023.12)", "20240320000001", "20240320"),
+            _backlog_report("반기보고서 (2026.06)", "20260814000001", "20260814"),
+        ]
+        tables = {r: [self._table()] for r in
+                  ("20260320000001", "20240320000001", "20260814000001")}
+        text, _ = await self._run(reports, tables, years=3)
+        body = text.split(rmeta.MARKER_START)[0]
+        self.assertIn("2026.06=5,000", body)
+        self.assertNotIn("2026=5,000", body)
+        self.assertIn("[기간]", body)
+        self.assertNotIn("[연간]", body)
+
+    async def test_already_filled_period_is_not_downloaded_again(self):
+        reports = [
+            _backlog_report("[기재정정]사업보고서 (2025.12)", "20260801000001", "20260801"),
+            _backlog_report("사업보고서 (2025.12)", "20260320000001", "20260320"),
+            _backlog_report("사업보고서 (2024.12)", "20250320000001", "20250320"),
+        ]
+        tables = {r: [self._table()] for r in
+                  ("20260801000001", "20260320000001", "20250320000001")}
+        text, fetched = await self._run(reports, tables, years=3)
+        self.assertEqual(fetched, ["20260801000001", "20250320000001"])
+        self.assertIn("2025=5,000", text)
+
+    async def test_period_read_from_correction_is_not_reported_missing(self):
+        reports = [
+            _backlog_report("사업보고서 (2025.12)", "20260320000001", "20260320"),       # 원본 실패
+            _backlog_report("[기재정정]사업보고서 (2025.12)", "20260101000001", "20260101"),
+        ]
+        # 정렬은 접수일 내림차순이라 원본(03-20)이 정정(01-01, 가짜)보다 먼저 온다.
+        tables = {"20260101000001": [self._table()]}
+        text, fetched = await self._run(reports, tables, years=1)
+        body = text.split(rmeta.MARKER_START)[0]
+        self.assertEqual(fetched, ["20260320000001", "20260101000001"])
+        self.assertIn("2025=5,000", body)
+        self.assertNotIn("빠진 기간", body)
+        self.assertEqual(extract_meta(text)["data_completeness"], "complete")
+
+
 if __name__ == "__main__":
     unittest.main()

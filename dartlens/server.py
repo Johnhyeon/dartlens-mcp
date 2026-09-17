@@ -1880,6 +1880,7 @@ def _finish_order_backlog(
     warnings: list[str],
     failed_periods: dict[str, str],
     reports: list[dict],
+    unit: str = "억원",
 ) -> str:
     """수주잔고 응답에 원문 근거·누락 사유·meta v3 를 단다(DL-01).
 
@@ -1942,7 +1943,7 @@ def _finish_order_backlog(
             "source_filings": source_filings,
             "tables": table_provenance,
             "unit_normalization": {
-                "target_unit": "억원",
+                "target_unit": unit,
                 "per_table_raw_and_converted": [
                     {"caption": (i.get("caption") or "")[:40],
                      "unit": i.get("unit"),
@@ -1990,11 +1991,30 @@ def _order_backlog_report_name(item: dict) -> str:
     return str(item.get("report_nm") or "정기보고서").replace("|", "·")
 
 
+_REPORT_PERIOD_RE = re.compile(r"(20\d{2})[.년/-]?\s*(0[1-9]|1[0-2])")
+
+
 def _order_backlog_report_period(item: dict) -> str | None:
+    """보고서가 덮는 기간 라벨. 사업보고서 12월 결산만 연도("2025")로 적는다.
+
+    예전엔 이름에서 연도만 떼어 "반기보고서 (2026.06)"도 "2026"이 되고 [연간]으로
+    찍혔다. 6월 말 잔고가 연말 잔고처럼 읽힌다. 반기·분기·12월이 아닌 결산은
+    "2026.06"처럼 월까지 적는다(그러면 시계열 라벨이 [기간]이 된다).
+    기간을 알 수 없는 반기·분기 보고서는 None - 라벨을 지어내지 않는다.
+    """
     report_name = item.get("report_nm") or ""
-    match = re.search(r"(20\d{2})(?:[.년/-]?\s*(?:12|06|03|09))?", report_name)
+    is_annual = "사업보고서" in report_name
+    match = _REPORT_PERIOD_RE.search(report_name)
     if match:
-        return match.group(1)
+        year, month = match.groups()
+        if is_annual and month == "12":
+            return year
+        return f"{year}.{month}"
+    if not is_annual:
+        return None
+    year_only = re.search(r"20\d{2}", report_name)
+    if year_only:
+        return year_only.group(0)
     rcept_dt = item.get("rcept_dt") or ""
     if len(rcept_dt) >= 4 and rcept_dt[:4].isdigit():
         return str(int(rcept_dt[:4]) - 1)
@@ -2040,9 +2060,15 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
     failed_periods: dict[str, str] = {}
     used_reports: list[dict] = []
     point_unit = "억원"
+    unit_assumed = False
     for report in candidates[:_ORDER_BACKLOG_MAX_REPORTS]:
         rcept_no = normalize_rcept_no(str(report.get("rcept_no") or ""))
         report_name = _order_backlog_report_name(report)
+        period = _order_backlog_report_period(report)
+        # 이미 값을 채운 기간(정정본·같은 기간 재제출)은 원문을 다시 받지 않는다.
+        # 예전엔 몇 MB짜리 원문을 먼저 받고 나서 버렸다.
+        if period is not None and period in seen_periods:
+            continue
         attempted.append(f"{report_name} rcept_no={rcept_no}")
         try:
             raw = await _fetch_document_zip(rcept_no)
@@ -2052,7 +2078,6 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             # 예전엔 오류 XML 을 표 0개로 읽어 "수주잔고 표 없음"으로 적었다.
             if e.status not in _DOCUMENT_NO_DATA:
                 raise
-            period = _order_backlog_report_period(report)
             if period is not None:
                 failed_periods[period] = f"원문 파일 없음(DART {e.status})"
             continue
@@ -2068,13 +2093,15 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
                 periods=[pt.period for pt in series.points],
                 source_filings=[{"rcept_no": rcept_no, "report": report_name}],
                 table_provenance=[{"caption": series.table_caption[:80],
-                                   "unit": series.unit,
+                                   "unit": series.source_unit or (
+                                       "표기 없음(억원 가정)"
+                                       if series.unit_source == "assumed" else "셀 표기"),
                                    "unit_source": series.unit_source,
                                    "method": "trend_table"}],
                 warnings=[], failed_periods={}, reports=[report],
+                unit=series.unit,
             )
-        period = _order_backlog_report_period(report)
-        if period is None or period in seen_periods:
+        if period is None:
             continue
         snapshot = extract_order_backlog_snapshot(tables, period=period)
         if snapshot is None:
@@ -2091,7 +2118,10 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             )
             continue
         point_unit = snapshot.value_unit
+        unit_assumed = unit_assumed or snapshot.unit_source == "assumed"
         seen_periods.add(period)
+        # 앞선 보고서(원본)에서 실패했어도 정정본에서 읽었으면 빠진 기간이 아니다.
+        failed_periods.pop(period, None)
         yearly_points.append(snapshot.point)
         sources.append(f"{period}: {report_name} rcept_no={rcept_no}")
         source_filings.append({"period": period, "rcept_no": rcept_no,
@@ -2109,7 +2139,11 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             corp_code=cc,
             report_name="복수 정기보고서",
             rcept_no=", ".join(point.period for point in yearly_points),
-            series=OrderBacklogSeries(metric="수주잔고", unit=point_unit, points=yearly_points),
+            series=OrderBacklogSeries(
+                metric="수주잔고", unit=point_unit, points=yearly_points,
+                # 한 점이라도 단위를 가정했으면 '원문 표기 기준'이라 적지 않는다.
+                unit_source="assumed" if unit_assumed else "declared",
+            ),
             sources=sources[-len(yearly_points):],
         )
         return _finish_order_backlog(
@@ -2120,6 +2154,7 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             warnings=extraction_warnings,
             failed_periods=failed_periods,
             reports=used_reports,
+            unit=point_unit,
         )
 
     lines = [
