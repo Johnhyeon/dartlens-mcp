@@ -453,5 +453,26 @@ class ScanFailureTests(_ScanBase):
             result.warnings)
 
 
+# ---------------------------------------------------------------------------
+# 11. "최근 N일"은 한국 날짜 기준
+# ---------------------------------------------------------------------------
+
+from datetime import date, datetime, timedelta, timezone
+
+from dartlens import _validate
+
+
+class KstDateRangeTests(unittest.TestCase):
+    def test_us_evening_is_already_tomorrow_in_korea(self):
+        pdt = timezone(timedelta(hours=-7))
+        now = datetime(2026, 9, 17, 20, 0, tzinfo=pdt)      # = 2026-09-18 12:00 KST
+        self.assertEqual(_validate.kst_today(now), date(2026, 9, 18))
+
+    def test_days_to_range_ends_on_korean_today(self):
+        with patch.object(_validate, "kst_today", return_value=date(2026, 9, 18)):
+            bgn, end = _validate.days_to_range(1)
+        self.assertEqual((bgn, end), ("20260917", "20260918"))
+
+
 if __name__ == "__main__":
     unittest.main()

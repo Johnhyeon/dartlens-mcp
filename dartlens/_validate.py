@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
+
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def kst_today(now: datetime | None = None) -> date:
+    """한국 날짜. DART 접수일·공시 기간은 KST 기준이다.
+
+    PC 날짜(date.today())를 쓰면 미국에 있는 구매자는 한국보다 하루 늦어, "최근 N일"
+    조회가 한국 오늘 접수분을 빼고 끝난다. now 는 테스트에서 해외 시각을 흉내 낼 때만.
+    """
+    return (now or datetime.now(timezone.utc)).astimezone(_KST).date()
 
 
 def normalize_corp_code(value: str | None) -> str:
@@ -51,7 +63,7 @@ def normalize_bsns_year(value) -> str:
     if len(s) != 4 or not s.isdigit():
         raise ValueError(f"bsns_year는 4자리 연도여야 합니다 (받음: '{value}').")
     year = int(s)
-    current = date.today().year
+    current = kst_today().year
     if year < 1980 or year > current + 1:
         raise ValueError(f"bsns_year가 비정상 범위입니다: {year} (1980 ~ {current + 1}).")
     return s
@@ -152,14 +164,14 @@ def normalize_sj_div(value: str | None) -> str | None:
 
 
 def days_to_range(days: int, *, today: date | None = None) -> tuple[str, str]:
-    """오늘 기준 N일 전 ~ 오늘을 (bgn_de, end_de) YYYYMMDD로 반환.
+    """한국 오늘 기준 N일 전 ~ 오늘을 (bgn_de, end_de) YYYYMMDD로 반환.
 
-    DART는 한국 시장 기준이므로 호출 측에서 KST `today`를 넘기면 더 정확하지만,
-    공시 조회는 일 단위라 시스템 시각으로도 충분.
+    today 를 안 주면 KST 날짜를 쓴다. 예전엔 PC 날짜라 미국 시간대 사용자의 조회가
+    한국 어제에서 끝났다.
     """
     if not isinstance(days, int) or days < 1 or days > 3650:
         raise ValueError(f"days는 1~3650 사이의 정수여야 합니다 (받음: {days}).")
     from datetime import timedelta
-    today = today or date.today()
+    today = today or kst_today()
     bgn = today - timedelta(days=days)
     return bgn.strftime("%Y%m%d"), today.strftime("%Y%m%d")
