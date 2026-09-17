@@ -360,5 +360,98 @@ class BacklogPeriodToolTests(_BacklogToolBase):
         self.assertEqual(extract_meta(text)["data_completeness"], "complete")
 
 
+# ---------------------------------------------------------------------------
+# 3. 실적 스캔 YoY 는 같은 기준끼리 / 4. 조회 실패는 결측이 아니다
+# ---------------------------------------------------------------------------
+
+import tempfile
+
+from dartlens import _earnings
+from dartlens._cache import EarningsCache
+
+
+def _multi_row(corp, account, ths, frm, add=None, frm_add=None, rcept="20260814000001"):
+    row = {"corp_code": corp, "rcept_no": rcept, "account_nm": account, "fs_div": "CFS",
+           "sj_div": "IS", "thstrm_amount": ths, "frmtrm_amount": frm}
+    if add is not None:
+        row["thstrm_add_amount"] = add
+    if frm_add is not None:
+        row["frmtrm_add_amount"] = frm_add
+    return row
+
+
+class _ScanBase(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.cache = EarningsCache(Path(self._td.name) / "earnings.sqlite")
+        self.addCleanup(self._td.cleanup)
+        self.addCleanup(self.cache.close)
+
+    async def _collect(self, multi_acnt, universe="00115931", period="2026H1"):
+        with patch.object(_earnings, "get_multi_acnt", multi_acnt), \
+             patch.object(_earnings, "corp_basic_map", AsyncMock(return_value={})), \
+             patch.object(_earnings, "meta_map", AsyncMock(return_value={})):
+            return await _earnings.collect_scan_rows(
+                period=period, universe=universe, cache=self.cache)
+
+
+class ScanPrevBasisTests(_ScanBase):
+    async def test_missing_prev_cumulative_is_filled_from_prior_year_cumulative(self):
+        async def fake(corp_codes, year, reprt_code):
+            if int(year) == 2026:   # 전기 누적(frmtrm_add_amount) 없음
+                return [_multi_row("00115931", "영업이익", "449", "401", add="862")]
+            return [_multi_row("00115931", "영업이익", "401", "380", add="759", frm_add="700",
+                               rcept="20250814000001")]
+
+        result = await self._collect(AsyncMock(side_effect=fake))
+        row = result.rows[0]
+        self.assertEqual(row.op, 862.0)
+        self.assertAlmostEqual(row.op_yoy, (862 - 759) / 759 * 100)
+
+    async def test_prior_year_with_other_basis_is_not_used(self):
+        async def fake(corp_codes, year, reprt_code):
+            if int(year) == 2026:
+                return [_multi_row("00115931", "영업이익", "449", "401", add="862")]
+            return [_multi_row("00115931", "영업이익", "401", "380",   # 전년은 3개월뿐
+                               rcept="20250814000001")]
+
+        result = await self._collect(AsyncMock(side_effect=fake))
+        self.assertIsNone(result.rows[0].op_yoy)
+
+
+class ScanFailureTests(_ScanBase):
+    async def test_all_chunks_failing_is_an_error_not_empty_table(self):
+        multi = AsyncMock(side_effect=DartApiError("010", "등록되지 않은 인증키입니다."))
+        with self.assertRaises(DartApiError) as ctx:
+            await self._collect(multi, universe="00115931,00126380")
+        self.assertEqual(ctx.exception.status, "010")
+
+    async def test_tool_reports_dart_error_code(self):
+        multi = AsyncMock(side_effect=DartApiError("020", "사용한도를 초과하였습니다."))
+        with patch("dartlens._safe.is_licensed", return_value=True), \
+             patch.object(_earnings, "get_multi_acnt", multi), \
+             patch.object(_earnings, "get_earnings_cache", return_value=self.cache):
+            text = await server.scan_earnings_season(period="2026H1", universe="00115931")
+        self.assertTrue(text.startswith("⚠️ DART API 오류 [020]"), text)
+
+    async def test_partial_failure_is_warned_not_hidden_in_missing(self):
+        # 00115931 은 캐시에 있고, 00126380 조회만 한도에 걸린다.
+        acc = _earnings.extract_accounts(
+            [_multi_row("00115931", "영업이익", "449", "401", add="862", frm_add="759")],
+            "00115931", "CFS", "11012")
+        self.cache.set_many({EarningsCache.make_key("00115931", 2026, "11012", "CFS"): acc})
+
+        async def fake(corp_codes, year, reprt_code):
+            if int(year) == 2026:
+                raise DartApiError("020", "사용한도를 초과하였습니다.")
+            return []
+
+        result = await self._collect(AsyncMock(side_effect=fake), universe="00115931,00126380")
+        self.assertEqual(result.data_count, 1)
+        self.assertTrue(
+            any("조회 실패로 1개 회사" in w and "020" in w for w in result.warnings),
+            result.warnings)
+
+
 if __name__ == "__main__":
     unittest.main()

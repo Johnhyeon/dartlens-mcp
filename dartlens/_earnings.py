@@ -219,6 +219,10 @@ _NI_NAMES = {
 }
 
 
+# 캐시 payload 규칙 버전. 계산 규칙이 바뀌어 옛 캐시 값을 믿을 수 없으면 올린다.
+_ACCOUNTS_SCHEMA_V = 4
+
+
 def extract_accounts(
     rows: list[dict], corp_code: str, fs_div: str, reprt_code: str = ""
 ) -> dict | None:
@@ -264,8 +268,13 @@ def extract_accounts(
     if not picked:
         return None
 
-    out: dict = {"corp_name": corp_name, "rcept_no": rcept_no, "filing_date": filing_date}
+    out: dict = {
+        "corp_name": corp_name, "rcept_no": rcept_no, "filing_date": filing_date,
+        "schema_v": _ACCOUNTS_SCHEMA_V,
+    }
     used_cum = False
+    # 1분기·사업보고서는 3개월(=해당 기간) 값이 곧 누적이라 전기 3개월로 채워도 같은 기준이다.
+    prev_q_is_cum = reprt_code in ("11011", "11013")
     for bucket in ("rev", "op", "ni"):
         r = picked.get(bucket)
         q_cur = parse_won(r.get("thstrm_amount")) if r else None
@@ -275,7 +284,12 @@ def extract_accounts(
         if cum_cur is not None:
             used_cum = True
             out[f"{bucket}_cur"] = cum_cur
-            out[f"{bucket}_prev"] = cum_prev if cum_prev is not None else q_prev
+            # 전기 누적이 없을 때 전기 3개월로 채우면 누적÷3개월이 된다(반기면 YoY 가
+            # 두 배 가까이 부푼다). 비워 두면 collect_scan_rows 가 전년도 같은
+            # 보고서의 누적으로 채우고, 그것도 없으면 N/A 다.
+            if cum_prev is None and prev_q_is_cum:
+                cum_prev = q_prev
+            out[f"{bucket}_prev"] = cum_prev
         else:
             out[f"{bucket}_cur"] = q_cur
             out[f"{bucket}_prev"] = q_prev
@@ -451,9 +465,14 @@ def _has_current_schema(acc: dict) -> bool:
     v2: bea5cd3 이전 payload에는 rcept_no/filing_date가 없어 공시일이 N/A가 된다.
     v3: 누적/3개월 분리 이전 payload는 _cur가 3개월 값인데 누적으로 표시되므로
         (`basis` 키 부재로 판별) 반드시 재조회한다.
+    v4: 전기 누적이 없을 때 _prev 를 전기 3개월로 채운 payload 는 YoY 가 누적÷3개월이라
+        (`schema_v` < 4 로 판별) 재조회한다.
     값이 빈 문자열/None일 수는 있으므로 truthiness가 아니라 키 존재로 판정한다.
     """
-    return "rcept_no" in acc and "filing_date" in acc and "basis" in acc
+    return (
+        "rcept_no" in acc and "filing_date" in acc and "basis" in acc
+        and acc.get("schema_v", 0) >= _ACCOUNTS_SCHEMA_V
+    )
 
 
 async def _fetch_year(
@@ -462,10 +481,12 @@ async def _fetch_year(
     reprt_code: str,
     fs_div: str,
     cache: EarningsCache,
-) -> tuple[dict[str, dict], int, int, int]:
+) -> tuple[dict[str, dict], int, int, int, list[tuple[DartApiError, int]]]:
     """특정 (year, reprt, fs_div)에 대해 캐시 미스 corp만 chunk fetch.
 
-    반환: (corp_code→accounts, cache_hits, api_fetched, api_call_count).
+    반환: (corp_code→accounts, cache_hits, api_fetched, api_call_count, failures).
+    failures 는 (오류, 그 chunk 의 회사 수) 목록이다. 예전엔 실패 chunk 를 빈 결과로
+    삼켜 한도 초과·키 오류가 "데이터 결측"(=미공시)으로 읽혔다.
     캐시 hit corp는 API 스킵. 데이터 있는 corp만 캐시에 저장(미접수분 재시도).
     """
     keys = {
@@ -486,15 +507,15 @@ async def _fetch_year(
     chunks = [misses[i : i + _CHUNK] for i in range(0, len(misses), _CHUNK)]
     sem = asyncio.Semaphore(_MAX_CONCURRENT_CHUNKS)
     api_calls = 0
-    failed_chunks = 0
+    failures: list[tuple[DartApiError, int]] = []
 
     async def run_chunk(chunk: list[str]) -> dict[str, dict]:
-        nonlocal api_calls, failed_chunks
+        nonlocal api_calls
         async with sem:
             try:
                 rows = await get_multi_acnt(chunk, year, reprt_code)
-            except DartApiError:
-                failed_chunks += 1
+            except DartApiError as e:
+                failures.append((e, len(chunk)))
                 return {}
             api_calls += 1
             out: dict[str, dict] = {}
@@ -518,7 +539,12 @@ async def _fetch_year(
         await asyncio.to_thread(cache.set_many, to_store)
 
     result.update(fetched)
-    return result, cache_hits, len(fetched), api_calls + failed_chunks
+    return result, cache_hits, len(fetched), api_calls + len(failures), failures
+
+
+def _failure_codes(failures: list[tuple[DartApiError, int]]) -> str:
+    codes = sorted({e.status or "코드 없음" for e, _ in failures})
+    return "DART " + ", ".join(codes)
 
 
 # ---------------------------------------------------------------------------
@@ -561,15 +587,21 @@ async def collect_scan_rows(
         cache = get_earnings_cache()
 
     # 당기 + 전년동기 (전년 frmtrm 결측 보완용) — 두 세트 병렬
-    (cur_map, cur_hits, cur_fetched, cur_calls), (
+    (cur_map, cur_hits, cur_fetched, cur_calls, cur_failures), (
         prev_map,
         prev_hits,
         prev_fetched,
         prev_calls,
+        prev_failures,
     ) = await asyncio.gather(
         _fetch_year(corp_codes, year, reprt_code, fs_div, cache),
         _fetch_year(corp_codes, year - 1, reprt_code, fs_div, cache),
     )
+    # 당기 조회가 전부 실패했으면(키 오류·점검·한도) 빈 표를 "결측"으로 내지 않고
+    # DART 오류 그대로 알린다.
+    cur_failed_corps = sum(n for _, n in cur_failures)
+    if cur_failures and not cur_map and cur_failed_corps >= len(corp_codes):
+        raise cur_failures[0][0]
 
     rows: list[ScanRow] = []
     for cc in corp_codes:
@@ -577,12 +609,13 @@ async def collect_scan_rows(
         if acc is None:
             continue
         acc = dict(acc)  # 캐시 dict 변형 방지
-        # frmtrm 결측 시 전년도 호출의 thstrm로 보완
+        # frmtrm 결측 시 전년도 호출의 thstrm로 보완. 전년도 값이 같은 기준(누적·3개월·
+        # 연간)일 때만 - 기준이 다르면 YoY 가 성립하지 않으니 비워 둔다(N/A).
+        prev_acc = prev_map.get(cc)
+        same_basis = prev_acc is not None and prev_acc.get("basis") == acc.get("basis")
         for bucket in ("rev", "op", "ni"):
-            if acc.get(f"{bucket}_prev") is None:
-                prev_acc = prev_map.get(cc)
-                if prev_acc is not None:
-                    acc[f"{bucket}_prev"] = prev_acc.get(f"{bucket}_cur")
+            if acc.get(f"{bucket}_prev") is None and same_basis:
+                acc[f"{bucket}_prev"] = prev_acc.get(f"{bucket}_cur")
         rows.append(compute_row(cc, acc))
 
     # fnlttMultiAcnt엔 corp_name이 없다 → corpCode.xml에서 name+stock_code,
@@ -608,6 +641,17 @@ async def collect_scan_rows(
     total_hits = cur_hits + prev_hits
     total_fetched = cur_fetched + prev_fetched
     warnings = [w for w in (universe_warn, big_universe_warn) if w]
+    if cur_failures:
+        warnings.append(
+            f"DART 조회 실패로 {cur_failed_corps}개 회사를 확인하지 못했습니다"
+            f"({_failure_codes(cur_failures)}). 데이터 결측 {missing}건에 포함돼 있으니 "
+            "미공시로 읽지 마세요."
+        )
+    if prev_failures:
+        warnings.append(
+            f"전년 비교값 조회 실패 {sum(n for _, n in prev_failures)}개 회사"
+            f"({_failure_codes(prev_failures)}) - 일부 YoY 가 N/A 일 수 있습니다."
+        )
 
     sorted_rows = sort_rows(rows, sort_by, direction)
     limited_rows = sorted_rows[:limit] if limit is not None else sorted_rows

@@ -395,12 +395,27 @@ class ExtractAccountsBasisTests(unittest.TestCase):
         self.assertNotIn("⚠3개월값", row.note)
         self.assertEqual(row.rev, 86_272_175_136.0)
 
-    def test_prev_falls_back_to_quarter_when_cumulative_missing(self):
+    def test_prev_stays_empty_when_cumulative_missing(self):
+        """전기 누적이 없다고 전기 3개월로 채우면 YoY 가 누적÷3개월이 된다.
+
+        이 테스트는 예전에 그 채움(rev_prev = 전기 3개월)을 기대값으로 고정하고
+        있었다. 반기면 862억÷401억 = +115% 가 되어 op_yoy desc 맨 위로 올라간다.
+        2026-09-17 라벨-값 점검에서 올바른 기대값으로 바꿨다: 비워 두고, 전년도
+        같은 보고서의 누적으로 채우는 건 collect_scan_rows 가 한다.
+        """
         rows = [
             _scan_row("매출액", "44,949,617,767", "40,099,205,051", "86,272,175,136"),
         ]
         acc = extract_accounts(rows, "00115931", "CFS", "11012")
-        self.assertEqual(acc["rev_prev"], 40_099_205_051.0)
+        self.assertIsNone(acc["rev_prev"])
+        self.assertEqual(acc["rev_q_prev"], 40_099_205_051.0)  # 3개월 값은 따로 보존
+        self.assertIsNone(compute_row("00115931", acc).rev_yoy)
+
+    def test_q1_prev_quarter_is_already_cumulative(self):
+        """1분기는 3개월 = 누적이라 전기 3개월로 채워도 같은 기준이다."""
+        rows = [_scan_row("매출액", "100", "90", "100")]
+        acc = extract_accounts(rows, "00115931", "CFS", "11013")
+        self.assertEqual(acc["rev_prev"], 90.0)
 
 
 class BasisNoteTests(unittest.TestCase):
@@ -430,6 +445,12 @@ class CacheSchemaGuardTests(unittest.TestCase):
     def test_pre_basis_payload_is_stale(self):
         """basis 없는 옛 캐시는 _cur가 3개월 값이라 반드시 재조회해야 한다."""
         old = {"rcept_no": "2026...", "filing_date": "2026-08-13", "rev_cur": 1.0}
+        self.assertFalse(_has_current_schema(old))
+
+    def test_pre_v4_payload_is_stale(self):
+        """v4 이전 payload 는 _prev 가 전기 3개월로 채워졌을 수 있다."""
+        old = {"rcept_no": "2026...", "filing_date": "2026-08-13", "basis": "cum",
+               "rev_cur": 862.0, "rev_prev": 401.0}
         self.assertFalse(_has_current_schema(old))
 
     def test_current_payload_accepted(self):
