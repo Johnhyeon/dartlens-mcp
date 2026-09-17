@@ -21,7 +21,7 @@ from dartlens._corp_code import (
 from dartlens._document_tables import extract_document_tables
 from dartlens._earnings import run_scan
 from dartlens._earnings_export import run_export
-from dartlens._http import get_bytes, get_json
+from dartlens._http import dart_error_from_bytes, get_bytes, get_json
 from dartlens import _metrics as _metrics_mod
 from dartlens._metrics import read_dart_call_status, track_metrics
 from dartlens import _result_meta as rmeta
@@ -1580,15 +1580,30 @@ def _extract_full_text(xml_bytes: bytes) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# DART 가 "이 접수번호의 원문 파일이 없다"고 답한 것. 한도 초과·키 오류와 달리
+# 같은 요청을 다시 해도 소용없고, 다른 보고서는 받을 수 있다.
+_DOCUMENT_NO_DATA = {"013", "014"}
+
+
 @cached(ttl_seconds=24 * 3600)
 async def _fetch_document_zip(rcept_no: str) -> bytes:
-    return await get_bytes("/document.xml", params={"rcept_no": rcept_no})
+    """document.xml 원문 zip. 정상 응답은 항상 zip 이다.
+
+    zip 이 아니면 DART 가 status 를 실어 보낸 오류 XML 이다. 예전엔 그 XML 을
+    본문으로 읽어 "020사용한도를 초과하였습니다." 가 공시 발췌로 나갔고, 24시간
+    캐시에 남았다. 예외는 캐시되지 않으므로 한도가 풀리면 바로 다시 받는다.
+    """
+    raw = await get_bytes("/document.xml", params={"rcept_no": rcept_no})
+    if raw[:2] != b"PK":
+        raise dart_error_from_bytes(raw, expected="공시 원문 파일")
+    return raw
 
 
 def _parse_document_zip(raw: bytes) -> tuple[list[str], str]:
     """document.xml 응답 파싱. (파일목록, 본문 풀 텍스트) — cap 없음."""
     if raw[:2] != b"PK":
-        return [], _extract_full_text(raw)
+        # 오류 응답을 본문으로 읽지 않는다(_fetch_document_zip 참고).
+        raise dart_error_from_bytes(raw, expected="공시 원문 파일")
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
         names = zf.namelist()
         if not names:
@@ -1680,6 +1695,17 @@ def _format_short_disclosure(*, no: str, names: list[str], text: str) -> str:
     return "\n".join(lines)
 
 
+def _format_missing_document(*, no: str, err: DartApiError) -> str:
+    return "\n".join([
+        f"# 공시 본문 (rcept_no={no})",
+        "",
+        f"**원문 보기:** {_viewer_url(no)}",
+        "",
+        f"DART에서 이 접수번호의 원문 파일을 받지 못했습니다 (DART {err.status}: {err.message}).",
+        "접수번호가 list_disclosures 결과와 같은지 확인하거나, 원문 보기 링크에서 확인하세요.",
+    ])
+
+
 def _format_long_report(*, no: str, names: list[str], text: str) -> str:
     title = _guess_title(text)
     lines = [
@@ -1762,7 +1788,23 @@ async def get_disclosure_detail(rcept_no: str, find: str | None = None) -> str:
         find: 본문 검색 키워드 (선택). 지정 시 키워드 검색 모드.
     """
     no = normalize_rcept_no(rcept_no)
-    raw = await _fetch_document_zip(no)
+    try:
+        raw = await _fetch_document_zip(no)
+    except DartApiError as e:
+        # 원문 파일이 없다는 답(013·014)만 빈 결과로 돌려준다. 한도 초과·키·IP 오류는
+        # safe_tool 이 DART 코드 그대로 알린다.
+        if e.status not in _DOCUMENT_NO_DATA:
+            raise
+        return rmeta.append_meta(
+            _format_missing_document(no=no, err=e),
+            _dart_meta(
+                data_completeness=rmeta.NONE,
+                warnings=[
+                    f"DART가 원문 파일을 주지 않았다(DART {e.status}). 공시 내용이 없다는 "
+                    "뜻이 아니다. 본문 없이 학습지식으로 답하지 마라."
+                ],
+            ),
+        )
     names, text = _parse_document_zip(raw)
 
     if find and find.strip():
@@ -2002,7 +2044,18 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
         rcept_no = normalize_rcept_no(str(report.get("rcept_no") or ""))
         report_name = _order_backlog_report_name(report)
         attempted.append(f"{report_name} rcept_no={rcept_no}")
-        raw = await _fetch_document_zip(rcept_no)
+        try:
+            raw = await _fetch_document_zip(rcept_no)
+        except DartApiError as e:
+            # 원문 파일이 없다는 답(013·014)만 이 보고서를 건너뛴다. 한도 초과·키·IP
+            # 오류는 남은 보고서도 똑같이 막히므로 더 부르지 않고 그대로 알린다.
+            # 예전엔 오류 XML 을 표 0개로 읽어 "수주잔고 표 없음"으로 적었다.
+            if e.status not in _DOCUMENT_NO_DATA:
+                raise
+            period = _order_backlog_report_period(report)
+            if period is not None:
+                failed_periods[period] = f"원문 파일 없음(DART {e.status})"
+            continue
         tables = extract_document_tables(raw)
         series = extract_order_backlog_series(tables, limit=years)
         if series is not None and len(series.points) >= 2:

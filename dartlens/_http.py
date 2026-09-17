@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import ssl
 from typing import Any
 
@@ -163,6 +164,49 @@ _STATUS_MESSAGES = {
     "900": "정의되지 않은 오류가 발생했습니다",
     "901": "사용자 계정의 개인정보 보유기간이 만료되었습니다",
 }
+
+
+_BODY_SECRET_RE = re.compile(r"(crtfc_key\s*=\s*)([0-9A-Za-z]{4,})", re.IGNORECASE)
+
+
+def dart_error_from_bytes(raw: bytes, *, expected: str) -> DartApiError:
+    """zip 이어야 할 응답이 zip 이 아닐 때, DART 가 실어 보낸 status 로 오류를 만든다.
+
+    DART 는 파일 엔드포인트(document.xml 등)에서도 오류를 HTTP 200 + 작은 XML 로
+    준다: <result><status>020</status><message>…</message></result>. 이걸 본문으로
+    읽으면 "020사용한도를 초과하였습니다." 가 공시 원문 발췌로 나가고, 캐시에 남아
+    한도가 풀린 뒤에도 같은 글자를 돌려준다. 오류는 오류로 올려야 캐시되지 않는다.
+
+    status 를 못 찾으면(점검 페이지 HTML 등) status 는 빈 문자열로 두고 받은 응답의
+    앞부분을 크리덴셜을 지운 채 싣는다. 없는 DART 코드를 지어내지 않는다.
+    """
+    status = ""
+    message = ""
+    try:
+        from lxml import etree
+
+        root = etree.fromstring(raw, parser=etree.XMLParser(recover=True))
+        if root is not None:
+            status = (root.findtext(".//status") or "").strip()
+            message = (root.findtext(".//message") or "").strip()
+    except Exception:
+        status, message = "", ""
+
+    if status:
+        from dartlens._metrics import record_dart_call
+
+        try:
+            record_dart_call(status)
+        except Exception:
+            pass
+        return DartApiError(status, message or _STATUS_MESSAGES.get(status, "알 수 없는 오류"))
+
+    if not raw:
+        snippet = "빈 응답"
+    else:
+        snippet = " ".join(raw[:200].decode("utf-8", errors="replace").split())
+        snippet = _BODY_SECRET_RE.sub(lambda m: f"{m.group(1)}***", snippet)
+    return DartApiError("", f"DART가 {expected} 대신 다른 응답을 보냈습니다: {snippet}")
 
 
 async def get_json(endpoint: str, params: dict[str, Any] | None = None) -> dict:

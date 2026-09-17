@@ -57,7 +57,7 @@ class DartApiError(Exception):
     def __init__(self, status: str, message: str):
         self.status = status
         self.message = message
-        super().__init__(f"[{status}] {message}")
+        super().__init__(f"[{status}] {message}" if status else message)
 
 
 class MissingApiKeyError(Exception):
@@ -105,6 +105,9 @@ def safe_tool(func):
         except MissingApiKeyError as e:
             return f"⚠️ {e}"
         except DartApiError as e:
+            # status 가 없는 오류는 DART 가 코드를 안 실어 보낸 응답이다(점검 페이지 등).
+            if not e.status:
+                return f"⚠️ DART API 오류: {e.message}"
             return f"⚠️ DART API 오류 [{e.status}]: {e.message}"
         except httpx.TimeoutException as e:
             # 0.6.16에서 ConnectError/HTTPError에는 원인을 붙였는데 이 분기만 빠뜨렸다.
