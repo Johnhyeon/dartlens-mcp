@@ -2365,25 +2365,30 @@ def _format_status(
     if latest_version and latest_version != version:
         # 터미널 명령을 안내하면 주 고객층은 거기서 막힌다 — LeetKit Manager가 있는
         # 이유가 그 명령을 안 치게 하려는 것이다. 세 Lens 안내를 같은 말로 맞춘다.
-        update_line += f" (최신: {latest_version} — LeetKit Manager를 열고 DartLens 카드의 [업데이트])"
+        update_line += f" (최신: {latest_version} — LeetKit Manager의 DartLens 카드에서 [업데이트]를 눌러주세요)"
     elif latest_version:
         update_line += " (최신 버전)"
     else:
         update_line += " (최신 버전 확인 불가 — PyPI 연결 실패)"
     lines.append(update_line)
 
+    # 상황 문장은 Manager 진단과 같은 것을 쓰고, 할 일만 Claude 답변용 앞말로 바꾼다
+    # (diagnostics.answer_copy). 터미널 명령은 안내하지 않는다.
     if license_diag.status == "active":
         lines.append(f"- 라이선스: 활성화 (ID: {license_diag.license_id_masked})")
     else:
-        lines.append(f"- ⚠️ 라이선스: {license_diag.message}")
+        action = diagnostics.license_action(license_diag, in_answer=True)
+        lines.append(f"- ⚠️ 라이선스: {license_diag.message}" + (f" {action}" if action else ""))
 
     api_note = " (실제 유효성 확인됨)" if checked_online else " (형식만 확인 — 실제 유효성은 check_online=True)"
+    api_action = diagnostics.dart_api_action(api_diag, in_answer=True)
+    api_tail = f" {api_action}" if api_action else ""
     if api_diag.status == "valid":
-        lines.append(f"- DART API 키: 정상{api_note} — {api_diag.storage}, {api_diag.key_tail_masked}")
+        lines.append(f"- DART 인증키: 정상{api_note} — {api_diag.storage}, {api_diag.key_tail_masked}")
     elif api_diag.status in ("rate_limited", "network_unreachable"):
-        lines.append(f"- DART API 키: {api_diag.message} (일시적 문제로 보임)")
+        lines.append(f"- DART 인증키: {api_diag.message}{api_tail}")
     else:
-        lines.append(f"- ⚠️ DART API 키: {api_diag.message}")
+        lines.append(f"- ⚠️ DART 인증키: {api_diag.message}{api_tail}")
 
     if call_status["last_call_at"]:
         lines.append(f"- 최근 DART 호출: {call_status['last_call_at']} (status {call_status['last_status']})")
@@ -2409,7 +2414,8 @@ async def dartlens_status(check_online: bool = False) -> str:
 
     라이선스나 API 키가 없어도 동작한다(문제 원인을 보여주는 게 목적이라 다른 도구처럼
     라이선스 게이트를 걸지 않음 — 재무 데이터는 전혀 포함하지 않아 게이트가 필요 없음).
-    "DartLens가 왜 안 되지" 류 질문에서 dartlens-doctor 안내 전에 먼저 호출하기 좋음.
+    "DartLens가 왜 안 되지" 류 질문에서 먼저 호출하기 좋음.
+    문제가 있으면 LeetKit Manager의 [진단]이나 상단 [지원 문의]를 안내하세요. 터미널 명령은 안내하지 마세요.
 
     Args:
         check_online: True면 DART에 가벼운 엔드포인트 1회 호출해 API 키의 실제 유효성까지 확인.

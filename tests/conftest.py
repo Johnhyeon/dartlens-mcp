@@ -27,3 +27,20 @@ def _isolate_license_state(tmp_path_factory, monkeypatch):
         lambda: [root / "lens" / "trial_started.json", root / "shared" / "trial_started.json"],
         raising=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_metrics_logs(tmp_path_factory, monkeypatch):
+    """도구 호출 기록(`~/.dartlens/logs`)도 진짜 폴더에 쓰지 않게 막는다.
+
+    예전엔 도구를 부르는 테스트가 개발자 홈의 metrics 파일에 호출 기록을 쌓았다(일부러
+    낸 ValueError·DART 한도 오류 포함). doctor 의 RECENT_TOOL_FAILURES 가 이 기록을
+    읽으므로, 테스트 한 번 돌리면 그 PC의 Manager 카드가 "최근 실패"로 바뀐다.
+    """
+    logs = tmp_path_factory.mktemp("metrics_logs")
+    try:
+        from dartlens import _metrics
+    except Exception:
+        return
+    monkeypatch.setattr(_metrics, "get_metrics_dir", lambda: logs)
+    monkeypatch.setattr(_metrics, "_metrics_dir_readonly", lambda: logs)

@@ -34,6 +34,8 @@ try:
     )
     from dartlens import diagnostics
     from dartlens import _corp_code
+    from dartlens import _error_class
+    from dartlens import _metrics
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from dartlens.setup_claude import (
@@ -47,6 +49,20 @@ except ImportError:
     )
     from dartlens import diagnostics
     from dartlens import _corp_code
+    from dartlens import _error_class
+    from dartlens import _metrics
+
+
+# Manager 진단 화면의 "할 일"(checks[].action)에 들어가는 문구. 예전엔 여기에 터미널
+# 명령(`dartlens-setup`, `uv tool install …`)을 적었고 Manager가 그걸 그대로 보여줬다 —
+# 주 고객층은 거기서 막힌다. 이제 할 일은 Manager 버튼으로만 안내한다. details.lines 도
+# Manager 상세 창에 보이므로 새로 넣는 줄은 한국어 상황을 먼저 쓰고 원문은 짧게 괄호에
+# 붙인다(diagnostics._detail_line). 사람용 텍스트 출력도 같은 Check 를 쓴다.
+_LENS = diagnostics.LENS
+_ACTION_MCP_REGISTER = f"{_LENS} 카드의 [MCP 등록]을 눌러주세요."
+_ACTION_UPDATE = _error_class.action_for("other", _LENS)
+_ACTION_REPAIR = f"{_LENS} 카드의 [복구]를 눌러주세요."
+_ACTION_SUPPORT = "상단 [지원 문의]를 눌러주세요."
 
 
 class Check:
@@ -135,13 +151,11 @@ def check_uv() -> Check:
         c.ok("uv is installed")
         c.info(f"Path:       {uv}")
     else:
+        # uv 는 설치·업데이트 때만 쓴다. 이미 깔린 DartLens 는 uv 없이도 돈다 — 그래서
+        # 고칠 일을 시키기보다 지금 되는지부터 말한다. 설치는 Manager 가 필요할 때 한다.
         c.warn(
             "uv not found",
-            fix=(
-                "Install uv (recommended):\n"
-                "  Windows: irm https://astral.sh/uv/install.ps1 | iex\n"
-                "  macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh"
-            ),
+            fix=f"지금 {_LENS}가 잘 되면 그대로 두셔도 돼요. 문제가 있으면 상단 [지원 문의]를 눌러주세요.",
         )
     return c
 
@@ -158,7 +172,7 @@ def check_package() -> Check:
     except ImportError:
         c.fail(
             "dartlens-mcp NOT importable in current interpreter",
-            fix="uv tool install --force dartlens-mcp",
+            fix=_ACTION_UPDATE,
         )
     return c
 
@@ -191,7 +205,7 @@ def check_dartlens_command() -> Check:
             if candidate.exists():
                 c.warn(
                     "'dartlens' exists in sysconfig scripts but not on PATH",
-                    fix=f'Add to PATH: "{scripts_dir}"',
+                    fix=_ACTION_UPDATE,
                 )
                 c.info(f"Path:       {candidate}")
                 return c
@@ -200,7 +214,7 @@ def check_dartlens_command() -> Check:
 
     c.fail(
         "'dartlens' command NOT found anywhere",
-        fix="uv tool install --force dartlens-mcp",
+        fix=_ACTION_UPDATE,
     )
     return c
 
@@ -229,7 +243,7 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
 
     if not config_path.exists():
         if required:
-            c.fail("Config file does not exist", fix="dartlens-setup")
+            c.fail("Config file does not exist", fix=_ACTION_MCP_REGISTER)
         else:
             c.info("Config file does not exist (target not in use — OK)")
             c.status = "info-skip"
@@ -240,20 +254,23 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except json.JSONDecodeError as e:
-        c.fail(f"Config is not valid JSON: {e}", fix="Back up and re-run dartlens-setup")
+        # [MCP 등록]이 깨진 파일을 백업해두고 새로 쓴다(setup_claude._write_config_entry).
+        c.fail(f"Config is not valid JSON: {e}", fix=_ACTION_MCP_REGISTER)
         return c
     except Exception as e:
-        c.fail(f"Cannot read config: {e}")
+        c.fail(f"Cannot read config: {e}", fix=_ACTION_SUPPORT)
         return c
 
     servers = cfg.get("mcpServers", {}) or {}
     entry = servers.get(SERVER_KEY)
 
     legacy_found = [k for k in LEGACY_KEYS if k in servers]
+    # 목록을 파이썬 표기(['dart-mcp'])로 찍지 않는다 — Manager 화면에서 대괄호는 버튼 이름으로 읽힌다.
+    legacy_text = ", ".join(legacy_found)
     if legacy_found:
         c.warn(
-            f"Legacy entries present: {legacy_found}",
-            fix="dartlens-setup (auto-removes)",
+            f"Legacy entries present: {legacy_text}",
+            fix=_ACTION_MCP_REGISTER,  # 등록하면서 옛 이름 항목을 지운다
         )
 
     if not entry:
@@ -262,12 +279,9 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
         if required or legacy_found:
             msg = (
                 f"'{SERVER_KEY}' entry missing in mcpServers"
-                + (f" (legacy {legacy_found} present)" if legacy_found else "")
+                + (f" (legacy {legacy_text} present)" if legacy_found else "")
             )
-            c.fail(
-                msg,
-                fix=f"dartlens-setup --target {label_to_target(label)}",
-            )
+            c.fail(msg, fix=_ACTION_MCP_REGISTER)
         else:
             c.info(f"'{SERVER_KEY}' entry not present (target not in use — OK)")
             c.status = "info-skip"
@@ -288,7 +302,7 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
         if Path(cmd).exists():
             c.ok("Command points to existing file")
         else:
-            c.fail(f"Command file missing: {cmd}", fix="dartlens-setup")
+            c.fail(f"Command file missing: {cmd}", fix=_ACTION_MCP_REGISTER)
     else:
         resolved = shutil.which(cmd)
         if resolved:
@@ -296,14 +310,10 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
         else:
             c.fail(
                 f"Command '{cmd}' not in PATH — client will fail to launch the server",
-                fix="dartlens-setup",
+                fix=_ACTION_MCP_REGISTER,
             )
 
     return c
-
-
-def label_to_target(label: str) -> str:
-    return "claude-code" if "Code" in label else "claude-desktop"
 
 
 def check_config_desktop() -> Check:
@@ -334,7 +344,7 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
 
     if not config_path.exists():
         if required:
-            c.fail("Config file does not exist", fix="dartlens-setup --target codex")
+            c.fail("Config file does not exist", fix=_ACTION_MCP_REGISTER)
         else:
             c.info("Config file does not exist (target not in use — OK)")
             c.status = "info-skip"
@@ -347,7 +357,7 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = tomlkit.parse(f.read())
     except Exception as e:
-        c.fail(f"Cannot read config: {e}")
+        c.fail(f"Cannot read config: {e}", fix=_ACTION_SUPPORT)
         return c
 
     servers = cfg.get("mcp_servers", {}) or {}
@@ -355,7 +365,7 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
 
     if not entry:
         if required:
-            c.fail(f"'{SERVER_KEY}' entry missing in mcp_servers", fix="dartlens-setup --target codex")
+            c.fail(f"'{SERVER_KEY}' entry missing in mcp_servers", fix=_ACTION_MCP_REGISTER)
         else:
             c.info(f"'{SERVER_KEY}' entry not present (target not in use — OK)")
             c.status = "info-skip"
@@ -376,7 +386,7 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
         if Path(cmd).exists():
             c.ok("Command points to existing file")
         else:
-            c.fail(f"Command file missing: {cmd}", fix="dartlens-setup --target codex")
+            c.fail(f"Command file missing: {cmd}", fix=_ACTION_MCP_REGISTER)
     else:
         resolved = shutil.which(cmd)
         if resolved:
@@ -384,7 +394,7 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
         else:
             c.fail(
                 f"Command '{cmd}' not in PATH — client will fail to launch the server",
-                fix="dartlens-setup --target codex",
+                fix=_ACTION_MCP_REGISTER,
             )
 
     return c
@@ -400,10 +410,7 @@ def check_at_least_one_config(*configs: Check) -> Check:
     if registered:
         c.ok(f"{len(registered)} target(s) configured")
         return c
-    c.fail(
-        "dartlens not registered in any MCP client (Claude Desktop / Code / Codex)",
-        fix="dartlens-setup --target {claude-desktop|claude-code|both|codex}",
-    )
+    c.fail(f"{_LENS}가 아직 AI 앱에 등록되지 않았어요.", fix=_ACTION_MCP_REGISTER)
     return c
 
 
@@ -433,6 +440,8 @@ _CHECK_IDS = {
     "dart_api": "DART_API_KEY",
     "license": "LICENSE_ACTIVE",
     "corp_code_cache": "CORP_CODE_CACHE",
+    # 세 Lens 공통 ID — Manager 라벨 표가 이 글자 그대로 찾는다.
+    "recent_tool_failures": "RECENT_TOOL_FAILURES",
 }
 
 
@@ -463,14 +472,15 @@ def _dart_api_check_from_diag(diag: "diagnostics.DartApiDiagnosis") -> Check:
         c.info(f"Storage:    {diag.storage}")
     if diag.key_tail_masked:
         c.info(f"Tail:       {diag.key_tail_masked}")
+    if diag.detail:
+        c.info(diag.detail)
+    action = diagnostics.dart_api_action(diag)
     if diag.status == "valid":
-        c.ok(diag.message or "DART API 키가 등록되어 있습니다.")
+        c.ok(diag.message or "DART 인증키가 등록돼 있어요.")
     elif diag.status in ("rate_limited", "network_unreachable"):
-        c.warn(diag.message, fix="잠시 후 다시 시도하세요 (일시적 문제 — 키 설정 문제 아님)")
-    elif diag.status == "storage_failed":
-        c.fail(diag.message, fix="dartlens-setup --plaintext <YOUR_DART_API_KEY>")
-    else:  # missing, invalid
-        c.fail(diag.message, fix="dartlens-setup <YOUR_DART_API_KEY>")
+        c.warn(diag.message, fix=action)
+    else:  # missing, invalid, storage_failed
+        c.fail(diag.message, fix=action)
     return c
 
 
@@ -478,11 +488,41 @@ def _license_check_from_diag(diag: "diagnostics.LicenseDiagnosis") -> Check:
     c = Check("DartLens License")
     if diag.license_id_masked:
         c.info(f"License ID: {diag.license_id_masked}")
+    if diag.detail:
+        c.info(diag.detail)
     if diag.status == "active":
-        c.ok(diag.message or "라이선스가 활성화되어 있습니다.")
+        c.ok(diag.message or "라이선스가 활성화돼 있어요.")
     else:
-        c.fail(diag.message, fix="dartlens-activate <라이선스-키>")
+        c.fail(diag.message, fix=diagnostics.license_action(diag))
     return c
+
+
+def _recent_failures_check_from_diag(diag: "diagnostics.RecentFailuresDiagnosis") -> Check:
+    c = Check("Recent Tool Failures")
+    for line in diag.lines:
+        c.info(line)
+    if diag.status == "warn":
+        c.warn(diag.summary, fix=diag.action)
+    elif diag.status == "info-skip":
+        c.info(diag.summary)
+        c.status = "info-skip"
+        c.summary = diag.summary
+    else:
+        c.ok(diag.summary)
+    return c
+
+
+def _diagnose_recent_failures() -> "diagnostics.RecentFailuresDiagnosis":
+    """기록 읽기가 어떤 이유로 실패해도 진단 전체를 죽이지 않는다 — 이 검사는 보조다."""
+    try:
+        records = _metrics.load_recent_metrics(diagnostics.RECENT_FAILURE_WINDOW_HOURS)
+        return diagnostics.diagnose_recent_tool_failures(records)
+    except Exception as e:
+        return diagnostics.RecentFailuresDiagnosis(
+            status="info-skip",
+            summary="최근 조회 기록을 읽지 못했어요.",
+            lines=[f"{type(e).__name__}: {e}"],
+        )
 
 
 def check_dart_api_key() -> Check:
@@ -507,11 +547,10 @@ def _corp_cache_check_from_diag(diag: dict) -> Check:
         # 다만 "정상입니다"에서 끝내면 안 된다 — 실사용에서 확인된 문제(2026-08-13,
         # 뉴질랜드 문의): 다운로드가 몇 시간째 실패해 회사 조회가 전부 죽은 PC에서도
         # 이 줄이 [ OK ] 로 떴다. 갓 설치한 것과 계속 실패하는 것을 이 문구로는
-        # 구분할 수 없으니, 직접 받아보는 방법을 같이 준다. 그러면 실패한 사람은
-        # 그 명령에서 실제 오류를 보게 된다.
-        c.ok("기업코드 캐시가 아직 없습니다 — 첫 조회 때 자동으로 받습니다(갓 설치했다면 정상)")
-        c.info("회사 조회가 계속 안 되면 아래로 직접 받아보세요 — 실패하면 원인이 표시됩니다")
-        c.fix = "dartlens-doctor --repair corp-code-cache --yes"
+        # 구분할 수 없으니, 직접 받아보는 방법([복구])을 같이 준다. 최근 조회 실패는
+        # RECENT_TOOL_FAILURES 가 호출 기록으로 따로 잡는다.
+        c.ok("기업코드 목록을 아직 받지 않았어요. 첫 조회 때 자동으로 받아요(갓 설치했다면 정상이에요).")
+        c.fix = f"회사 조회가 계속 안 되면 {_ACTION_REPAIR}"
         return c
 
     c.info(f"Last updated: {diag['last_updated']}")
@@ -519,7 +558,7 @@ def _corp_cache_check_from_diag(diag: dict) -> Check:
         c.info(f"Entries:      {diag['entry_count']:,}")
 
     if not diag["parseable"]:
-        c.fail("캐시 파일이 손상되어 파싱할 수 없습니다", fix="dartlens-doctor --repair corp-code-cache --yes")
+        c.fail("기업코드 목록 파일이 망가져서 읽을 수 없어요.", fix=_ACTION_REPAIR)
         return c
 
     if not diag["entry_count"]:
@@ -527,20 +566,20 @@ def _corp_cache_check_from_diag(diag: dict) -> Check:
         # 모양이다. 예전엔 이 상태가 "최신 상태입니다"로 통과했다. 회사 조회는
         # 전부 실패하는데 진단은 정상이라 원인을 찾을 수가 없다.
         c.fail(
-            "캐시에 기업이 한 곳도 없습니다 — 내려받다 실패한 응답이 남은 것으로 보입니다",
-            fix="dartlens-doctor --repair corp-code-cache --yes",
+            "기업코드 목록이 비어 있어요. 내려받다 실패한 응답이 남은 것으로 보여요.",
+            fix=_ACTION_REPAIR,
         )
         return c
 
     if not diag["writable"]:
-        c.fail("캐시 디렉토리에 쓰기 권한이 없어 갱신할 수 없습니다", fix="캐시 디렉토리 권한을 확인하세요")
+        c.fail("캐시 폴더에 쓸 수 없어요.", fix=_ACTION_SUPPORT)
         return c
 
     if not diag["is_fresh"]:
-        c.warn("캐시가 오래되었습니다 (TTL 7일 초과)", fix="dartlens-doctor --repair corp-code-cache --yes")
+        c.warn("기업코드 목록이 오래됐어요(7일 넘음).", fix=_ACTION_REPAIR)
         return c
 
-    c.ok("corp code 캐시가 최신 상태입니다")
+    c.ok("기업코드 목록이 최신이에요.")
     return c
 
 
@@ -606,6 +645,7 @@ def run_diagnostics(*, online: bool = False) -> dict:
         latest_version = None
     license_diag = diagnostics.diagnose_license()
     corp_cache_diag = _corp_code.cache_diagnosis()
+    recent_failures_diag = _diagnose_recent_failures()
 
     checks: dict[str, Check] = {
         "uv": check_uv(),
@@ -618,12 +658,14 @@ def run_diagnostics(*, online: bool = False) -> dict:
         "dart_api": _dart_api_check_from_diag(dart_diag),
         "license": _license_check_from_diag(license_diag),
         "corp_code_cache": _corp_cache_check_from_diag(corp_cache_diag),
+        "recent_tool_failures": _recent_failures_check_from_diag(recent_failures_diag),
     }
     return {
         "checks": checks,
         "dart_diag": dart_diag,
         "license_diag": license_diag,
         "corp_cache_diag": corp_cache_diag,
+        "recent_failures_diag": recent_failures_diag,
         "targets": _registered_targets(desktop_check, code_check, codex_check),
         "latest_version": latest_version,
     }
@@ -659,6 +701,14 @@ def build_report(state: dict, *, online: bool) -> dict:
                     repair_id="corp-code-cache" if corp_cache_repairable else None,
                 )
             )
+        elif key == "recent_tool_failures":
+            # 지난 실패 기록 하나로 카드가 "사용 불가"가 되면 안 된다 — critical=False.
+            item = c.to_contract_dict(_CHECK_IDS[key])
+            item["critical"] = False
+            recent = state.get("recent_failures_diag")
+            if recent is not None and recent.error_code:
+                item["error_code"] = recent.error_code
+            checks_list.append(item)
         else:
             checks_list.append(c.to_contract_dict(_CHECK_IDS[key]))
 

@@ -192,13 +192,16 @@ class ActivateCliTests(unittest.TestCase):
         result = json.loads(out)
         self.assertFalse(result["license_activated"])
         self.assertEqual(result["error_code"], "DARTLENS_LICENSE_INVALID")
-        self.assertIn("DART API 키", result["message"])
+        # Manager [활성화] 창에 뜨는 문구 — 칸을 바꿔 넣으라는 안내, 터미널 명령 없음.
+        self.assertIn("DART 인증키", result["message"])
+        self.assertIn("라이선스 키 칸", result["message"])
+        self.assertNotIn("dartlens-", result["message"])
         self.assertEqual(code, 1)
         self.assertNotIn(key, out)
 
     def test_dart_api_key_in_license_field_human_output_shows_cross_hint(self):
         code, out = self._run_cli(["a" * 40])
-        self.assertIn("DART API 키", out)
+        self.assertIn("DART 인증키", out)
         self.assertEqual(code, 1)
 
     def test_stdin_mode_reads_key_without_touching_argv(self):

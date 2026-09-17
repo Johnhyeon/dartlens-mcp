@@ -14,10 +14,13 @@ DART 라이트 엔드포인트 호출(`check_dart_key_online`)도 여기서 소�
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 
+from dartlens import _error_class
 from dartlens import _keyring as keyring_helper
 from dartlens import licensing
 from dartlens._cache import cached
@@ -43,6 +46,70 @@ SCHEMA_VERSION = 1
 PRODUCT = "dartlens"
 PACKAGE_NAME = "dartlens-mcp"
 
+LENS = "DartLens"
+
+
+# ---------------------------------------------------------------------------
+# 고객 문구 — 어디에 보이느냐에 따라 앞말만 다르다
+#
+# 같은 진단 결과가 두 곳에 나간다: Manager 진단 화면(doctor --json 의 summary/action)과
+# Claude 답변 안(dartlens_status). 할 일은 같고 가리키는 말만 다르다 — Manager 안에서는
+# "DartLens 카드의 [활성화]"로 충분하지만, Claude 답변에서는 어느 프로그램의 카드인지부터
+# 말해야 한다. 문구를 두 벌로 따로 쓰면 한쪽만 고쳐지는 일이 생기므로, Manager 문구를
+# 기준으로 두고 답변용은 여기서 바꿔 만든다. 터미널 명령은 어느 쪽에도 쓰지 않는다 —
+# 주 고객층은 터미널에서 막힌다(Manager 한 길 원칙).
+# ---------------------------------------------------------------------------
+
+
+def answer_copy(text: str | None) -> str | None:
+    """Manager 화면 문구를 Claude 답변 안에서 읽히는 앞말로 바꾼다."""
+    if not text:
+        return text
+    out = text.replace(f"{LENS} 카드의 [활성화]에서", f"LeetKit Manager의 {LENS} 카드에서 [활성화]를 눌러")
+    out = out.replace(f"{LENS} 카드의 [", f"LeetKit Manager의 {LENS} 카드에서 [")
+    out = out.replace("상단 [", "LeetKit Manager 상단 [")
+    # [진단]은 Manager 안에서만 누를 수 있다. 답변을 읽는 사람에게는 Claude에게 다시
+    # 묻는 것이 같은 확인이다.
+    out = out.replace("[진단]을 다시 눌러주세요", "다시 물어봐 주세요")
+    return out
+
+
+# 진단 details.lines 는 Manager 상세 창에 그대로 뜬다. 그래서 한 줄을 "한국어 상황"으로
+# 시작하고, 지원할 때 필요한 원문은 줄 끝 괄호 안에 짧게만 붙인다. 원문에서 주소·경로·
+# 쿼리스트링·키처럼 생긴 것은 지운다 — 고객 화면이고, [결과 복사]로 밖에도 나간다.
+_CATEGORY_LABEL = {
+    "tls": "보안 인증서 확인 실패",
+    "timeout": "연결 시간 초과",
+    "dns": "인터넷 주소 찾기 실패",
+    "connect": "서버 연결 실패",
+    "blocked": "요청 차단",
+    "auth": "인증 거부",
+    "schema": "응답 형식 이상",
+    "other": "기타 오류",
+}
+_DETAIL_RAW_MAX = 80
+_URL_RE = re.compile(r"https?://\S+|\?\S*")
+_PATH_RE = re.compile(r"[A-Za-z]:\\\S*|(?<![\w.])/(?:[\w.-]+/)+[\w.-]*")
+# 키처럼 생긴 긴 덩어리(DART 인증키 40자리 hex, 라이선스 키 base32). 예외 문구의
+# 쿼리스트링은 _error_detail 이 이미 지우지만, 키가 경로나 본문에 섞여 올 수도 있다.
+_SECRET_CHUNK_RE = re.compile(
+    r"\b[0-9A-Fa-f]{32,}\b|\b[A-Z2-7]{24,}\b|\b[A-Z2-7]{4,}(?:-[A-Z2-7]{2,}){3,}\b"
+)
+
+
+def _detail_line(korean: str, raw: str | None = None) -> str:
+    """상세 창 한 줄. 원문은 걸러서 80자 안으로 괄호에 붙인다(없거나 다 지워지면 생략)."""
+    text = " ".join(str(raw or "").split())
+    text = _URL_RE.sub("", text)
+    text = _PATH_RE.sub("", text)
+    text = _SECRET_CHUNK_RE.sub("***", text)
+    text = " ".join(text.split()).strip(" :'\"")
+    if not text:
+        return korean
+    if len(text) > _DETAIL_RAW_MAX:
+        text = text[: _DETAIL_RAW_MAX - 1] + "…"
+    return f"{korean} ({text})"
+
 
 def _version_gt(latest: str, current: str) -> bool:
     """semver 비교. 실패 시 단순 문자열 비교 fallback."""
@@ -66,6 +133,11 @@ class DartApiDiagnosis:
     key_tail_masked: str | None = None
     error_code: str | None = None
     message: str = ""
+    # 아래 둘은 to_dict()에 안 나간다(JSON 계약 그대로). category 는 _error_class 분류로
+    # 할 일 문구를 고르는 데 쓰고, detail 은 doctor 의 details.lines 한 줄이 된다 —
+    # Manager 상세 창에 그대로 보이므로 _detail_line 형식(한국어 먼저, 원문은 괄호)을 쓴다.
+    category: str | None = None
+    detail: str | None = None
 
     def to_dict(self) -> dict:
         d: dict = {"status": self.status}
@@ -91,6 +163,8 @@ class LicenseDiagnosis:
     message: str = ""
     # 기간이 있는 키(체험판·구독)만 채워진다.
     expires_on: str | None = None
+    # doctor details.lines 한 줄(Manager 상세 창에 보인다). to_dict()에는 안 나간다.
+    detail: str | None = None
 
     def to_dict(self) -> dict:
         d: dict = {"status": self.status}
@@ -140,18 +214,19 @@ def diagnose_dart_api_key(*, config_plaintext_key: str | None = None) -> DartApi
     if not key:
         ok, reason = keyring_helper.backend_status()
         if not ok:
+            # 사유 원문 뒷부분에는 헤드리스 환경용 터미널 안내(`--plaintext`)가 붙어 있다.
+            # Manager 고객이 할 수 있는 일이 아니라서 첫 문장만 상세 줄에 남긴다.
+            first_sentence = str(reason).split("\n")[0].split(". ")[0]
             return DartApiDiagnosis(
                 status="storage_failed",
                 error_code=DART_API_KEY_STORAGE_FAILED,
-                message=f"OS 키체인을 사용할 수 없어 키를 읽거나 저장할 수 없습니다 — {reason}",
+                message="이 컴퓨터의 키 저장소를 쓸 수 없어서 DART 인증키를 읽지 못했어요.",
+                detail=_detail_line("키 저장소: 사용할 수 없음", first_sentence),
             )
         return DartApiDiagnosis(
             status="missing",
             error_code=DART_API_KEY_MISSING,
-            message=(
-                "DART API 키가 없습니다. `dartlens-setup` 으로 등록하세요. "
-                "(키가 없다면 https://opendart.fss.or.kr 에서 무료 발급)"
-            ),
+            message="DART 인증키가 아직 없어요.",
         )
 
     if licensing.looks_like_license_shape(key):
@@ -160,10 +235,30 @@ def diagnose_dart_api_key(*, config_plaintext_key: str | None = None) -> DartApi
             storage=storage,
             key_tail_masked=licensing.mask_tail(key),
             error_code=DART_API_KEY_INVALID,
-            message=licensing.CROSS_HINT_LICENSE_IN_API_KEY_FIELD,
+            message="DART 인증키 자리에 라이선스 키가 들어가 있어요.",
+            category="auth",
         )
 
     return DartApiDiagnosis(status="valid", storage=storage, key_tail_masked=licensing.mask_tail(key))
+
+
+def dart_api_action(diag: DartApiDiagnosis, *, in_answer: bool = False) -> str | None:
+    """DART 인증키 진단의 할 일 한 줄(Manager 화면 기준, in_answer=True 면 Claude 답변용)."""
+    if diag.status == "valid":
+        return None
+    if diag.status == "missing":
+        action = f"{LENS} 카드의 [활성화]를 눌러 DART 인증키를 넣어주세요."
+    elif diag.status == "storage_failed":
+        action = "상단 [지원 문의]를 눌러주세요."
+    elif diag.status == "invalid" and diag.category == "blocked":
+        # 012(IP 차단). 인증키를 다시 넣게 하면 멀쩡한 키를 재발급받느라 시간만 쓴다.
+        action = "인증키를 다시 넣지 말고 상단 [지원 문의]를 눌러주세요."
+    elif diag.category:
+        action = _error_class.action_for(diag.category, LENS)
+    else:
+        # DART 서비스 점검(800/900) — 인증키도 연결도 아닌, 기다리면 풀리는 일이다.
+        action = "잠시 뒤 [진단]을 다시 눌러주세요. 그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    return answer_copy(action) if in_answer else action
 
 
 # DART company.json — 삼성전자(00126380)는 항상 존재하는 안정적 corp_code라
@@ -218,30 +313,33 @@ async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = Non
 
     try:
         code, data = await check_dart_key_online(key)
-    except httpx.TimeoutException:
+    except (httpx.HTTPError, OSError) as e:
+        # 예전엔 타임아웃·ConnectError·나머지 셋으로만 갈랐다. 그러면 백신이 TLS를
+        # 가로챈 PC(2026-08-13 문의)와 인터넷이 끊긴 PC가 같은 "연결할 수 없습니다"를
+        # 받는다 — 할 일이 전혀 다른데. 세 Lens 공통 분류로 원인을 나눈다.
+        # OSError 도 받는 이유: httpx 를 안 거친 ssl/소켓 오류가 새면 doctor 전체가 죽는다.
+        category = _error_class.classify_exception(e)
+        if category == "timeout":
+            message = "DART 응답이 늦어서 인증키를 확인하지 못했어요."
+        elif category == "blocked":
+            message = "DART가 요청을 막아서 인증키를 확인하지 못했어요."
+        else:
+            message = "DART에 연결하지 못해서 인증키를 확인하지 못했어요."
         return DartApiDiagnosis(
             status="network_unreachable",
             storage=storage,
             key_tail_masked=base.key_tail_masked,
             error_code=DART_NETWORK_UNREACHABLE,
-            message="DART 서버 응답이 지연되고 있습니다 (타임아웃). 키 자체는 문제가 아닐 수 있습니다.",
+            message=message,
+            category=category,
+            detail=_detail_line(
+                f"DART 연결: 실패 ({_CATEGORY_LABEL.get(category, '기타 오류')})",
+                f"{type(e).__name__}: {e}",
+            ),
         )
-    except httpx.ConnectError:
-        return DartApiDiagnosis(
-            status="network_unreachable",
-            storage=storage,
-            key_tail_masked=base.key_tail_masked,
-            error_code=DART_NETWORK_UNREACHABLE,
-            message="DART 서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.",
-        )
-    except httpx.HTTPError as e:
-        return DartApiDiagnosis(
-            status="network_unreachable",
-            storage=storage,
-            key_tail_masked=base.key_tail_masked,
-            error_code=DART_NETWORK_UNREACHABLE,
-            message=f"네트워크 오류: {type(e).__name__}",
-        )
+
+    dart_message = str(data.get("message") or "").strip().rstrip(".")
+    reply = f"응답 {code}: {dart_message}" if dart_message else f"응답 {code}"
 
     if code in SUCCESS_CODES:
         return DartApiDiagnosis(status="valid", storage=storage, key_tail_masked=base.key_tail_masked)
@@ -252,7 +350,9 @@ async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = Non
             storage=storage,
             key_tail_masked=base.key_tail_masked,
             error_code=DART_API_RATE_LIMITED,
-            message=f"DART 요청 제한에 도달했습니다 (응답 {code}). 키는 정상일 수 있습니다 — 잠시 후 다시 시도하세요.",
+            message=f"DART 요청 한도에 걸렸어요({reply}). 인증키는 정상일 수 있어요.",
+            category="blocked",
+            detail=_detail_line("DART 연결: 요청 한도 초과", reply),
         )
 
     if code in SERVICE_ISSUE_CODES:
@@ -261,31 +361,38 @@ async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = Non
             storage=storage,
             key_tail_masked=base.key_tail_masked,
             error_code=DART_NETWORK_UNREACHABLE,
-            message=f"DART 서비스 자체 문제로 보입니다 (응답 {code}: {data.get('message', '')}). 키 문제가 아닙니다.",
+            message=f"DART 서비스 점검이나 일시 장애로 보여요({reply}). 인증키 문제는 아니에요.",
+            detail=_detail_line("DART 연결: 서비스 점검·장애", reply),
         )
 
     if code in IP_BLOCKED_CODES:
         # 키 값이 틀린 게 아니라 이 PC의 IP가 막힌 것이다. "키를 거부했다"로 적으면
         # 멀쩡한 키를 다시 발급·등록하게 된다. status·error_code 는 LeetKit Manager
         # 계약이라 그대로 두고 문구만 원인대로 적는다.
+        if not dart_message:
+            reply = f"응답 {code}: 접근할 수 없는 IP입니다"
         return DartApiDiagnosis(
             status="invalid",
             storage=storage,
             key_tail_masked=base.key_tail_masked,
             error_code=DART_API_KEY_INVALID,
-            message=(
-                f"DART가 이 PC의 IP 접속을 막았습니다 (응답 {code}: "
-                f"{data.get('message', '접근할 수 없는 IP입니다')}). 키 값이 틀렸다는 뜻은 "
-                "아닙니다 - 키를 다시 등록하지 말고 LeetKit Manager의 [지원 문의]로 알려주세요."
-            ),
+            message=f"DART가 이 컴퓨터의 IP 접속을 막았어요({reply}). 인증키가 틀렸다는 뜻은 아니에요.",
+            category="blocked",
+            detail=_detail_line("DART 연결: IP 접속 차단", reply),
         )
 
+    # 901(개인정보 보유기간 만료) 같은 계정 문제도 여기로 온다. DART 원문을 그대로 실어야
+    # 고객이 무엇을 풀어야 하는지 안다.
+    if not dart_message:
+        reply = f"응답 {code}: 알 수 없는 오류"
     return DartApiDiagnosis(
         status="invalid",
         storage=storage,
         key_tail_masked=base.key_tail_masked,
         error_code=DART_API_KEY_INVALID,
-        message=f"DART가 키를 거부했습니다 (응답 {code}: {data.get('message', '알 수 없는 오류')}).",
+        message=f"DART가 인증키를 거부했어요({reply}).",
+        category="auth",
+        detail=_detail_line("DART 연결: 인증키 거부", reply),
     )
 
 
@@ -294,12 +401,42 @@ async def diagnose_dart_api_key_online(*, config_plaintext_key: str | None = Non
 # ---------------------------------------------------------------------------
 
 
-# 셋 다 "키를 다시 넣으세요"가 답이 아니다 — 할 일이 서로 다르다.
-_LICENSE_BLOCKED_MESSAGE = {
-    "expired": "DartLens 사용 기간이 끝났습니다. 계속 쓰시려면 라이선스를 구매해주세요.",
-    "revoked": "이 라이선스 키는 현재 사용이 중지되어 있습니다. 착오라면 문의해주세요.",
-    "clock": "이 컴퓨터의 날짜가 실제보다 과거로 설정되어 있습니다. 날짜를 맞춘 뒤 다시 시도해주세요.",
+# 상태마다 할 일이 서로 다르다 — 셋 다 "키를 다시 넣으세요"가 답이 아니다.
+# 문구는 세 Lens 공통 사양(2-2)과 글자까지 맞춘다. 앞은 상황(summary), 뒤는 할 일(action).
+_LICENSE_SUMMARY = {
+    "missing": "라이선스 키가 아직 없어요.",
+    "invalid": "저장된 라이선스 키를 확인할 수 없어요.",
+    "expired": "사용 기간이 끝났어요.",
+    "revoked": "이 라이선스 키는 사용이 중지돼 있어요.",
+    "clock": "이 컴퓨터의 날짜가 실제보다 과거로 되어 있어요.",
 }
+
+_LICENSE_ACTION = {
+    "missing": f"{LENS} 카드의 [활성화]를 눌러 메일로 받은 키를 넣어주세요.",
+    "invalid": f"{LENS} 카드의 [활성화]를 눌러 메일로 받은 키를 다시 넣어주세요.",
+    "expired": f"{LENS} 카드의 [구매]를 누르고, 받은 키를 [활성화]로 넣어주세요.",
+    "revoked": "착오라면 상단 [지원 문의]를 눌러주세요.",
+    "clock": "날짜와 시간을 오늘로 맞춘 뒤 [진단]을 다시 눌러주세요.",
+}
+
+# 라이선스 칸에 DART 인증키를 넣은 경우. 흔한 실수라 "확인할 수 없어요"만으로는
+# 무엇을 바꿔 넣어야 하는지 모른다.
+_LICENSE_HOLDS_API_KEY = "라이선스 키 자리에 DART 인증키가 들어가 있어요."
+
+# 상세 창에 보이는 검증 실패 사유. "서명 불일치(위조/변조)" 원문은 정상 구매자에게
+# 의심받는다는 인상을 준다 — 대부분은 복사 실수다.
+_LICENSE_REASON_LABEL = {
+    licensing._REASON_MALFORMED: "키 모양이 달라요",
+    licensing._REASON_WRONG_PRODUCT: "DartLens 키가 아니에요",
+    licensing._REASON_BAD_SIGNATURE: "키 내용이 맞지 않아요",
+    licensing._REASON_PUBKEY: "확인 설정 오류",
+}
+
+
+def license_action(diag: LicenseDiagnosis, *, in_answer: bool = False) -> str | None:
+    """라이선스 진단의 할 일 한 줄(Manager 화면 기준, in_answer=True 면 Claude 답변용)."""
+    action = _LICENSE_ACTION.get(diag.status)
+    return answer_copy(action) if in_answer else action
 
 
 def diagnose_license() -> LicenseDiagnosis:
@@ -308,10 +445,7 @@ def diagnose_license() -> LicenseDiagnosis:
         return LicenseDiagnosis(
             status="missing",
             error_code=DARTLENS_LICENSE_MISSING,
-            message=(
-                "DartLens 라이선스 키가 없습니다. 구매 후 이메일로 받은 라이선스 키로 "
-                "`dartlens-activate <라이선스-키>` 를 실행하세요."
-            ),
+            message=_LICENSE_SUMMARY["missing"],
         )
 
     res = licensing.verify_key(key)
@@ -326,7 +460,7 @@ def diagnose_license() -> LicenseDiagnosis:
                 status=reason,
                 license_id_masked=masked,
                 error_code=DARTLENS_LICENSE_INVALID,
-                message=_LICENSE_BLOCKED_MESSAGE[reason],
+                message=_LICENSE_SUMMARY[reason],
                 expires_on=expiry.isoformat() if expiry else None,
             )
         return LicenseDiagnosis(
@@ -335,10 +469,139 @@ def diagnose_license() -> LicenseDiagnosis:
             expires_on=expiry.isoformat() if expiry else None,
         )
 
-    message = f"라이선스 키가 유효하지 않습니다 — {res['reason']}."
+    message = _LICENSE_SUMMARY["invalid"]
     if licensing.looks_like_dart_api_key(key):
-        message += " " + licensing.CROSS_HINT_API_KEY_IN_LICENSE_FIELD
-    return LicenseDiagnosis(status="invalid", error_code=DARTLENS_LICENSE_INVALID, message=message)
+        message += " " + _LICENSE_HOLDS_API_KEY
+    return LicenseDiagnosis(
+        status="invalid",
+        error_code=DARTLENS_LICENSE_INVALID,
+        message=message,
+        detail=_detail_line(
+            "라이선스 키 확인: 실패",
+            _LICENSE_REASON_LABEL.get(res.get("reason"), res.get("reason")),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 최근 조회 실패 (RECENT_TOOL_FAILURES) — metrics 기록만 읽는다, 네트워크 없음
+#
+# 온라인 진단은 "지금 연결되나"만 본다. 고객이 겪은 실패는 이미 도구 호출 기록에
+# 남아 있는데, 진단이 그걸 안 읽으면 카드는 "정상"인데 Claude는 계속 실패하는 반대말
+# 상태가 된다(지원 번들 요약이 같은 이유로 고쳐졌다).
+#
+# 한계: 도구가 예외 없이 "⚠️ …" 문자열을 돌려준 실패는 기록에 error 로 안 남아 못 본다.
+# ---------------------------------------------------------------------------
+
+RECENT_FAILURE_WINDOW_HOURS = 48
+_RECENT_LINES_MAX = 8
+_RECENT_DETAIL_PREVIEW = 120
+
+
+@dataclass
+class RecentFailuresDiagnosis:
+    status: str  # ok | warn (기록을 못 읽으면 doctor 가 info-skip 으로 만든다)
+    summary: str
+    action: str | None = None
+    error_code: str | None = None
+    lines: list = field(default_factory=list)
+
+
+def _mask_secrets(text: str) -> str:
+    return _SECRET_CHUNK_RE.sub("***", text)
+
+
+def _hhmm(timestamp) -> str:
+    try:
+        return datetime.fromisoformat(str(timestamp)).strftime("%H:%M")
+    except Exception:
+        return "?"
+
+
+def diagnose_recent_tool_failures(records: list) -> RecentFailuresDiagnosis:
+    """최근 호출 기록(시간순)으로 '아직 풀리지 않은 실패'가 있는지 본다.
+
+    같은 도구가 실패 뒤에 성공했으면 풀린 것으로 본다 — 한 번 삐끗한 기록 때문에
+    이틀 내내 카드가 '주의'로 남으면 진단을 믿지 않게 된다. AI 앱이 취소한 호출
+    (CancelledError)은 DartLens 고장이 아니라서 실패로 세지 않고, 앞선 상태도 바꾸지
+    않는다.
+    """
+    records = [row for row in records if isinstance(row, dict)]
+    total = len(records)
+    if not total:
+        return RecentFailuresDiagnosis(
+            status="ok", summary=f"최근 이틀 동안 AI 앱이 {LENS}를 쓴 기록이 없어요."
+        )
+
+    per_tool: dict = {}
+    failure_count = 0
+    for row in records:
+        tool = str(row.get("tool") or "unknown")
+        info = per_tool.setdefault(tool, {"failed": [], "cancelled": [], "last_failed": False})
+        error_type = row.get("error")
+        if not error_type:
+            info["last_failed"] = False
+            continue
+        category = _error_class.classify_error(str(error_type), row.get("error_detail"))
+        if category == "cancelled":
+            info["cancelled"].append(row)
+            continue
+        failure_count += 1
+        info["failed"].append((row, category))
+        info["last_failed"] = True
+
+    def _line(tool: str, count_text: str, row: dict, category: str) -> str:
+        detail = _mask_secrets(str(row.get("error_detail") or ""))[:_RECENT_DETAIL_PREVIEW]
+        error_text = f"{row.get('error')}: {detail}" if detail else str(row.get("error"))
+        return f"{tool}: {count_text}, 마지막 {_hhmm(row.get('timestamp'))}, 분류 {category}, {error_text}"
+
+    def _failed_line(tool: str, info: dict) -> str:
+        row, category = info["failed"][-1]
+        return _line(tool, f"실패 {len(info['failed'])}번", row, category)
+
+    def _cancelled_line(tool: str, info: dict) -> str:
+        return _line(tool, f"취소 {len(info['cancelled'])}번(실패로 안 셈)", info["cancelled"][-1], "cancelled")
+
+    def _last_failed_at(item) -> str:
+        return str(item[1]["failed"][-1][0].get("timestamp") or "")
+
+    outstanding = sorted(
+        ((t, i) for t, i in per_tool.items() if i["last_failed"]), key=_last_failed_at, reverse=True
+    )
+    resolved = sorted(
+        ((t, i) for t, i in per_tool.items() if i["failed"] and not i["last_failed"]),
+        key=_last_failed_at,
+        reverse=True,
+    )
+    lines = [_failed_line(t, i) for t, i in outstanding + resolved]
+    lines += [_cancelled_line(t, i) for t, i in per_tool.items() if i["cancelled"]]
+    lines = lines[:_RECENT_LINES_MAX]
+
+    if failure_count == 0:
+        return RecentFailuresDiagnosis(
+            status="ok", summary=f"최근 이틀 동안 조회 {total}번이 모두 정상이었어요.", lines=lines
+        )
+    if not outstanding:
+        return RecentFailuresDiagnosis(
+            status="ok",
+            summary=f"최근 이틀 동안 조회 {total}번 중 {failure_count}번이 실패했지만, 그 뒤에는 정상이었어요.",
+            lines=lines,
+        )
+
+    # 대표 분류: 남아 있는 실패에서 가장 많은 것, 같으면 더 최근 것.
+    tally: dict = {}
+    for _tool, info in outstanding:
+        row, category = info["failed"][-1]
+        count, latest = tally.get(category, (0, ""))
+        tally[category] = (count + 1, max(latest, str(row.get("timestamp") or "")))
+    main_category = max(tally, key=lambda c: tally[c])
+    return RecentFailuresDiagnosis(
+        status="warn",
+        summary=f"최근 조회 중 아직 실패로 남아 있는 것이 {len(outstanding)}가지 있어요.",
+        action=_error_class.action_for(main_category, LENS),
+        error_code=f"RECENT_TOOL_FAILURES_{main_category.upper()}",
+        lines=lines,
+    )
 
 
 # ---------------------------------------------------------------------------

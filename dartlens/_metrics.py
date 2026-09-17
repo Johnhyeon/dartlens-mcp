@@ -58,6 +58,55 @@ def get_metrics_file() -> Path:
     return get_metrics_dir() / f"metrics_{datetime.now():%Y%m%d}.jsonl"
 
 
+def _metrics_dir_readonly() -> Path:
+    """get_metrics_dir() 와 같은 자리를 가리키되 폴더를 만들지 않는다.
+
+    진단은 읽기만 해야 한다 — 한 번도 안 쓴 PC에서 진단을 돌렸다고 빈 폴더가 생기면
+    "기록 없음"과 "폴더는 있는데 기록 없음"이 섞여 지원할 때 헷갈린다.
+    """
+    folder = Path.home() / ".dartlens"
+    legacy = Path.home() / ".dart-mcp-server"
+    if not folder.exists() and legacy.exists():
+        folder = legacy
+    return folder / "logs"
+
+
+def load_recent_metrics(hours: float = 48, *, now: datetime | None = None) -> list[dict]:
+    """최근 N시간 안의 도구 호출 기록을 시간순으로 돌려준다(읽기 전용).
+
+    파일은 날짜별이라 창에 걸치는 날짜 파일을 모두 읽고 timestamp 로 다시 거른다.
+    깨진 줄·timestamp 없는 줄은 건너뛴다 — 기록 한 줄 때문에 진단이 죽으면 안 된다.
+    """
+    from datetime import timedelta
+
+    now = now or datetime.now()
+    start = now - timedelta(hours=hours)
+    folder = _metrics_dir_readonly()
+    records: list[tuple[datetime, int, dict]] = []
+    day = start.date()
+    order = 0
+    while day <= now.date():
+        path = folder / f"metrics_{day:%Y%m%d}.jsonl"
+        day += timedelta(days=1)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                row = json.loads(line)
+                ts = datetime.fromisoformat(str(row["timestamp"]))
+                if not (start <= ts <= now):
+                    continue
+            except Exception:
+                continue
+            order += 1
+            records.append((ts, order, row))
+    records.sort(key=lambda item: (item[0], item[1]))
+    return [row for _ts, _order, row in records]
+
+
 def _sanitize_kwargs(kwargs: dict) -> dict:
     out = {}
     for k, v in kwargs.items():

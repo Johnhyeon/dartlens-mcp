@@ -30,25 +30,17 @@ def _cause_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {msg}"
 
 
-def _support_hint() -> str:
-    """safe_tool 의 '예상 못한 오류' 버킷에서만 붙이는 자가진단 안내.
-
-    이미 원인이 명확한 예외(라이선스/API키/타임아웃/연결오류 등)엔 안 붙인다 — 사소한 것까지
-    문의로 유도하면 노이즈만 늘어난다.
-
-    예전엔 여기서 OS별 zip 명령을 띄워 "Claude 로그를 직접 압축해 메일로 보내라"고
-    안내했다. 그대로 따라 보내온 문의(2026-09-11)를 받아보니, 손으로 만든 zip에는
-    LeetKit Manager 번들이 넣어주는 것이 통째로 빠져 있었다 — 3-Lens 온라인 진단
-    요약도, metrics 기록에서 센 최근 호출 실패 집계도, 홈 경로·키 마스킹도. 받는
-    쪽은 원인을 좁힐 재료가 없고, 보내는 쪽은 마스킹 안 된 로그를 그대로 내보낸다.
-    안내하는 길은 하나로 둔다.
-    """
-    return (
-        "\n\n계속되면:\n"
-        "1) Claude 완전 종료 후 재시작 → 다시 시도\n"
-        "2) 그래도 안 되면 LeetKit Manager를 열고 [지원 문의]를 눌러주세요 "
-        "(진단 로그 zip과 메일 초안이 자동으로 만들어집니다)."
-    )
+# 원인을 모르는 오류의 안내. 예전엔 "입력값(종목코드/corp_code/날짜)을 다시 확인해주세요"
+# 라고 적었는데, 이 분기는 정의상 원인을 모르는 곳이다 — 입력이 틀렸으면 ValueError
+# 분기에서 이미 걸렀다. 고객 탓으로 돌리면 멀쩡한 질문을 고치느라 시간을 쓴다.
+#
+# 문의 길은 LeetKit Manager [지원 문의] 하나다. 예전엔 OS별 zip 명령으로 로그를 직접
+# 압축해 메일로 보내라고 했는데, 그렇게 온 문의(2026-09-11)에는 Manager 번들이 넣어주는
+# 3-Lens 온라인 진단 요약·최근 호출 실패 집계·키 마스킹이 통째로 빠져 있었다.
+_UNKNOWN_ERROR_MESSAGE = (
+    "조회 중 문제가 생겼어요. 같은 질문을 한 번 더 해보고, "
+    "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
+)
 
 
 class DartApiError(Exception):
@@ -82,10 +74,11 @@ def require_api_key() -> str:
     if stored:
         return stored
 
+    # Claude 답변 안에 그대로 나간다. 키 넣는 곳은 Manager [활성화] 창 하나다
+    # (거기서 DART 인증키 발급 페이지도 연다).
     raise MissingApiKeyError(
-        "DART API 키가 필요합니다.\n"
-        "터미널에서 `dartlens-setup`을 실행해 키를 등록하세요.\n"
-        "키가 없다면 https://opendart.fss.or.kr 에서 무료 발급 가능."
+        "DART 인증키가 아직 없어요. "
+        "LeetKit Manager의 DartLens 카드에서 [활성화]를 눌러 DART 인증키를 넣어주세요."
     )
 
 
@@ -131,10 +124,6 @@ def safe_tool(func):
         except ValueError as e:
             return f"⚠️ 입력값 오류: {e}"
         except Exception as e:
-            return (
-                f"⚠️ 처리 중 오류: {_cause_text(e)}\n"
-                f"입력값(종목코드/corp_code/날짜)을 다시 확인해주세요."
-                + _support_hint()
-            )
+            return f"⚠️ {_UNKNOWN_ERROR_MESSAGE}\n(원인: {_cause_text(e)})"
 
     return wrapper

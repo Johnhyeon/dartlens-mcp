@@ -27,6 +27,7 @@ from pathlib import Path
 
 import httpx
 
+from dartlens import _error_class
 from dartlens import _keyring as keyring_helper
 from dartlens import diagnostics
 from dartlens import licensing
@@ -538,40 +539,58 @@ def run_setup_noninteractive(
     if licensing.looks_like_license_shape(key):
         raise SetupError(diagnostics.DART_API_KEY_INVALID, licensing.CROSS_HINT_LICENSE_IN_API_KEY_FIELD)
 
+    # 아래 message 는 Manager DartLens [활성화] 창의 실패 사유로 쓰인다 — 터미널 명령·
+    # 플래그 없이, 할 일은 창 안에서 할 수 있는 것만 적는다.
     try:
         status, data = asyncio.run(diagnostics.check_dart_key_online(key))
     except httpx.TimeoutException:
-        raise SetupError(diagnostics.DART_NETWORK_UNREACHABLE, "DART 서버 응답이 지연되고 있습니다 (타임아웃).")
-    except httpx.ConnectError:
-        raise SetupError(diagnostics.DART_NETWORK_UNREACHABLE, "DART 서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.")
+        raise SetupError(
+            diagnostics.DART_NETWORK_UNREACHABLE,
+            "DART 응답이 늦어서 인증키를 확인하지 못했어요. 잠시 뒤 다시 넣어주세요.",
+        )
     except httpx.HTTPError as e:
-        raise SetupError(diagnostics.DART_NETWORK_UNREACHABLE, f"네트워크 오류: {type(e).__name__}")
+        category = _error_class.classify_exception(e)
+        raise SetupError(
+            diagnostics.DART_NETWORK_UNREACHABLE,
+            "DART에 연결하지 못해서 인증키를 확인하지 못했어요. "
+            + (_error_class.action_for(category, diagnostics.LENS) or ""),
+        )
 
     if status in diagnostics.RATE_LIMIT_CODES:
         raise SetupError(
             diagnostics.DART_API_RATE_LIMITED,
-            f"DART 요청 제한에 도달했습니다 (응답 {status}). 키는 정상일 수 있습니다 — 잠시 후 다시 시도하세요.",
+            f"DART 요청 한도에 걸렸어요(응답 {status}). 인증키는 정상일 수 있어요. 잠시 뒤 다시 넣어주세요.",
         )
     if status in diagnostics.SERVICE_ISSUE_CODES:
         raise SetupError(
             diagnostics.DART_NETWORK_UNREACHABLE,
-            f"DART 서비스 자체 문제로 보입니다 (응답 {status}). 키 문제가 아닙니다.",
+            f"DART 서비스 점검이나 일시 장애로 보여요(응답 {status}). 인증키 문제는 아니에요. 잠시 뒤 다시 넣어주세요.",
+        )
+    if status in diagnostics.IP_BLOCKED_CODES:
+        # 012 는 키가 아니라 접속 위치 문제다(diagnostics 와 같은 구분).
+        raise SetupError(
+            diagnostics.DART_API_KEY_INVALID,
+            f"DART가 이 컴퓨터의 IP 접속을 막았어요(응답 {status}). 인증키가 틀렸다는 뜻은 아니에요. "
+            "상단 [지원 문의]를 눌러주세요.",
         )
     if status not in diagnostics.SUCCESS_CODES:
         raise SetupError(
             diagnostics.DART_API_KEY_INVALID,
-            f"DART가 키를 거부했습니다 (응답 {status}: {data.get('message', '알 수 없는 오류')}).",
+            f"DART가 인증키를 거부했어요(응답 {status}: {str(data.get('message') or '알 수 없는 오류').rstrip('.')}). "
+            "DART에서 받은 인증키를 그대로 다시 넣어주세요.",
         )
 
     plaintext = False
     storage = "os-keychain"
     try:
         keyring_helper.save(key)
-    except keyring_helper.KeyringUnavailableError as e:
+    except keyring_helper.KeyringUnavailableError:
         if not plaintext_consent:
+            # 헤드리스 환경용 --plaintext 안내는 Manager 고객이 할 수 있는 일이 아니다.
+            # 터미널에서 직접 설정하는 사람은 대화형 dartlens-setup 이 평문 모드를 따로 묻는다.
             raise SetupError(
                 diagnostics.DART_API_KEY_STORAGE_FAILED,
-                f"OS 키체인을 사용할 수 없습니다: {e} 평문 저장에 동의하려면 --plaintext 를 추가하세요.",
+                "이 컴퓨터의 키 저장소를 쓸 수 없어요. 상단 [지원 문의]를 눌러주세요.",
             )
         plaintext = True
         storage = "plaintext-config"

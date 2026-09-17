@@ -86,7 +86,10 @@ class DiagnoseDartApiKeyTests(unittest.TestCase):
         self.assertEqual(diag.status, "invalid")
         self.assertEqual(diag.error_code, diagnostics.DART_API_KEY_INVALID)
         self.assertIn("라이선스 키", diag.message)
-        self.assertIn("dartlens-activate", diag.message)
+        # 할 일은 터미널 명령이 아니라 Manager 버튼으로 안내한다(인증키 다시 넣기).
+        self.assertNotIn("dartlens-", diag.message)
+        self.assertIn("[활성화]", diagnostics.dart_api_action(diag))
+        self.assertIn("DART 인증키", diagnostics.dart_api_action(diag))
 
     def test_to_dict_never_contains_raw_key(self):
         key = "b" * 40
@@ -110,8 +113,9 @@ class DiagnoseLicenseTests(unittest.TestCase):
             diag = diagnostics.diagnose_license()
         self.assertEqual(diag.status, "invalid")
         self.assertEqual(diag.error_code, diagnostics.DARTLENS_LICENSE_INVALID)
-        self.assertIn("DART API 키", diag.message)
-        self.assertIn("dartlens-setup", diag.message)
+        self.assertIn("DART 인증키", diag.message)
+        self.assertNotIn("dartlens-", diag.message)
+        self.assertIn("[활성화]", diagnostics.license_action(diag))
 
     def test_active_when_verify_succeeds(self):
         with patch.object(licensing, "stored_key", return_value="whatever"), \

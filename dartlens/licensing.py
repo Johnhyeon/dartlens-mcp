@@ -43,25 +43,25 @@ def _purchase_line(prefix: str = "· 구매: ") -> str:
     return f"\n{prefix}{PURCHASE_URL}" if PURCHASE_URL else ""
 
 
+# 잠금 안내 4종은 Claude 답변 안에 그대로 들어간다. 터미널 명령은 쓰지 않는다 — 주
+# 고객층은 거기서 막히고, 키 넣기·구매·문의는 전부 LeetKit Manager 버튼으로 된다.
+# 문구는 세 Lens 공통 사양(2-1)과 Lens 이름만 다르게 글자까지 맞춘다.
 LOCKED_MESSAGE = (
-    "🔒 DartLens는 유료 라이선스가 필요합니다.\n"
+    "🔒 DartLens를 쓰려면 라이선스 키가 필요해요.\n"
     "\n"
-    "구매 시 발송된 라이선스 키로 활성화하세요:\n"
-    "    dartlens-activate <라이선스-키>\n"
-    "\n"
-    "· 키는 결제 완료 후 이메일로 발송됩니다."
-    + _purchase_line()
+    "LeetKit Manager의 DartLens 카드에서 [활성화]를 눌러 메일로 받은 키를 넣어주세요.\n"
+    "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
 )
 
 # 폐기된 키 전용 안내. LOCKED_MESSAGE와 달리 "키를 넣으세요"라고 하면 안 된다 —
 # 이 사람은 키를 갖고 있고, 그 키가 중지된 것이다. 할 일은 연락이지 재입력이 아니다.
+# 문의처는 메일 주소가 아니라 [지원 문의] 버튼이다 — 진단 파일이 같이 만들어져야
+# 착오인지 바로 확인할 수 있다.
 REVOKED_MESSAGE = (
-    "🔒 이 라이선스 키는 현재 사용이 중지되어 있습니다.\n"
+    "🔒 이 라이선스 키는 지금 사용이 중지돼 있어요.\n"
     "\n"
-    "환불 또는 결제 취소된 키로 확인됩니다.\n"
-    "착오라고 생각되시면 알려주세요 — 확인 후 바로 풀어드리겠습니다.\n"
-    "\n"
-    "· 문의: osy980315@gmail.com"
+    "환불이나 결제 취소로 중지된 키예요.\n"
+    "착오라면 LeetKit Manager 상단 [지원 문의]를 눌러 알려주세요. 확인하고 바로 풀어드릴게요."
 )
 
 # 기간이 끝난 키 전용 안내. LOCKED_MESSAGE("키를 넣으세요")도, REVOKED_MESSAGE
@@ -69,10 +69,10 @@ REVOKED_MESSAGE = (
 # 할 일은 구매다. 체험이 끝난 사람에게 가장 자주 보일 문구라 사과나 경고가 아니라
 # 다음 걸음을 적는다.
 EXPIRED_MESSAGE = (
-    "🔒 DartLens 사용 기간이 끝났습니다.\n"
+    "🔒 DartLens 사용 기간이 끝났어요.\n"
     "\n"
-    "계속 쓰시려면 라이선스를 구매하신 뒤 받으신 키로 활성화하세요:\n"
-    "    dartlens-activate <라이선스-키>"
+    "계속 쓰시려면 LeetKit Manager의 DartLens 카드에서 [구매]를 누르고, "
+    "받은 키를 같은 카드의 [활성화]로 넣어주세요."
     + _purchase_line()
 )
 
@@ -81,10 +81,11 @@ EXPIRED_MESSAGE = (
 # 두 경우 모두에게 맞는 한 가지 할 일만 적는다. "부정 사용"이라고 썼다가 배터리가
 # 닳은 정직한 사용자를 범인 취급하면 그 손해가 훨씬 크다.
 CLOCK_MESSAGE = (
-    "🔒 이 컴퓨터의 날짜가 실제보다 과거로 설정되어 있어 DartLens를 열 수 없습니다.\n"
+    "🔒 이 컴퓨터의 날짜가 실제보다 과거로 되어 있어서 DartLens를 열 수 없어요.\n"
     "\n"
-    "날짜와 시간을 현재에 맞춘 뒤 다시 시도해주세요.\n"
-    "(Windows: 설정 → 시간 및 언어 / Mac: 시스템 설정 → 일반 → 날짜 및 시간)"
+    "날짜와 시간을 오늘로 맞춘 뒤 다시 물어봐 주세요.\n"
+    "(Windows: 설정 → 시간 및 언어 / Mac: 시스템 설정 → 일반 → 날짜 및 시간)\n"
+    "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
 )
 
 _licensed_cache = False  # 한 번 유효하면 프로세스 동안 재검증 생략
@@ -141,14 +142,16 @@ def mask_tail(value: str, keep: int = 4) -> str:
     return "*" * 4 + v[-keep:]
 
 
+# 두 키를 서로 바꿔 넣었을 때의 안내. Manager의 DartLens [활성화] 창에 라이선스 키 칸과
+# DART 인증키 칸이 같이 있어서, 할 일은 "칸을 바꿔 넣기" 하나다.
 CROSS_HINT_API_KEY_IN_LICENSE_FIELD = (
-    "이 값은 DART API 키 형식입니다. API 키를 라이선스 입력란에 넣지 마세요 — "
-    "API 키는 `dartlens-setup` 으로 등록하고, 라이선스 키는 `dartlens-activate` 로 등록하세요."
+    "넣은 값이 DART 인증키 모양이에요. "
+    "라이선스 키 칸에는 메일로 받은 라이선스 키를, DART 인증키 칸에는 DART 인증키를 넣어주세요."
 )
 
 CROSS_HINT_LICENSE_IN_API_KEY_FIELD = (
-    "이 값은 DartLens 라이선스 키 형식입니다. 라이선스 키를 API 키 입력란에 넣지 마세요 — "
-    "라이선스는 `dartlens-activate` 로 등록하고, DART API 키는 `dartlens-setup` 으로 등록하세요."
+    "넣은 값이 라이선스 키 모양이에요. "
+    "DART 인증키 칸에는 DART 인증키를, 라이선스 키 칸에는 메일로 받은 라이선스 키를 넣어주세요."
 )
 
 
@@ -398,24 +401,61 @@ def _clock_turned_back(expiry: "date | None") -> bool:
     return False
 
 
+# verify_key 의 실패 사유. 지원용 원문이라 터미널 출력·진단 details 에만 쓰고, Manager
+# 활성화 창에는 _ACTIVATION_COPY 의 고객 문구로 바꿔 보낸다("서명 불일치"는 고객이
+# 할 일을 알려주지 못한다).
+_REASON_PUBKEY = "공개키 설정 오류"
+_REASON_MALFORMED = "형식 오류(깨진 키)"
+_REASON_WRONG_PRODUCT = "이 제품의 키가 아님"
+_REASON_BAD_SIGNATURE = "서명 불일치(위조/변조)"
+
+_ACTIVATION_COPY = {
+    _REASON_MALFORMED: (
+        "DartLens 라이선스 키로 읽을 수 없어요. 메일로 받은 키를 앞뒤 공백 없이 그대로 붙여넣어 주세요. "
+        "그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    ),
+    _REASON_WRONG_PRODUCT: (
+        "DartLens 키가 아니에요. 메일에서 DartLens 키를 찾아 그대로 붙여넣어 주세요. "
+        "그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    ),
+    _REASON_BAD_SIGNATURE: (
+        "DartLens 라이선스 키로 확인되지 않아요. 메일로 받은 키를 그대로 다시 붙여넣어 주세요. "
+        "그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    ),
+    _REASON_PUBKEY: "키를 확인하는 중에 문제가 생겼어요. 상단 [지원 문의]를 눌러주세요.",
+}
+
+
+def activation_failure_message(res: dict, key_str: str = "") -> str:
+    """활성화 실패를 Manager [활성화] 창에 보여줄 한 덩어리 문구로.
+
+    두 키를 바꿔 넣은 경우는 사유보다 그 사실이 먼저다 — 서명이 안 맞는 건 결과일 뿐이다.
+    save_key 가 직접 만든 사유(체험 재사용·기간 끝남·중지)는 이미 고객 문구라 그대로 쓴다.
+    """
+    if looks_like_dart_api_key(key_str):
+        return CROSS_HINT_API_KEY_IN_LICENSE_FIELD
+    reason = str(res.get("reason") or "")
+    return _ACTIVATION_COPY.get(reason, reason)
+
+
 def verify_key(key_str: str) -> dict:
     """키 문자열이 '판매자가 서명한 이 제품의 진짜 키'인지 검증."""
     try:
         pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(_PUBLIC_KEY_B64))
     except Exception:
-        return {"valid": False, "reason": "공개키 설정 오류"}
+        return {"valid": False, "reason": _REASON_PUBKEY}
     try:
         raw = _decode(key_str)
     except Exception:
-        return {"valid": False, "reason": "형식 오류(깨진 키)"}
+        return {"valid": False, "reason": _REASON_MALFORMED}
     payload_len = len(raw) - _SIG_LEN
     if payload_len not in (_PAYLOAD_LEN, _PAYLOAD_LEN_WITH_EXPIRY) or raw[:4] != PRODUCT:
-        return {"valid": False, "reason": "이 제품의 키가 아님"}
+        return {"valid": False, "reason": _REASON_WRONG_PRODUCT}
     payload, sig = raw[:payload_len], raw[payload_len:]
     try:
         pub.verify(sig, payload)
     except InvalidSignature:
-        return {"valid": False, "reason": "서명 불일치(위조/변조)"}
+        return {"valid": False, "reason": _REASON_BAD_SIGNATURE}
     # 만료일은 서명 안에 들어 있다 — 고쳐 쓰면 서명이 깨지므로 위 검증에서 걸린다.
     return {
         "valid": True,
@@ -590,12 +630,13 @@ def save_key(key_str: str) -> dict:
     # 우리는 이 PC 가 예전에 어떤 체험 키를 썼는지 이미 적어두고 있다(체험 시작일 기록).
     already = _other_trial_used(res)
     if already:
+        # 이 사유는 Manager [활성화] 창에 그대로 뜬다. 문의처는 메일 주소가 아니라 버튼이다.
         return {
             "valid": False,
             "reason": (
-                "이 컴퓨터에서는 이미 체험판을 사용하셨습니다.\n"
-                "체험은 한 대에 한 번만 드립니다. 계속 쓰시려면 정식 라이선스를 구매해주세요.\n"
-                "착오라고 생각되시면 osy980315@gmail.com 으로 알려주세요."
+                "이 컴퓨터에서는 이미 체험판을 사용하셨어요. 체험은 한 대에 한 번만 드려요.\n"
+                "계속 쓰시려면 DartLens 카드의 [구매]를 눌러주세요. "
+                "착오라면 상단 [지원 문의]를 눌러주세요."
             ),
         }
 
@@ -603,9 +644,13 @@ def save_key(key_str: str) -> dict:
     # 행위가 활성화이므로, 그날이 창의 첫날로 기록된다.
     expiry = effective_expiry(res)
     if _is_expired(expiry):
-        return {"valid": False, "reason": "사용 기간이 끝난 키입니다", "expires_on": expiry}
+        return {
+            "valid": False,
+            "reason": "사용 기간이 끝난 키예요. DartLens 카드의 [구매]를 누르고, 받은 키를 [활성화]로 넣어주세요.",
+            "expires_on": expiry,
+        }
     if is_revoked(res.get("license_id", "")):
-        return {"valid": False, "reason": "현재 사용이 중지된 키입니다"}
+        return {"valid": False, "reason": "지금 사용이 중지된 키예요. 착오라면 상단 [지원 문의]를 눌러주세요."}
 
     p = _license_path()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -678,7 +723,7 @@ def activate_cli() -> None:
             result = (
                 {"license_activated": True}
                 if licensed
-                else {"license_activated": False, "error_code": DARTLENS_LICENSE_MISSING, "message": "라이선스 키가 입력되지 않았습니다."}
+                else {"license_activated": False, "error_code": DARTLENS_LICENSE_MISSING, "message": "라이선스 키가 비어 있어요. 메일로 받은 키를 붙여넣어 주세요."}
             )
             print(json.dumps(result, ensure_ascii=False))
             sys.exit(0 if licensed else 1)
@@ -703,7 +748,8 @@ def activate_cli() -> None:
 
     cross_hint = CROSS_HINT_API_KEY_IN_LICENSE_FIELD if looks_like_dart_api_key(key) else None
     if json_mode:
-        message = res["reason"] + (f" {cross_hint}" if cross_hint else "")
+        # --json 은 Manager [활성화] 창이 읽는다 — 고객 문구로 바꿔 보낸다.
+        message = activation_failure_message(res, key)
         print(json.dumps(
             {"license_activated": False, "error_code": DARTLENS_LICENSE_INVALID, "message": message},
             ensure_ascii=False,
