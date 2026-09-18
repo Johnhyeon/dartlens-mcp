@@ -2212,6 +2212,12 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             failed_periods[period] = "검산 이상(전체 잔고 < 단일 세부 계약) - 산정 불가"
             extraction_warnings.extend(snapshot.warnings)
             continue
+        if snapshot.unit_unknown:
+            failed_periods[period] = (
+                "단위 표기 없는 표가 있어 부문 합계 산정 불가(100배 위험) - 원문 대조 필요"
+            )
+            extraction_warnings.extend(snapshot.warnings)
+            continue
         if yearly_points and snapshot.value_unit != point_unit:
             failed_periods[period] = (
                 f"단위 상이({snapshot.value_unit} vs {point_unit}) - 한 시계열로 묶지 않음"

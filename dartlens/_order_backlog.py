@@ -34,6 +34,7 @@ class BacklogSnapshot:
     warnings: list[str]
     max_single_detail: float    # value_unit 기준. 전체 잔고가 이보다 작으면 말이 안 된다
     anomalous: bool = False
+    unit_unknown: bool = False  # 합산한 표 중에 단위 표기가 없는 게 있다
     value_unit: str = "억원"    # 외화 표는 원문 단위 그대로(환산하지 않는다)
     unit_source: str = "declared"  # "declared" = 원문에 단위 표기 있음 / "assumed" = 억원 가정
     basis: str = ""             # "연결"/"별도" — 섞으면 없던 증감이 생긴다
@@ -118,6 +119,24 @@ def extract_order_backlog_snapshot(
                 + ")는 원화 합계에서 제외했습니다. 통화가 달라 합칠 수 없습니다."
             )
             extracted = krw
+        # 부문별 표 여러 개를 더해 회사 합계를 만드는 자리다. 여기서는 표마다
+        # 단위가 밝혀져 있어야 한다 - 한 표만 백만원을 억원으로 읽어도 그 표가
+        # 합계를 통째로 지배한다. 실측(현대건설 [기재정정]사업보고서
+        # 20251017000151): '(2) 현대엔지니어링' 표만 단위 표기가 없어
+        # 191,004억이 19,100,399억이 됐고 그 해 수주잔고가 1,938조로 나갔다.
+        # 반기보고서(20250814002545)는 두 표 다 표기가 없어 4,337조가 됐다.
+        # 원문에 그 표들의 단위는 실제로 없다. 가까운 표에서 물려받아 추측하지
+        # 않고, 합계를 만들지 않는다(한 표만 읽는 다른 경로는 종전대로
+        # '억원 가정'으로 표시하고 값을 낸다).
+        unknown = [i for i in extracted if i.get("unit_source") == "assumed"]
+        unit_unknown = bool(unknown)
+        if unit_unknown:
+            warnings.append(
+                "표 " + str(len(unknown)) + "개("
+                + ", ".join(sorted({(i.get("caption") or "무제")[:20] for i in unknown}))
+                + ")에 단위 표기가 없어 부문 합계를 만들지 않았습니다. "
+                "단위를 잘못 읽으면 100배·10만배 어긋납니다."
+            )
         units = sorted({i["unit"] for i in extracted if i.get("currency") != "KRW"})
         value_unit = units[0] if units else "억원"
         value = round(sum(i["eok_sum"] for i in extracted), 2)
@@ -138,6 +157,7 @@ def extract_order_backlog_snapshot(
             warnings=warnings,
             max_single_detail=round(max_detail, 2),
             anomalous=anomalous,
+            unit_unknown=unit_unknown,
             value_unit=value_unit,
             unit_source=(
                 "assumed" if any(i.get("unit_source") == "assumed" for i in extracted)
@@ -271,12 +291,26 @@ def _single_row_snapshot(
 
 _TOTAL_LABELS = {"합계", "총계", "계", "소계"}
 _PLAIN_NUMBER_RE = re.compile(r"^-?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^-?\d+(?:\.\d+)?$")
+# 셀 전체가 괄호로 싸인 숫자만 음수로 읽는다. '(*1)'·'(단위: 천원)'은 해당 없음.
+_PAREN_NUMBER_RE = re.compile(r"^\((\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\)$")
 
 
 def _plain_number(cell: str) -> float | None:
-    """콤마 숫자 셀만 숫자로 읽는다. 날짜('2007-03-09')·라벨은 None."""
+    """콤마 숫자 셀만 숫자로 읽는다. 날짜('2007-03-09')·라벨은 None.
+
+    한국 재무 표는 음수를 괄호로 적는다. 예전엔 '(10,322,942)'를 숫자로 못 읽어
+    행마다 숫자가 두 개뿐이 됐고, 그러면 항등식(수주총액=기납품액+수주잔고)을
+    세울 수가 없어 검산이 아예 안 돌았다 - 실측(한화오션 2025 사업보고서
+    20260317000644)에서 검산 실패 표시도 안 남은 채 단일 값 경로로 새어,
+    합계(34.5조) 대신 첫 행 '상선'(26.0조)이 수주잔고로 나갔다.
+    """
     text = (cell or "").strip().replace(" ", "")
-    if not text or not _PLAIN_NUMBER_RE.match(text):
+    if not text:
+        return None
+    paren = _PAREN_NUMBER_RE.match(text)
+    if paren:
+        return -float(paren.group(1).replace(",", ""))
+    if not _PLAIN_NUMBER_RE.match(text):
         return None
     try:
         return float(text.replace(",", ""))
@@ -291,6 +325,10 @@ def _identity_backlog_column(numeric_rows: list[dict]) -> int | None:
     현대로템형은 수량/금액 쌍으로 열이 늘어난다. 위치를 가정하는 대신 표 안의
     수학으로 자가검증한다: 열 (a < b < c)에서 v[a] = v[b] + v[c] 가 대다수
     행에서 성립하면 c 가 수주잔고다(열 순서는 원문 표기 순서를 따른다).
+
+    기납품액을 차감액으로 보아 음수로 적는 표가 있다(한화오션). 부호만 다를 뿐
+    같은 항등식이므로 가운데 항은 절댓값으로 본다. 수주총액·수주잔고는 음수일
+    수 없으니 그 조건은 그대로 둔다.
     """
     votes: dict[int, int] = {}
     checked = 0
@@ -304,9 +342,9 @@ def _identity_backlog_column(numeric_rows: list[dict]) -> int | None:
                 for ci in range(bi + 1, len(idxs)):
                     a, b, c = idxs[ai], idxs[bi], idxs[ci]
                     va, vb, vc = nums[a], nums[b], nums[c]
-                    if va <= 0 or vb < 0 or vc < 0:
+                    if va <= 0 or vc < 0:
                         continue
-                    if abs(va - (vb + vc)) <= max(2.0, va * 0.005):
+                    if abs(va - (abs(vb) + vc)) <= max(2.0, va * 0.005):
                         votes[c] = votes.get(c, 0) + 1
     if checked == 0:
         return None, 0

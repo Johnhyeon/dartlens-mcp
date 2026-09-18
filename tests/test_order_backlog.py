@@ -870,3 +870,134 @@ class SeriesConsistencyTests(unittest.IsolatedAsyncioTestCase):
         body = await self._run(docs, reports)
         self.assertLess(body.index("2025.06="), body.index("| 2025="),
                         "6월말 잔고가 연말 뒤에 놓였다")
+
+
+# ---------------------------------------------------------------------------
+# 괄호 음수 때문에 검산이 아예 안 돌던 회귀 (한화오션 2025 사업보고서 20260317000644)
+#
+# 실측: 기납품액이 '(10,322,942)' 괄호 음수라 숫자로 안 읽혔다. 그러면 행마다
+# 숫자가 두 개뿐이라 항등식(수주총액=기납품액+수주잔고)을 세울 수 없고, 검산이
+# 안 돌았다는 표시조차 안 남는다. 그 표는 단일 값 경로로 새어, 부문 합계
+# (34.5조) 대신 첫 행 '상선'(26.0조)이 수주잔고로 나갔다.
+# ---------------------------------------------------------------------------
+
+
+def _hanwha_ocean_table():
+    return DocumentTable(
+        caption="(단위 : 백만원)",
+        rows=[
+            ["품목", "수주일자", "납기", "수주총액(*1)", "기납품액(*2)", "수주잔고"],
+            ["수량", "금액", "수량", "금액", "수량", "금액"],
+            ["상선", "2025.12.31일까지", "-", "-", "36,326,613", "-",
+             "(10,322,942)", "-", "26,003,671"],
+            ["해양 및 특수선", "2025.12.31일까지", "-", "-", "8,186,289", "-",
+             "(1,884,332)", "-", "6,301,957"],
+            ["플랜트", "2025.12.31일까지", "-", "-", "3,002,968", "-",
+             "(816,095)", "-", "2,186,873"],
+            ["기타", "2025.12.31일까지", "-", "-", "6,255", "-", "(3,692)", "-", "2,563"],
+            ["합 계", "-", "47,522,125", "-", "(13,027,061)", "-", "34,495,064"],
+        ],
+    )
+
+
+class ParenthesisedNegativeTests(unittest.TestCase):
+    def test_parenthesised_number_is_negative(self):
+        from dartlens._order_backlog import _plain_number
+
+        self.assertEqual(_plain_number("(10,322,942)"), -10322942.0)
+        self.assertEqual(_plain_number("(3,692)"), -3692.0)
+
+    def test_footnote_and_unit_markers_are_still_not_numbers(self):
+        from dartlens._order_backlog import _plain_number
+
+        for cell in ("(*1)", "(단위: 천원)", "(주1)", "()", "-"):
+            self.assertIsNone(_plain_number(cell), cell)
+
+    def test_segment_total_is_summed_not_the_first_row(self):
+        snap = extract_order_backlog_snapshot([_hanwha_ocean_table()], period="2025")
+        self.assertIsNotNone(snap)
+        # 34,495,064 백만원 = 344,950.64억. '상선' 한 줄(260,036.71억)이 아니다.
+        self.assertAlmostEqual(snap.point.value, 344950.64, places=2)
+        self.assertEqual(snap.tables[0]["rows_used"], 4)
+        self.assertIn("항등식", snap.tables[0]["method"])
+
+    def test_positive_delivered_column_still_works(self):
+        """기납품액을 양수로 적는 표(두산형)는 그대로 맞아야 한다."""
+        snap = extract_order_backlog_snapshot([_doosan_table()], period="2025")
+        self.assertAlmostEqual(snap.point.value, 136.72, places=2)
+
+
+# ---------------------------------------------------------------------------
+# 단위 표기 없는 표를 섞어 합계를 만들던 회귀 (현대건설 [기재정정]사업보고서
+# 20251017000151 / 반기보고서 20250814002545)
+#
+# 실측: '(2) 현대엔지니어링' 표만 단위 표기가 없어 백만원을 억원으로 읽었고,
+# 191,004억이 19,100,399억이 돼 2024년 수주잔고가 1,938조로 나갔다. 반기보고서는
+# 두 표 다 표기가 없어 4,337조가 됐다. 원문에 그 표들의 단위는 실제로 없다.
+# ---------------------------------------------------------------------------
+
+
+def _hdec_table(caption, first_row_name="A현장"):
+    return DocumentTable(
+        caption=caption,
+        rows=[
+            ["구분", "공사명", "발주처", "수주총액", "기납품액", "계약잔액"],
+            ["국내", first_row_name, "발주처1", "3,931,885", "312,881", "3,619,004"],
+            ["해외", "B현장", "발주처2", "2,411,552", "903,131", "1,508,421"],
+        ],
+    )
+
+
+class UnknownUnitSumTests(unittest.TestCase):
+    def test_unit_less_table_is_not_summed_with_declared_ones(self):
+        snap = extract_order_backlog_snapshot(
+            [_hdec_table("(단위 : 백만원)"), _hdec_table("(2) 현대엔지니어링", "C현장")],
+            period="2024",
+        )
+        self.assertTrue(snap.unit_unknown)
+        self.assertTrue(any("단위 표기가 없어" in w for w in snap.warnings), snap.warnings)
+
+    def test_all_tables_without_unit_are_also_refused(self):
+        snap = extract_order_backlog_snapshot(
+            [_hdec_table("다. 수주상황 1) 현대건설"), _hdec_table("2) 현대엔지니어링", "C현장")],
+            period="2025.06",
+        )
+        self.assertTrue(snap.unit_unknown)
+
+    def test_declared_units_are_unaffected(self):
+        snap = extract_order_backlog_snapshot(
+            [_hdec_table("(단위 : 백만원)"), _hdec_table("(단위 : 백만원)", "C현장")],
+            period="2024",
+        )
+        self.assertFalse(snap.unit_unknown)
+        self.assertAlmostEqual(snap.point.value, (3619004 + 1508421) * 2 / 100, places=2)
+
+
+class UnknownUnitToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_period_with_unknown_unit_is_reported_missing_not_guessed(self):
+        good = [_hdec_table("(단위 : 백만원)")]
+        bad = [_hdec_table("(단위 : 백만원)"), _hdec_table("(2) 현대엔지니어링", "C현장")]
+        tables = {"good": good, "bad": bad}
+
+        async def fake_zip(rcept_no):
+            return (b"bad" if rcept_no.startswith("2025") else b"good")
+
+        reports = [
+            {"report_nm": "사업보고서 (2025.12)", "rcept_no": "20260318001395",
+             "rcept_dt": "20260318"},
+            {"report_nm": "사업보고서 (2024.12)", "rcept_no": "20250318001395",
+             "rcept_dt": "20250318"},
+        ]
+        with (
+            patch("dartlens._safe.is_licensed", return_value=True),
+            patch.object(server, "_fetch_disclosure_list",
+                         AsyncMock(return_value={"list": reports})),
+            patch.object(server, "_fetch_document_zip", AsyncMock(side_effect=fake_zip)),
+            patch.object(server, "extract_document_tables",
+                         side_effect=lambda raw: tables[raw.decode()]),
+        ):
+            text = await server.get_order_backlog("00164478", years=3)
+        body = text.split("RESULT_META_JSON_START")[0]
+        self.assertIn("단위 표기 없는 표가 있어", body)
+        self.assertNotIn("2024=", body)          # 100배 값이 시계열에 안 들어간다
+        self.assertIn("2025=", body)
