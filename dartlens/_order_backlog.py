@@ -522,6 +522,24 @@ def _is_rollforward_header(normalized: list[str]) -> bool:
     return stages >= 2
 
 
+def _named_backlog_column(header: list[str], index: int,
+                          detail_rows: list[dict]) -> int | None:
+    """머리글이 '수주잔고'라고 적은 칸을 그대로 쓴다 - 칸 수가 맞을 때만.
+
+    위치로 찍는 게 아니라 이름을 읽는 것이지만, 머리글과 데이터 행의 칸 수가
+    다르면 그 이름이 가리키는 자리가 밀린다. 그럴 땐 쓰지 않는다.
+    """
+    if index is None:
+        return None
+    width = len(header)
+    aligned = [e for e in detail_rows if e.get("width") == width]
+    if not aligned or len(aligned) * 2 < len(detail_rows):
+        return None
+    if sum(1 for e in aligned if index in e["nums"]) * 2 < len(aligned):
+        return None
+    return index
+
+
 def _contract_detail_extract(table: DocumentTable) -> dict | None:
     """계약별 상세표(품목|발주처|...|수주잔고|...)에서 수주잔고 열을 합산한다."""
     default_unit = _table_unit(table)
@@ -557,7 +575,7 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
             # 온다. 숫자가 아닌 칸을 전부 보고 판정한다.
             labels = [cell.strip() for i, cell in enumerate(drow)
                       if i not in nums and cell.strip()]
-            entry = {"labels": labels, "nums": nums,
+            entry = {"labels": labels, "nums": nums, "width": len(drow),
                      "first": labels[0] if labels else ""}
             if _is_total_row(labels):
                 total_rows.append(entry)
@@ -585,6 +603,13 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
         col, checked = _identity_backlog_column(
             [e["nums"] for e in detail_rows] or [e["nums"] for e in total_rows]
         )
+        if col is None and not checked:
+            # 항등식을 세울 숫자가 모자란 표(기납품액 없이 수주총액|수주잔고 두
+            # 칸뿐). 그래도 머리글이 어느 칸이 잔고인지 이름으로 말해 준다.
+            # 실측(씨에스윈드 20260318001110): '구분|수주총액|수주잔고' 3칸 표라
+            # 검산이 못 돌아 단일 값 경로로 새고 첫 줄(1,147)만 읽혀 해상풍력
+            # 31 백만달러가 빠졌다. 머리글과 행의 칸 수가 맞을 때만 이름을 믿는다.
+            col = _named_backlog_column(hrow, k, detail_rows)
         if col is None:
             # 항등식을 세울 수 있는 표(행마다 숫자 3개 이상)인데 검산이 안 맞으면
             # 추측하지 않는다. 진행률·충당금 열을 금액으로 합산한 것이 예전
@@ -891,11 +916,17 @@ def _balance_value_from_row(rows: list[list[str]], row_index: int, *, default_un
     당기 열, 부문 축이면 전부 더한다. 셋 다 아니면 값을 만들지 않는다.
     """
     row = rows[row_index]
-    header = _nearest_header(rows, before=row_index)
+    header, header_index = _nearest_header_with_index(rows, before=row_index)
     if header is None:
         return None
 
     index = _preferred_value_index(header, row)
+    if index is not None:
+        # 수주총액·기납품액·수주잔고마다 수량|금액 두 칸으로 갈라지는 표가 있다.
+        # 머리글이 가리키는 자리는 '수량' 이고 금액은 그 옆이다 - 실측
+        # (포스코인터내셔널 20260318001494): 수주잔고 자리에 '약 38만톤' 이
+        # 들어 있고 금액 '3조 2474억' 은 한 칸 옆이다.
+        index = _amount_column(rows, header_index, index)
     if index is not None and index < len(row):
         try:
             return _amount_to_eok(row[index], default_unit=default_unit)
@@ -913,8 +944,13 @@ def _balance_value_from_row(rows: list[list[str]], row_index: int, *, default_un
         return None
     if kind == "segment":
         # 합계 열이 없는 부문별 표. 부문은 서로 겹치지 않으니 더한 값이 전체다.
+        # 콤마 숫자 칸만 더한다 - 날짜('2022.10.21')도 _amount_to_eok 는 숫자로
+        # 읽기 때문에, 그대로 두면 날짜와 수량까지 금액에 섞인다(실측
+        # 포스코인터내셔널: 날짜 둘과 금액 둘을 더해 64,048억이 나왔다).
         values = []
         for cell in row[1:]:
+            if _plain_number(cell) is None:
+                continue
             try:
                 values.append(_amount_to_eok(cell, default_unit=default_unit))
             except ValueError:
@@ -923,14 +959,38 @@ def _balance_value_from_row(rows: list[list[str]], row_index: int, *, default_un
     return None
 
 
+def _amount_column(rows: list[list[str]], header_index: int, index: int) -> int:
+    """머리글 바로 아래 '수량|금액' 하위 머리글이 있으면 금액 칸으로 옮긴다."""
+    if header_index is None or header_index + 1 >= len(rows):
+        return index
+    sub = rows[header_index + 1]
+    if not _is_label_row(sub) or "금액" not in "".join(sub):
+        return index
+    for offset in (0, 1):
+        at = index + offset
+        if at < len(sub) and sub[at].replace(" ", "") == "금액":
+            return at
+    return index
+
+
 _PERIOD_HEADER_WORDS = ("당기", "전기", "당반기", "전반기", "당분기", "전분기",
                         "당해", "전년", "기초", "기말")
+
+
+_METRIC_HEADER_WORDS = ("수주총액", "기납품액", "수량", "금액", "일자", "납기",
+                        "진행률", "비고", "발주처", "공사명", "품목")
 
 
 def _header_axis_kind(header: list[str]) -> str | None:
     """머리글의 값 열들이 기간인지 부문인지. 판정이 안 되면 None."""
     cells = [cell.replace(" ", "") for cell in header[1:] if cell.strip()]
     if not cells:
+        return None
+    # 열이 부문(회사·지역)이 아니라 지표(수주총액·기납품액·수량·금액)면 더하면
+    # 안 된다. 서로 다른 것을 더하는 셈이다.
+    if any(any(word in cell for word in _METRIC_HEADER_WORDS) for cell in cells):
+        return None
+    if any(any(keyword in cell for keyword in BACKLOG_KEYWORDS) for cell in cells):
         return None
     if all(any(word in cell for word in _PERIOD_HEADER_WORDS)
            or _normalize_period(cell) is not None for cell in cells):
@@ -954,6 +1014,19 @@ def _current_period_index(header: list[str]) -> int | None:
     if years:
         return max(years)[1]
     return 1 if len(header) > 1 else None
+
+
+def _nearest_header_with_index(
+    rows: list[list[str]], *, before: int
+) -> tuple[list[str] | None, int | None]:
+    for index in range(before - 1, -1, -1):
+        row = rows[index]
+        if not _is_label_row(row):
+            continue
+        joined = "".join(row).replace(" ", "")
+        if "구분" in joined or "합계" in joined or any(keyword in joined for keyword in BACKLOG_KEYWORDS):
+            return row, index
+    return None, None
 
 
 def _nearest_header(rows: list[list[str]], *, before: int) -> list[str] | None:
@@ -1130,6 +1203,9 @@ def _amount_to_eok(value: str, *, default_unit: str | None = None) -> float:
         raise ValueError("amount not found")
     if re.search(r"[가-힣A-Za-z]", text) and not any(unit in text for unit in ("조", "억원", "억", "백만원", "천원", "원")):
         raise ValueError("numeric footnote or label")
+    compound = _compound_amount(text)
+    if compound is not None:
+        return compound
     number = float(match.group(0).replace(",", ""))
     if "조" in text:
         return number * 10000
@@ -1150,6 +1226,30 @@ def _amount_to_eok(value: str, *, default_unit: str | None = None) -> float:
     if default_unit == "원":
         return number / 100000000
     return number
+
+
+_COMPOUND_AMOUNT_RE = re.compile(
+    r"^(?:약)?((?:\d[\d,]*(?:\.\d+)?(?:조|억원|억))+)(?:원)?$")
+_COMPOUND_PART_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)(조|억원|억)")
+
+
+def _compound_amount(text: str) -> float | None:
+    """'3조 2474억'처럼 단위를 두 번 쓴 금액. 억원으로 환산해 돌려준다.
+
+    실측(포스코인터내셔널 20260318001494): LNG 장기계약 수주잔고가 숫자가 아니라
+    '3조 2474억'으로 적혀 있다. 앞 숫자만 읽으면 3조(30,000억)가 돼 2,474억이
+    사라진다. 단위가 하나뿐인 값('4,100억원')은 여기서 처리하지 않는다.
+    """
+    if not _COMPOUND_AMOUNT_RE.match(text):
+        return None
+    parts = _COMPOUND_PART_RE.findall(text)
+    if len(parts) < 2:
+        return None
+    total = 0.0
+    for number, unit in parts:
+        value = float(number.replace(",", ""))
+        total += value * 10000 if unit == "조" else value
+    return total
 
 
 def _format_value(value: float) -> str:

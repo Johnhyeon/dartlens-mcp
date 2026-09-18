@@ -1465,3 +1465,95 @@ class NearbyUnitNoteTests(unittest.TestCase):
         tables = extract_document_tables(_unit_note_xml(big))
         data = [t for t in tables if len(t.rows) > 2][0]
         self.assertEqual(data.unit_hint, "")
+
+
+# ---------------------------------------------------------------------------
+# 수량|금액 두 칸으로 갈라진 표, 한글로 적은 금액, 열 두 개짜리 표
+# (포스코인터내셔널 20260318001494 / 씨에스윈드 20260318001110)
+# ---------------------------------------------------------------------------
+
+
+class CompoundAmountTests(unittest.TestCase):
+    def test_trillion_plus_hundred_million(self):
+        from dartlens._order_backlog import _amount_to_eok
+
+        self.assertEqual(_amount_to_eok("3조 2474억"), 32474.0)
+        self.assertEqual(_amount_to_eok("1조 500억원"), 10500.0)
+
+    def test_single_unit_amounts_unchanged(self):
+        from dartlens._order_backlog import _amount_to_eok
+
+        self.assertEqual(_amount_to_eok("3.2조"), 32000.0)
+        self.assertEqual(_amount_to_eok("4,100억원"), 4100.0)
+        self.assertEqual(_amount_to_eok("1,250,000", default_unit="백만원"), 12500.0)
+
+    def test_quantity_text_is_not_an_amount(self):
+        from dartlens._order_backlog import _amount_to_eok
+
+        with self.assertRaises(ValueError):
+            _amount_to_eok("약 38만톤")
+
+
+class QuantityAmountPairTests(unittest.TestCase):
+    """수주총액·기납품액·수주잔고마다 수량|금액 두 칸으로 갈라지는 표."""
+
+    TABLE = DocumentTable(
+        caption="(기준일: 2025.12.31)",
+        rows=[
+            ["품목", "수주일자", "납기", "수주총액", "", "기납품액", "", "수주잔고", ""],
+            ["품목", "수주일자", "납기", "수량", "금액", "수량", "금액", "수량", "금액"],
+            ["LNG", "2022.10.21", "2026.11.01~2041.10.31", "약 38만톤", "3조 2474억",
+             "-", "-", "약 38만톤", "3조 2474억"],
+        ],
+    )
+
+    def test_amount_column_is_used_not_the_quantity_column(self):
+        point = extract_order_backlog_point([self.TABLE], period="2025")
+        self.assertIsNotNone(point)
+        self.assertEqual(point.value, 32474.0)
+
+    def test_dates_and_quantities_are_never_summed(self):
+        """예전엔 부문 축으로 오인해 날짜(2022.10)까지 더해 64,048이 나왔다."""
+        point = extract_order_backlog_point([self.TABLE], period="2025")
+        self.assertNotAlmostEqual(point.value, 64048.21, places=2)
+
+    def test_metric_header_is_not_a_segment_axis(self):
+        from dartlens._order_backlog import _header_axis_kind
+
+        self.assertIsNone(_header_axis_kind(
+            ["품목", "수주일자", "납기", "수주총액", "기납품액", "수주잔고"]))
+        self.assertEqual(_header_axis_kind(
+            ["구 분", "물품취급장비부문", "건설업부문", "물류사업부문"]), "segment")
+
+
+class NamedBacklogColumnTests(unittest.TestCase):
+    """기납품액이 없어 항등식을 못 세우는 두 칸짜리 표(씨에스윈드)."""
+
+    def test_named_column_is_summed_across_rows(self):
+        table = DocumentTable(
+            caption="(단위: 백만달러)",
+            rows=[
+                ["구분", "수주총액", "수주잔고"],
+                ["풍력타워 제조", "1,520", "1,147"],
+                ["해상풍력 하부구조물", "-", "31"],
+            ],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.point.value, 1178.0)      # 첫 줄 1,147 이 아니다
+        self.assertEqual(snap.value_unit, "백만달러")
+
+    def test_misaligned_rows_are_refused(self):
+        """머리글과 행의 칸 수가 다르면 이름이 가리키는 자리가 밀린다."""
+        table = DocumentTable(
+            caption="(단위: 백만원)",
+            rows=[
+                ["구분", "수주총액", "수주잔고"],
+                ["풍력타워", "2024-01-01", "1,520", "1,147"],
+                ["하부구조물", "2024-02-01", "100", "31"],
+            ],
+        )
+        from dartlens._order_backlog import _contract_detail_extract
+
+        info = _contract_detail_extract(table)
+        self.assertTrue(info is None or info.get("_failed"))
