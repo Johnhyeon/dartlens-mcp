@@ -1610,3 +1610,85 @@ class ScopeNoteTests(unittest.TestCase):
         data = [t for t in tables if len(t.rows) > 2][0]
         self.assertIn("주요 수주사항", data.intro)
         self.assertNotIn("단위", data.intro)
+
+
+# ---------------------------------------------------------------------------
+# 수량 열이 항등식을 통과해 금액 대신 뽑히던 것 / 발주처 이름의 '원'을 단위로
+# 읽던 것 (코오롱글로벌 20230814002221 / 한전기술 20260326001003)
+# ---------------------------------------------------------------------------
+
+
+class QuantityColumnVoteTests(unittest.TestCase):
+    TABLE = DocumentTable(
+        caption="(단위 : 백만원)",
+        rows=[
+            ["품목", "수주일자", "납기", "수주총액", "", "기납품액", "", "수주잔고", ""],
+            ["품목", "수주일자", "납기", "수량", "금액", "수량", "금액", "수량", "금액"],
+            ["세운 4구역", "2019-01-15", "2023-12-31", "1", "437,324", "1", "6,880", "1", "430,444"],
+            ["힐스테이트 A", "2020-03-02", "2024-06-30", "1", "220,000", "1", "20,000", "1", "200,000"],
+            ["합계", "", "", "237", "16,380,451", "237", "6,514,212", "237", "9,866,239"],
+        ],
+    )
+
+    def test_amount_column_wins_over_quantity_column(self):
+        snap = extract_order_backlog_snapshot([self.TABLE], period="2022")
+        self.assertIsNotNone(snap)
+        # 9,866,239 백만원 = 98,662.39억. 수량 237(2.37억)이 아니다.
+        self.assertAlmostEqual(snap.point.value, 98662.39, places=2)
+
+    def test_trivial_identity_does_not_vote(self):
+        """'1 = 1 + 1' 은 허용오차 하한(2.0) 덕에 통과하던 시시한 식이다."""
+        from dartlens._order_backlog import _identity_backlog_column
+
+        col, checked = _identity_backlog_column([{0: 1.0, 1: 1.0, 2: 1.0}])
+        self.assertIsNone(col)
+
+
+class UnitContextTests(unittest.TestCase):
+    """단위는 '단위'라고 적힌 자리에서만 읽는다."""
+
+    def test_client_name_is_not_a_unit(self):
+        from dartlens._order_backlog import _table_unit
+
+        table = DocumentTable(
+            caption="(기준일 : 2025.12.31)",
+            rows=[
+                ["구분", "발주처", "사업명", "기본도급액", "완성공사액", "계약잔액"],
+                ["원자력", "한국수력원자력", "새울3,4호기 종합설계용역", "5,174", "5,079", "95"],
+            ],
+        )
+        self.assertIsNone(_table_unit(table))      # '한국수력원자력'의 '원'이 아니다
+
+    def test_declared_unit_is_still_read(self):
+        from dartlens._order_backlog import _table_unit
+
+        for caption in ("(단위 : 억원)", "(단위: 천원)", "(단위 : 백만원, %)",
+                        "수주상황 (단위 : 백만원)", "(기준일 : 2026.06.30) (단위 : 억원)"):
+            table = DocumentTable(caption=caption, rows=[["구분", "계약잔액"]])
+            self.assertIsNotNone(_table_unit(table), caption)
+
+    def test_bare_unit_cell_is_read(self):
+        from dartlens._order_backlog import _table_unit
+
+        table = DocumentTable(caption="수주현황",
+                              rows=[["구분", "계약잔액", "(백만원)"]])
+        self.assertEqual(_table_unit(table), "백만원")
+
+
+class NoBacklogTableMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_says_the_company_does_not_disclose(self):
+        async def fake_zip(rcept_no):
+            return rcept_no.encode()
+
+        reports = [{"report_nm": "사업보고서 (2025.12)", "rcept_no": "20260319001265",
+                    "rcept_dt": "20260319"}]
+        with (
+            patch("dartlens._safe.is_licensed", return_value=True),
+            patch.object(server, "_fetch_disclosure_list",
+                         AsyncMock(return_value={"list": reports})),
+            patch.object(server, "_fetch_document_zip", AsyncMock(side_effect=fake_zip)),
+            patch.object(server, "extract_document_tables", side_effect=lambda raw: []),
+        ):
+            text = await server.get_order_backlog("01032486", years=3)
+        body = text.split("RESULT_META_JSON_START")[0]
+        self.assertIn("수주잔고를 공시하지 않는 회사", body)

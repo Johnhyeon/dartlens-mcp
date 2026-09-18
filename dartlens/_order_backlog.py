@@ -392,8 +392,16 @@ def _identity_backlog_column(numeric_rows: list[dict]) -> int | None:
     기납품액을 차감액으로 보아 음수로 적는 표가 있다(한화오션). 부호만 다를 뿐
     같은 항등식이므로 가운데 항은 절댓값으로 본다. 수주총액·수주잔고는 음수일
     수 없으니 그 조건은 그대로 둔다.
+
+    수량|금액 쌍 표에서는 수량 열도 같은 항등식을 세운다. 반올림을 봐주려고 둔
+    허용오차 하한(2.0) 때문에 '1 = 1 + 1' 같은 시시한 식까지 통과해, 금액 열과
+    표를 나눠 갖고 득표가 비겨 버린다 - 실측(코오롱글로벌 2022 반기보고서
+    20230814002221)에서 수량 열이 뽑혀 9.87조가 237백만원(2.4억)으로 나갔다.
+    그래서 (1) 눈에 띄게 작은 값의 식은 세지 않고, (2) 여러 열이 통과하면
+    금액이 큰 열을 고른다. 수량은 금액 옆에서 늘 훨씬 작다.
     """
     votes: dict[int, int] = {}
+    weight: dict[int, float] = {}
     checked = 0
     for nums in numeric_rows:
         idxs = sorted(nums)
@@ -407,16 +415,26 @@ def _identity_backlog_column(numeric_rows: list[dict]) -> int | None:
                     va, vb, vc = nums[a], nums[b], nums[c]
                     if va <= 0 or vc < 0:
                         continue
+                    # 허용오차 하한보다 작은 값끼리 맞춘 식은 우연이다.
+                    if va < _IDENTITY_MIN_VALUE:
+                        continue
                     if abs(va - (abs(vb) + vc)) <= max(2.0, va * 0.005):
                         votes[c] = votes.get(c, 0) + 1
+                        weight[c] = weight.get(c, 0.0) + vc
     if checked == 0:
         return None, 0
     if not votes:
         return None, checked
-    best, count = max(votes.items(), key=lambda kv: kv[1])
-    if count >= max(1, int(checked * 0.7)):
-        return best, checked
-    return None, checked
+    floor = max(1, int(checked * 0.7))
+    passed = [c for c, count in votes.items() if count >= floor]
+    if not passed:
+        return None, checked
+    return max(passed, key=lambda c: (weight.get(c, 0.0), votes[c])), checked
+
+
+# 항등식 허용오차 하한(2.0)보다 충분히 큰 값만 센다. 수량 1·2 같은 칸이
+# 우연히 식을 맞추는 것을 막는다.
+_IDENTITY_MIN_VALUE = 100.0
 
 
 _TOTAL_REF_RE = re.compile(r"\([^()]*\)$")
@@ -1181,17 +1199,47 @@ _FOREIGN_UNITS = (
 
 
 def _table_unit(table: DocumentTable) -> str | None:
-    unit = _unit_from_text(
-        table.caption + " " + " ".join(" ".join(row) for row in table.rows[:3]))
-    if unit is not None:
-        return unit
+    """이 표의 금액 단위. '단위'라고 적힌 자리에서만 읽는다.
+
+    예전엔 캡션과 앞 세 줄을 통째로 훑어 '원'·'억원' 같은 글자를 찾았다. 발주처
+    이름에 그 글자가 들어가면 그게 단위가 된다 - 실측(한전기술 2025 사업보고서
+    20260326001003): 발주처 '한국수력원자력'의 '원' 때문에 단위가 원으로 잡혀
+    310억이 310원이 됐고, 표 전체가 0이 돼 일곱 기간이 '검산 이상'으로 빠졌다.
+    """
+    for text in (table.caption, *(cell for row in table.rows[:3] for cell in row)):
+        unit = _unit_from_text(text)
+        if unit is not None:
+            return unit
     # 표 자체에 표기가 없을 때만, 바로 앞에 따로 얹힌 단위 쪽지를 본다.
     # 표에 표기가 있으면 그게 우선이다 - 남의 쪽지가 이겨선 안 된다.
     return _unit_from_text(table.unit_hint)
 
 
-def _unit_from_text(haystack: str) -> str | None:
-    normalized = (haystack or "").replace(" ", "")
+_UNIT_CONTEXT_RE = re.compile(r"단위[:：]?([^)\]]{0,24})")
+
+
+def _unit_from_text(text: str) -> str | None:
+    """'단위 : ○○' 표기, 또는 칸 전체가 단위 하나인 경우만 단위로 본다."""
+    normalized = (text or "").replace(" ", "")
+    if not normalized:
+        return None
+    fragments = _UNIT_CONTEXT_RE.findall(normalized)
+    if not fragments:
+        bare = normalized.strip("()[]:,·")
+        if bare in _BARE_UNIT_TOKENS:
+            fragments = [bare]
+        else:
+            return None
+    return _match_unit("|".join(fragments))
+
+
+_BARE_UNIT_TOKENS = frozenset(
+    {"백만원", "천원", "억원", "원", "백만달러", "천달러", "달러",
+     "백만불", "천불", "USD", "US$", "천USD", "백만USD"}
+)
+
+
+def _match_unit(normalized: str) -> str | None:
     # 외화가 먼저다 - "백만달러"에서 "원"을 찾으면 안 되고, 실측(삼성바이오로직스)
     # 에서 '(단위: 백만 달러)' 표가 단위 미인식 -> 억원 가정으로 나가
     # 12,355 백만달러(약 18조원)가 12,355억원으로 읽혔다.

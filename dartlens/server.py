@@ -2059,6 +2059,8 @@ def _backlog_period_key(point) -> tuple[int, int]:
     return _period_key(point.period)
 
 
+_NO_BACKLOG_TABLE = "보고서에 수주잔고·계약잔액 표 없음"
+
 _BACKLOG_METHOD_LABELS = {
     "ending_balance": "계약잔액 주석",
     "contract_detail": "수주 상세표",
@@ -2213,7 +2215,7 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             continue
         snapshot = extract_order_backlog_snapshot(tables, period=period)
         if snapshot is None:
-            failed_periods[period] = "구조화 가능한 수주잔고 표 없음"
+            failed_periods[period] = _NO_BACKLOG_TABLE
             continue
         if snapshot.anomalous:
             # 요구 5: 단일 세부 계약보다 작은 전체 잔고를 자동 확정하지 않는다.
@@ -2296,10 +2298,21 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             unit=point_unit,
         )
 
+    # 표를 못 읽은 것과, 공시에 표가 아예 없는 것은 다른 이야기다. 뒤엣것은
+    # 수주잔고를 공시하지 않는 업종(대리점 유통·양산 제조 등)이라는 뜻이고,
+    # 그때는 다른 보고서를 더 찾아봐도 나오지 않는다.
+    none_found = bool(failed_periods) and all(
+        why == _NO_BACKLOG_TABLE for why in failed_periods.values())
+    headline = (
+        "확인한 정기보고서에 수주잔고·계약잔액 표가 없습니다. "
+        "수주잔고를 공시하지 않는 회사입니다 - 업종에 따라 공시 의무가 없습니다."
+        if none_found else
+        "정기보고서에서 구조화 가능한 수주잔고 표를 찾지 못했습니다."
+    )
     lines = [
         f"# 수주잔고 추이 (corp_code={cc})",
         "",
-        "정기보고서에서 구조화 가능한 수주잔고 표를 찾지 못했습니다.",
+        headline,
         "",
         "확인한 보고서:",
     ]
