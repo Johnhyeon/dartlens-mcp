@@ -1243,3 +1243,143 @@ class ValueColumnChoiceTests(unittest.TestCase):
             ["기말계약잔액", "44,350,193", "9,586,022", "56,381,302"],
         ]
         self.assertEqual(_nearest_header(rows, before=3), rows[1])
+
+
+# ---------------------------------------------------------------------------
+# 합계행을 못 알아보거나, 겹치는 표를 더하거나, 표를 아예 못 읽던 회귀
+# (금호건설 20240318000777 / 두산에너빌리티 20260320001246 /
+#  계룡건설 20240319000660 / 태영건설 20240927000935 / 한국항공우주 20260318001461)
+# ---------------------------------------------------------------------------
+
+
+class TotalRowLabelTests(unittest.TestCase):
+    """회사마다 합계행을 다르게 적는다. 놓치면 소계까지 더해 몇 배가 된다."""
+
+    def test_reference_suffix_is_ignored(self):
+        from dartlens._order_backlog import _is_total_row
+
+        for label in ("총계(E=C+D)", "해외합계(D)", "국내합계(C=A+B)", "해외토목 계(D)"):
+            self.assertTrue(_is_total_row([label]), label)
+
+    def test_total_word_at_the_front(self):
+        from dartlens._order_backlog import _is_total_row
+
+        self.assertTrue(_is_total_row(["합계 - 전체"]))
+        self.assertTrue(_is_total_row(["소계 (국내)"]))
+
+    def test_spaced_and_nested_labels(self):
+        from dartlens._order_backlog import _is_total_row
+
+        for label in ("합 계", "국내 / 해외 합계", "계", "국내합계"):
+            self.assertTrue(_is_total_row([label]), label)
+
+    def test_ordinary_labels_are_not_totals(self):
+        from dartlens._order_backlog import _is_total_row
+
+        for label in ("기타", "설계", "토목설계", "국내 토목", "회계법인",
+                      "호남고속철도2단계(고막원~목포) 제2공구 건설공사"):
+            self.assertFalse(_is_total_row([label]), label)
+
+
+class NestedSubtotalTests(unittest.TestCase):
+    def test_grand_total_among_nested_subtotals(self):
+        from dartlens._order_backlog import _grand_total
+
+        # 금호건설 실측: 국내토목 계·국내건축 합계·국내합계·해외토목 계·해외합계·총계
+        values = [2375225.0, 4617143.0, 6992368.0, 100177.0, 100177.0, 7092545.0]
+        self.assertEqual(_grand_total(values), 7092545.0)
+
+    def test_unrelated_totals_are_still_refused(self):
+        from dartlens._order_backlog import _grand_total
+
+        self.assertIsNone(_grand_total([100.0, 500.0, 900.0]))
+
+
+class OverlappingTableTests(unittest.TestCase):
+    """같은 공사가 두 표에 실리면 더하지 않는다."""
+
+    @staticmethod
+    def _table(caption, projects):
+        rows = [["구분", "공사명", "발주처", "수주총액", "완성공사액", "계약잔액"]]
+        for name, total, done, left in projects:
+            rows.append(["국내", name, "발주처", f"{total:,}", f"{done:,}", f"{left:,}"])
+        return DocumentTable(caption=caption, rows=rows)
+
+    FULL = [("A현장", 100000, 40000, 60000), ("B현장", 80000, 30000, 50000),
+            ("C현장", 60000, 20000, 40000), ("D현장", 40000, 10000, 30000)]
+
+    def test_excerpt_table_is_not_added_to_the_full_one(self):
+        full = self._table("(단위 : 백만원) 전체 공사", self.FULL)
+        excerpt = self._table("(단위 : 백만원) 주요 공사", self.FULL[:3])
+        snap = extract_order_backlog_snapshot([full, excerpt], period="2025")
+        self.assertAlmostEqual(snap.point.value, 1800.0, places=2)   # 60+50+40+30 백만원
+        self.assertEqual(len(snap.tables), 1)
+        self.assertTrue(any("발췌" in w for w in snap.warnings), snap.warnings)
+
+    def test_different_projects_are_still_summed(self):
+        first = self._table("(단위 : 백만원)", self.FULL[:2])
+        second = self._table("(단위 : 백만원)", [("E현장", 50000, 20000, 30000),
+                                                 ("F현장", 30000, 10000, 20000),
+                                                 ("G현장", 20000, 5000, 15000)])
+        snap = extract_order_backlog_snapshot([first, second], period="2025")
+        self.assertAlmostEqual(snap.point.value, 1750.0, places=2)
+        self.assertEqual(len(snap.tables), 2)
+
+    def test_two_row_tables_are_not_merged_by_label(self):
+        """'관계사/비관계사'처럼 이름이 같은 두어 줄짜리 표는 겹침 근거가 못 된다."""
+        def tiny(left):
+            return DocumentTable(caption="(단위 : 백만원)", rows=[
+                ["구분", "수주총액", "완성공사액", "계약잔액"],
+                ["관계사", f"{left * 3:,}", f"{left * 2:,}", f"{left:,}"],
+                ["비관계사", "-", "-", "-"],
+            ])
+        snap = extract_order_backlog_snapshot([tiny(9262), tiny(5998)], period="2025")
+        self.assertEqual(len(snap.tables), 2)
+        self.assertAlmostEqual(snap.point.value, (9262 + 5998) / 100, places=2)
+
+
+class DetailHeaderWordTests(unittest.TestCase):
+    def test_site_name_header_is_recognised_as_detail_table(self):
+        """계룡건설 표는 첫 열이 '현장명'이라 상세표로 안 잡혔다."""
+        table = DocumentTable(
+            caption="(단위 : 백만원 )",
+            rows=[
+                ["현장명", "착공일", "완공예정일", "총 도급금액", "완성공사액", "계약잔액"],
+                ["인천검단 택지개발 조경1-2", "2019-12-02", "2024-06-30", "26,562", "24,958", "1,604"],
+                ["충북대병원 의생명진료연구동", "2020-01-15", "2024-09-17", "25,400", "23,531", "1,869"],
+                ["기    타", "", "", "6,513,225", "1,101,647", "5,411,578"],
+                ["합    계", "", "", "14,518,383", "5,120,396", "9,397,987"],
+            ],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertIsNotNone(snap)
+        self.assertAlmostEqual(snap.point.value, 93979.87, places=2)
+        self.assertIn("원문 합계행", snap.tables[0]["method"])
+
+
+class TransposedRollforwardTests(unittest.TestCase):
+    """행이 당기·전기, 열이 기초→이월인 표(한국항공우주)."""
+
+    TABLE = DocumentTable(
+        caption="가. 당기와 전기 중 공사계약 잔액의 변동내역은 다음과 같습니다.",
+        rows=[
+            ["(단위: 천원)", "", "", "", "", ""],
+            ["구분", "기초계약잔액", "증감액(*1)", "사업결합으로인한 증감", "수익인식", "이월계약잔액(*2)"],
+            ["당기", "6,797,434,572", "1,184,026,555", "37,070,697", "(1,739,692,038)", "6,278,839,786"],
+            ["전기", "8,122,814,460", "402,842,589", "-", "(1,728,222,477)", "6,797,434,572"],
+        ],
+    )
+
+    def test_current_period_ending_balance_is_read(self):
+        point = extract_order_backlog_point([self.TABLE], period="2025")
+        self.assertIsNotNone(point)
+        self.assertAlmostEqual(point.value, 62788.39786, places=3)
+
+    def test_rollforward_stages_are_never_summed(self):
+        point = extract_order_backlog_point([self.TABLE], period="2025")
+        stages = (6797434572 + 1184026555 + 37070697 - 1739692038 + 6278839786) / 100000
+        self.assertNotAlmostEqual(point.value, stages, places=2)
+
+    def test_prior_period_row_is_not_used(self):
+        point = extract_order_backlog_point([self.TABLE], period="2025")
+        self.assertNotAlmostEqual(point.value, 67974.34572, places=3)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 from dataclasses import dataclass
 
@@ -9,6 +10,8 @@ from dartlens._document_tables import DocumentTable
 
 
 BACKLOG_KEYWORDS = ("수주잔고", "수주잔액", "계약잔액", "계약잔고", "남은 수행의무")
+# 공사·계약 상세표임을 알려주는 머리글 낱말(회사마다 다르게 적는다)
+_DETAIL_HEADER_WORDS = ("품목", "발주처", "구분", "현장명", "공사명", "사업명", "계약명")
 ENDING_BALANCE_KEYWORDS = ("기말계약잔액", "기말공사계약잔액", "기말공사 계약잔액", "기말잔액")
 
 
@@ -112,6 +115,35 @@ def extract_order_backlog_snapshot(
         # 있다. 실측(한화에어로스페이스 2025 사업보고서 20260316001112): 요약표
         # 합계 116,800,729천원과 상세표 '계' 116,800,728천원이 같은 값인데, 그대로
         # 더해 168.8조가 나갔다(원문 116.8조). 명시 합계가 같은 표는 한 번만 센다.
+        # 한 보고서가 같은 공사를 두 표에 싣는 경우가 있다.
+        # - 금호건설 20240318000777: 전체 공사 145행 표(총계 7.1조) 옆에 주요
+        #   공사 26건만 뽑은 표가 따로 있다.
+        # - 두산에너빌리티 20260320001246: 같은 공사 목록이 당기·전기 두 벌이다
+        #   (공사명 36개 중 34개가 같다). 예전엔 둘을 더해 14.8조가 26.1조로 나갔다.
+        # 행 이름이 더 많은 표를 남기고, 그 표에 대부분 들어 있는 표는 뺀다.
+        # 금액이 아니라 포함 관계로 고른다 - 잔고가 줄어든 해에는 전기 쪽이 더
+        # 클 수 있어서 큰 값을 남기면 옛날 표가 남는다.
+        by_size = sorted(extracted,
+                         key=lambda i: (len(i.get("_keys") or ()), i["eok_sum"]),
+                         reverse=True)
+        keep_ids: list[int] = []
+        for info in by_size:
+            keys = info.get("_keys") or set()
+            # 행 이름이 두어 개뿐인 표(예: 관계사/비관계사 구분표)는 이름이 같아도
+            # 같은 내역이라는 근거가 못 된다. 목록다운 표에만 적용한다.
+            covered = len(keys) >= 3 and any(
+                len(keys & (other.get("_keys") or set())) >= len(keys) * 0.7
+                for other in by_size if id(other) in keep_ids
+            )
+            if covered:
+                warnings.append(
+                    f"표 '{(info.get('caption') or '무제')[:30]}'의 공사들이 더 큰 표에 "
+                    "그대로 들어 있어 같은 내역을 발췌한 목록으로 보고 합산에서 뺐습니다."
+                )
+                continue
+            keep_ids.append(id(info))
+        extracted = [i for i in extracted if id(i) in keep_ids]
+
         deduped: list[dict] = []
         for info in extracted:
             twin = next(
@@ -165,6 +197,7 @@ def extract_order_backlog_snapshot(
         max_detail = max(i["_max_detail"] for i in extracted)
         for i in extracted:
             i.pop("_max_detail", None)
+            i.pop("_keys", None)
         anomalous = value < max_detail * 0.999
         if anomalous:
             warnings.append(
@@ -385,35 +418,61 @@ def _identity_backlog_column(numeric_rows: list[dict]) -> int | None:
     return None, checked
 
 
+_TOTAL_REF_RE = re.compile(r"\([^()]*\)$")
+
+
 def _is_total_row(labels: list[str]) -> bool:
     """라벨 칸 중 하나라도 합계를 뜻하면 합계행이다.
 
     '합 계'(띄어쓴 것)·'국내합계'·'국내 / 해외 합계'·'계' 가 모두 해당한다.
+    라벨 끝에 붙은 참조 기호도 떼고 본다 - 실측(금호건설 2023 사업보고서
+    20240318000777)의 합계 행은 '총계(E=C+D)'·'해외합계(D)'·'해외토목 계(A)'
+    처럼 적혀 있어, 그대로 보면 전부 세부행으로 세어 7.1조가 33.0조가 됐다.
     """
     for label in labels:
-        squeezed = label.replace(" ", "")
+        bare = _TOTAL_REF_RE.sub("", label).strip()
+        squeezed = bare.replace(" ", "")
         if squeezed in _TOTAL_LABELS:
             return True
         if squeezed.endswith("합계") or squeezed.endswith("총계"):
             return True
+        # '합계 - 전체'처럼 합계를 앞에 적는 표가 있다(태영건설 20240927000935).
+        # 그대로 두면 합계행이 세부행으로 섞여 6.2조가 20.9조가 된다.
+        if squeezed.startswith(("합계", "총계", "소계")):
+            return True
+        # '해외토목 계' 처럼 띄어 쓴 소계. '설계'·'통계' 같은 낱말에 걸리지 않게
+        # 앞에 띄어쓰기가 있는 '계' 만 본다.
+        if bare.endswith(" 계"):
+            return True
     return False
+
+
+_MAX_TOTAL_ROWS_TO_COMBINE = 12
 
 
 def _grand_total(values: list[float]) -> float | None:
     """합계행이 여럿일 때 '전체 합계' 하나를 고른다.
 
-    수주상황 표는 국내합계·해외합계·국내/해외 합계처럼 소계와 총계가 같이 있다.
-    가장 큰 값이 나머지의 합과 맞으면 그게 총계다(자가검증). 관계가 안 맞으면
-    어느 것이 총계인지 지어내지 않고 없음을 돌려준다.
+    수주상황 표는 소계가 여러 단으로 쌓인다 - 금호건설은 국내토목 계, 국내건축
+    합계, 국내합계, 해외토목 계, 해외합계, 총계까지 여섯 줄이다. 가장 큰 값이
+    나머지 중 어떤 조합의 합과 맞으면 그게 총계다(자가검증: 총계 7,092,545 =
+    국내합계 6,992,368 + 해외합계 100,177). 맞는 조합이 없으면 어느 것이
+    총계인지 지어내지 않고 없음을 돌려준다.
     """
     if not values:
         return None
     if len(values) == 1:
         return values[0]
     ordered = sorted(values, reverse=True)
-    biggest, rest = ordered[0], sum(ordered[1:])
-    if abs(biggest - rest) <= max(1.0, abs(biggest) * 0.01):
+    biggest, rest = ordered[0], ordered[1:]
+    tolerance = max(1.0, abs(biggest) * 0.01)
+    if abs(biggest - sum(rest)) <= tolerance:
         return biggest
+    if len(rest) <= _MAX_TOTAL_ROWS_TO_COMBINE:
+        for size in range(1, len(rest) + 1):
+            for combo in itertools.combinations(rest, size):
+                if abs(biggest - sum(combo)) <= tolerance:
+                    return biggest
     return None
 
 
@@ -452,6 +511,17 @@ def _total_cell_is_broken(total: dict, detail_rows: list[dict], col: int) -> boo
     return False
 
 
+_ROLLFORWARD_STAGE_WORDS = ("기초", "증감", "수익인식", "이월", "취득", "처분",
+                            "상각", "설정", "환입", "대체")
+
+
+def _is_rollforward_header(normalized: list[str]) -> bool:
+    """열이 기초→증감→기말 단계로 늘어선 표인가(계약별 상세표가 아니다)."""
+    stages = sum(1 for cell in normalized
+                 if any(word in cell for word in _ROLLFORWARD_STAGE_WORDS))
+    return stages >= 2
+
+
 def _contract_detail_extract(table: DocumentTable) -> dict | None:
     """계약별 상세표(품목|발주처|...|수주잔고|...)에서 수주잔고 열을 합산한다."""
     default_unit = _table_unit(table)
@@ -462,7 +532,17 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
                   if any(kw in c for kw in BACKLOG_KEYWORDS)), None)
         if k is None:
             continue
-        if not any(("품목" in c) or ("발주처" in c) or ("구분" in c) for c in norm):
+        # 공사 상세표의 첫 열 이름은 회사마다 다르다. 실측(계룡건설 2023
+        # 사업보고서 20240319000660)은 '현장명' 이라 이 조건에 안 걸렸고, 표
+        # 전체가 단일 값 경로로 새서 115행 중 공사 한 줄(571억)만 읽혔다.
+        # 그 표의 원문 합계는 9,397,987 백만원(9.4조)이다.
+        if not any(any(word in c for word in _DETAIL_HEADER_WORDS) for c in norm):
+            continue
+        # 열이 기초→증감→수익인식→이월인 롤포워드 표는 계약별 상세표가 아니다.
+        # 실측(한국항공우주 2025 사업보고서 20260318001461): 행이 당기·전기고
+        # 열이 단계라, 3항 항등식이 성립할 리 없는데도 검산 실패로 표시돼
+        # 단일 값 경로까지 막혔다. 그 표의 당기 이월계약잔액은 6.28조다.
+        if _is_rollforward_header(norm):
             continue
 
         detail_rows: list[dict] = []
@@ -565,6 +645,11 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
         if foreign:
             warnings.append(_foreign_unit_warning(default_unit))
         return {
+            # 겹침 판정용 - 상세행마다 가장 긴 라벨(대개 공사명)을 들고 간다.
+            "_keys": {
+                max(e["labels"], key=len).replace(" ", "")
+                for e in detail_rows if e["labels"]
+            },
             "caption": table.caption[:80],
             "unit": default_unit or "표기 없음(억원 가정)",
             "unit_source": "declared" if default_unit else "assumed",
@@ -850,6 +935,9 @@ def _header_axis_kind(header: list[str]) -> str | None:
     if all(any(word in cell for word in _PERIOD_HEADER_WORDS)
            or _normalize_period(cell) is not None for cell in cells):
         return "period"
+    if _is_rollforward_header(cells):
+        # 기초·증감·기말이 열로 늘어선 표. 단계를 더하면 아무 뜻이 없다.
+        return None
     if all(_plain_number(cell) is None for cell in cells):
         return "segment"
     return None
@@ -892,7 +980,8 @@ def _preferred_value_index(header: list[str], row: list[str]) -> int | None:
         # '계'·'소 계'처럼 짧게 적은 합계 열도 합계다(_is_total_row 와 같은 판정).
         if index and index < len(row) and _is_total_row([cell]):
             return index
-    for keyword in ("합계", "수주잔액", "수주잔고", "기말공사계약잔액", "기말계약잔액", "기말잔액"):
+    for keyword in ("합계", "수주잔액", "수주잔고", "기말공사계약잔액", "기말계약잔액",
+                    "기말잔액", "이월계약잔액", "이월잔액", "기말계약잔고"):
         for index, cell in enumerate(normalized):
             if keyword in cell and index < len(row):
                 return index
