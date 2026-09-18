@@ -1383,3 +1383,26 @@ class TransposedRollforwardTests(unittest.TestCase):
     def test_prior_period_row_is_not_used(self):
         point = extract_order_backlog_point([self.TABLE], period="2025")
         self.assertNotAlmostEqual(point.value, 67974.34572, places=3)
+
+
+class ForeignUnitSpellingTests(unittest.TestCase):
+    """'천USD' 를 '달러'로 읽으면 1,000배 어긋난다(일진전기 20240313001767)."""
+
+    def test_thousand_usd_is_not_plain_dollar(self):
+        from dartlens._order_backlog import _table_unit
+
+        table = DocumentTable(caption="(단위 : 천USD )", rows=[["구분", "수주잔고"]])
+        self.assertEqual(_table_unit(table), "천달러")
+
+    def test_million_usd_spellings(self):
+        from dartlens._order_backlog import _table_unit
+
+        for caption in ("(단위: 백만USD)", "(단위: 백만US$)", "(단위 : 백만불)"):
+            table = DocumentTable(caption=caption, rows=[["구분", "수주잔고"]])
+            self.assertEqual(_table_unit(table), "백만달러", caption)
+
+    def test_plain_dollar_still_works(self):
+        from dartlens._order_backlog import _table_unit
+
+        table = DocumentTable(caption="(단위 : USD)", rows=[["구분", "수주잔고"]])
+        self.assertEqual(_table_unit(table), "달러")
