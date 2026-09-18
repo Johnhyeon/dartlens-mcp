@@ -585,8 +585,13 @@ class BacklogToolMetaTests(unittest.IsolatedAsyncioTestCase):
         meta = self._meta(text)
         self.assertEqual(meta["data_completeness"], "none")
 
-    async def test_anomalous_total_is_not_reported_as_backlog(self):
-        """요구 5: 전체 잔고가 단일 세부 계약보다 작으면 자동 확정하지 않는다."""
+    async def test_broken_total_cell_falls_back_to_verified_detail_sum(self):
+        """합계행의 그 칸만 깨졌으면 검산을 통과한 세부합을 쓴다.
+
+        같은 행의 수주총액·기납품액이 세부합과 정확히 맞는데 수주잔고만 세부합보다
+        작으면, 합계가 틀린 게 아니라 그 칸 표기가 깨진 것이다(실측 삼성중공업
+        2024 사업보고서: '315.350'). 어느 쪽이든 261.6억은 전체 잔고로 안 나간다.
+        """
         bad_total = DocumentTable(
             caption="수주상황 (단위 : 백만원)",
             rows=[
@@ -600,7 +605,28 @@ class BacklogToolMetaTests(unittest.IsolatedAsyncioTestCase):
         text = await self._run({self._rcept(2025): [bad_total]}, reports, years=1)
         meta = self._meta(text)
         body = text.split("RESULT_META_JSON_START")[0]
-        # 261.58억원이 전체 잔고로 확정 표기되면 안 된다
+        self.assertNotIn("2025=261.6", body)
+        self.assertIn("2025=48,025.3", body)          # 4,802,526 백만원
+        self.assertTrue(any("깨진" in w for w in meta["warnings"]), meta["warnings"])
+
+    async def test_unexplainable_small_total_is_still_refused(self):
+        """요구 5: 설명이 안 되는 작은 합계는 여전히 자동 확정하지 않는다."""
+        bad_total = DocumentTable(
+            caption="수주상황 (단위 : 백만원)",
+            rows=[
+                ["품목", "발주처", "계약일", "공사기한", "수주총액", "기납품액", "수주잔고", "진행률"],
+                ["체코 Dukovany", "한수원", "2025-12-15", "2038-04-18",
+                 "4,805,196", "2,670", "4,802,526", "0.06"],
+                ["신한울 3,4호기", "한수원", "2023-03-29", "2033-10-31",
+                 "2,341,601", "751,881", "1,589,720", "32.11"],
+                # 어느 칸도 세부합과 맞지 않는다 - 깨진 칸 하나로 설명되지 않는다
+                ["합계", "", "", "", "1,000,000", "1,000", "26,158", ""],
+            ],
+        )
+        reports = [self._report(2025, self._rcept(2025))]
+        text = await self._run({self._rcept(2025): [bad_total]}, reports, years=1)
+        meta = self._meta(text)
+        body = text.split("RESULT_META_JSON_START")[0]
         self.assertNotIn("2025=261.6", body)
         self.assertTrue(
             meta["data_completeness"] in ("none", "partial"), meta["data_completeness"])
@@ -937,13 +963,17 @@ class ParenthesisedNegativeTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _hdec_table(caption, first_row_name="A현장"):
+def _hdec_table(caption, scale=1):
+    """현대건설형 공사별 상세표. 합계행 없이 개별 공사만 있는 축약본."""
+    def amount(value):
+        return f"{value * scale:,}"
+
     return DocumentTable(
         caption=caption,
         rows=[
             ["구분", "공사명", "발주처", "수주총액", "기납품액", "계약잔액"],
-            ["국내", first_row_name, "발주처1", "3,931,885", "312,881", "3,619,004"],
-            ["해외", "B현장", "발주처2", "2,411,552", "903,131", "1,508,421"],
+            ["국내", "A현장", "발주처1", amount(3931885), amount(312881), amount(3619004)],
+            ["해외", "B현장", "발주처2", amount(2411552), amount(903131), amount(1508421)],
         ],
     )
 
@@ -951,7 +981,7 @@ def _hdec_table(caption, first_row_name="A현장"):
 class UnknownUnitSumTests(unittest.TestCase):
     def test_unit_less_table_is_not_summed_with_declared_ones(self):
         snap = extract_order_backlog_snapshot(
-            [_hdec_table("(단위 : 백만원)"), _hdec_table("(2) 현대엔지니어링", "C현장")],
+            [_hdec_table("(단위 : 백만원)"), _hdec_table("(2) 현대엔지니어링", scale=2)],
             period="2024",
         )
         self.assertTrue(snap.unit_unknown)
@@ -959,24 +989,24 @@ class UnknownUnitSumTests(unittest.TestCase):
 
     def test_all_tables_without_unit_are_also_refused(self):
         snap = extract_order_backlog_snapshot(
-            [_hdec_table("다. 수주상황 1) 현대건설"), _hdec_table("2) 현대엔지니어링", "C현장")],
+            [_hdec_table("다. 수주상황 1) 현대건설"), _hdec_table("2) 현대엔지니어링", scale=2)],
             period="2025.06",
         )
         self.assertTrue(snap.unit_unknown)
 
     def test_declared_units_are_unaffected(self):
         snap = extract_order_backlog_snapshot(
-            [_hdec_table("(단위 : 백만원)"), _hdec_table("(단위 : 백만원)", "C현장")],
+            [_hdec_table("(단위 : 백만원)"), _hdec_table("(단위 : 백만원)", scale=2)],
             period="2024",
         )
         self.assertFalse(snap.unit_unknown)
-        self.assertAlmostEqual(snap.point.value, (3619004 + 1508421) * 2 / 100, places=2)
+        self.assertAlmostEqual(snap.point.value, (3619004 + 1508421) * 3 / 100, places=2)
 
 
 class UnknownUnitToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_period_with_unknown_unit_is_reported_missing_not_guessed(self):
         good = [_hdec_table("(단위 : 백만원)")]
-        bad = [_hdec_table("(단위 : 백만원)"), _hdec_table("(2) 현대엔지니어링", "C현장")]
+        bad = [_hdec_table("(단위 : 백만원)"), _hdec_table("(2) 현대엔지니어링", scale=2)]
         tables = {"good": good, "bad": bad}
 
         async def fake_zip(rcept_no):
@@ -1001,3 +1031,135 @@ class UnknownUnitToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("단위 표기 없는 표가 있어", body)
         self.assertNotIn("2024=", body)          # 100배 값이 시계열에 안 들어간다
         self.assertIn("2025=", body)
+
+
+# ---------------------------------------------------------------------------
+# 병합 셀 때문에 원문이 적어 놓은 합계를 못 읽던 회귀
+# (현대건설 2025 사업보고서 20260318001395 / 한화에어로 20260316001112 /
+#  삼성바이오로직스 20260515001658)
+#
+# 실측: 수주상황 표는 개별 공사 23건 + '기타' 한 줄 + 소계 + '국내 / 해외 합계'로
+# 끝난다. 합계행은 COLSPAN 으로 라벨이 5칸을 덮어 4칸, 개별 공사 행은 구분 열이
+# ROWSPAN 이라 7칸, 헤더는 8칸이었다. 열 번호가 행마다 달라 항등식이 찾아낸 열이
+# 합계행엔 아예 없었고, 40.6조짜리 '기타' 줄과 69.7조 합계가 통째로 빠져
+# 개별 공사만 더한 22.7조가 나갔다.
+# ---------------------------------------------------------------------------
+
+MERGED_ORDER_TABLE = """
+<DOCUMENT>
+  <TABLE>
+    <TR><TD>(단위 : 백만원)</TD></TR>
+  </TABLE>
+  <TABLE>
+    <TR><TH>구분</TH><TH>공사명</TH><TH>발주처</TH><TH>수주총액</TH>
+        <TH>완성공사액</TH><TH>계약잔액</TH></TR>
+    <TR><TD ROWSPAN="3">국내</TD><TD>A현장</TD><TD>발주처1</TD>
+        <TD>3,931,885</TD><TD>988,332</TD><TD>2,943,553</TD></TR>
+    <TR><TD>B현장</TD><TD>발주처2</TD><TD>2,438,912</TD><TD>2,012,262</TD><TD>426,650</TD></TR>
+    <TR><TD COLSPAN="2">기타</TD><TD>57,723,031</TD><TD>18,761,243</TD><TD>38,961,788</TD></TR>
+    <TR><TD COLSPAN="3">국내합계</TD><TD>64,093,828</TD><TD>21,761,837</TD><TD>42,331,991</TD></TR>
+  </TABLE>
+</DOCUMENT>
+""".encode("utf-8")
+
+
+class MergedCellAlignmentTests(unittest.TestCase):
+    def test_every_row_has_the_same_column_count(self):
+        table = [t for t in extract_document_tables(MERGED_ORDER_TABLE)
+                 if len(t.rows) > 1][0]
+        self.assertEqual({len(r) for r in table.rows}, {6})
+        self.assertEqual(table.rows[2][0], "국내")      # ROWSPAN 이 아래 행까지
+        self.assertEqual(table.rows[3][:3], ["국내", "기타", ""])   # COLSPAN 은 빈 칸으로
+
+    def test_total_row_wins_over_listed_projects(self):
+        tables = extract_document_tables(MERGED_ORDER_TABLE)
+        snap = extract_order_backlog_snapshot(tables, period="2025")
+        self.assertIsNotNone(snap)
+        # 원문 합계 42,331,991 백만원 = 423,319.91억. 개별 공사만 더한
+        # (2,943,553 + 426,650) = 33,702.03억이 아니다.
+        self.assertAlmostEqual(snap.point.value, 423319.91, places=2)
+        self.assertIn("원문 합계행", snap.tables[0]["method"])
+        self.assertEqual(snap.tables[0]["rows_used"], 1)
+
+
+class GrandTotalChoiceTests(unittest.TestCase):
+    def test_subtotals_and_grand_total_pick_the_grand_total(self):
+        from dartlens._order_backlog import _grand_total
+
+        self.assertEqual(_grand_total([55398875.0, 14336700.0, 69735574.0]), 69735574.0)
+
+    def test_single_total_is_used(self):
+        from dartlens._order_backlog import _grand_total
+
+        self.assertEqual(_grand_total([34495064.0]), 34495064.0)
+
+    def test_unrelated_totals_are_refused(self):
+        from dartlens._order_backlog import _grand_total
+
+        self.assertIsNone(_grand_total([100.0, 500.0, 900.0]))
+
+
+class DuplicateSummaryTableTests(unittest.TestCase):
+    """같은 수주잔고를 요약표와 상세표로 두 번 싣는 보고서(한화에어로)."""
+
+    @staticmethod
+    def _table(caption, rows):
+        return DocumentTable(caption=caption, rows=[
+            ["부문", "품목", "수주총액", "기납품액", "수주잔고"], *rows])
+
+    def test_same_total_counted_once(self):
+        summary = self._table("(단위 : 백만원) 부문별 요약", [
+            ["항공", "상세내역 참조", "44,481,780", "12,082,235", "32,399,545"],
+            ["방산", "상세내역 참조", "52,558,369", "15,338,467", "37,219,902"],
+        ])
+        detail = self._table("(단위 : 백만원) 계약별 상세", [
+            ["항공", "추진기관", "44,481,780", "12,082,235", "32,399,545"],
+            ["방산", "유도무기", "52,558,369", "15,338,467", "37,219,902"],
+        ])
+        snap = extract_order_backlog_snapshot([summary, detail], period="2025")
+        self.assertAlmostEqual(snap.point.value, (32399545 + 37219902) / 100, places=2)
+        self.assertEqual(len(snap.tables), 1)
+        self.assertTrue(any("두 번 실은" in w for w in snap.warnings), snap.warnings)
+
+    def test_different_totals_are_still_summed(self):
+        first = self._table("(단위 : 백만원)", [
+            ["조선", "상선", "10,000", "4,000", "6,000"]])
+        second = self._table("(단위 : 백만원)", [
+            ["해양", "플랜트", "20,000", "5,000", "15,000"]])
+        snap = extract_order_backlog_snapshot([first, second], period="2025")
+        self.assertAlmostEqual(snap.point.value, 210.0, places=2)
+        self.assertEqual(len(snap.tables), 2)
+
+
+class ScenarioRowTests(unittest.TestCase):
+    """같은 계약을 '○○ 기준'으로 두 번 적은 줄은 더하지 않는다(삼성바이오로직스)."""
+
+    def _table(self):
+        return DocumentTable(
+            caption="(단위: 백만 달러)",
+            rows=[
+                ["사업부문", "품목", "수주일자", "납기", "구분", "", "수주총액", "기납품액", "수주잔고"],
+                ["CDMO", "항체의약품", "2015년~(계약별상이)", "~2037년(계약별상이)",
+                 "현 최소구매물량 기준", "금액", "21,153", "10,449", "10,704"],
+                ["CDMO", "항체의약품", "2015년~(계약별상이)", "~2037년(계약별상이)",
+                 "고객사 제품개발 성공시예상 수요물량 기준", "금액", "23,881", "10,449", "13,432"],
+            ],
+        )
+
+    def test_scenario_rows_are_not_added(self):
+        snap = extract_order_backlog_snapshot([self._table()], period="2025")
+        self.assertEqual(snap.point.value, 10704.0)     # 24,136 이 아니다
+        self.assertEqual(snap.value_unit, "백만달러")
+        self.assertTrue(any("다른 기준" in w for w in snap.warnings), snap.warnings)
+
+    def test_real_segment_rows_are_still_added(self):
+        table = DocumentTable(
+            caption="(단위 : 백만원)",
+            rows=[
+                ["부문", "품목", "수주총액", "기납품액", "수주잔고"],
+                ["조선", "상선", "10,000", "4,000", "6,000"],
+                ["조선", "특수선", "20,000", "5,000", "15,000"],
+            ],
+        )
+        snap = extract_order_backlog_snapshot([table], period="2025")
+        self.assertAlmostEqual(snap.point.value, 210.0, places=2)

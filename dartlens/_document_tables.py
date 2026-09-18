@@ -99,7 +99,14 @@ def _parse_xml(xml_bytes: bytes):
 
 
 def _extract_rows(table) -> list[list[str]]:
-    """이 표가 직접 가진 행만 읽는다 - 중첩된 표의 행은 그 표의 것이다.
+    """이 표가 직접 가진 행만, 원문의 열 자리 그대로 읽는다.
+
+    병합된 칸(COLSPAN/ROWSPAN)을 펴서 모든 행의 열 번호를 맞춘다. 예전엔 빈 칸을
+    지우고 병합을 무시해서, 같은 표 안에서도 행마다 칸 수가 달랐다 - 실측(현대건설
+    2025 사업보고서 20260318001395)에서 헤더 8칸, 개별 공사 행 7칸(구분 열이
+    세로 병합), 합계 행 4칸(가로 병합)이 섞였다. 그러면 계약잔액 열 번호가 행마다
+    달라, 항등식이 찾아낸 열이 합계 행에는 아예 없어 조용히 빠진다. 그 표의
+    '국내 / 해외 합계' 69.7조가 빠지고 개별 공사만 더한 22.7조가 나갔다.
 
     DART 원문은 레이아웃용 껍데기 <TABLE> 안에 실제 표 수백 개를 넣어 보낸다.
     예전엔 table.iter() 가 그 안쪽 <TR> 을 전부 긁어와 서로 상관없는 표
@@ -110,16 +117,54 @@ def _extract_rows(table) -> list[list[str]]:
     연도(2025/2026/2027)로 내보냈다. 캡션도 100행 위 손실충당금 표 것이 붙었다.
     """
     rows: list[list[str]] = []
+    spans: dict[int, list] = {}      # 세로로 이어지는 칸: 열 -> [남은 행 수, 글자]
     for tr in table.iter():
         if _tag_name(tr) != "tr":
             continue
         if _owner_table(tr) is not table:
             continue
-        cells = [_cell_text(cell) for cell in tr if _tag_name(cell) in {"td", "th"}]
-        cells = [cell for cell in cells if cell]
-        if cells:
-            rows.append(cells)
+        cells = [cell for cell in tr if _tag_name(cell) in {"td", "th"}]
+        row: list[str] = []
+        col = 0
+        index = 0
+        while index < len(cells) or col in spans:
+            if col in spans:
+                remaining, text = spans[col]
+                row.append(text)
+                if remaining <= 1:
+                    del spans[col]
+                else:
+                    spans[col] = [remaining - 1, text]
+                col += 1
+                continue
+            cell = cells[index]
+            index += 1
+            text = _cell_text(cell)
+            colspan = _span(cell, "colspan")
+            rowspan = _span(cell, "rowspan")
+            for offset in range(colspan):
+                # 가로로 합쳐진 칸은 첫 자리에만 글자를 두고 나머지는 빈 칸으로
+                # 채운다. 자리를 채워야 아래 행의 열 번호와 맞는다.
+                row.append(text if offset == 0 else "")
+                if rowspan > 1:
+                    spans[col] = [rowspan - 1, text if offset == 0 else ""]
+                col += 1
+        if any(cell.strip() for cell in row):
+            rows.append(row)
     return rows
+
+
+_MAX_SPAN = {"colspan": 40, "rowspan": 200}
+
+
+def _span(cell, name: str) -> int:
+    """COLSPAN/ROWSPAN 값. 레이아웃용 큰 값은 잘라 표가 터지지 않게 한다."""
+    raw = cell.get(name.upper()) or cell.get(name) or "1"
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(value, _MAX_SPAN[name]))
 
 
 def _owner_table(node):

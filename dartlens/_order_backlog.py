@@ -108,6 +108,28 @@ def extract_order_backlog_snapshot(
         extracted.append(info)
         warnings.extend(info.pop("_warnings"))
     if extracted:
+        # 같은 수주잔고를 부문별 요약표와 계약별 상세표로 두 번 싣는 보고서가
+        # 있다. 실측(한화에어로스페이스 2025 사업보고서 20260316001112): 요약표
+        # 합계 116,800,729천원과 상세표 '계' 116,800,728천원이 같은 값인데, 그대로
+        # 더해 168.8조가 나갔다(원문 116.8조). 명시 합계가 같은 표는 한 번만 센다.
+        deduped: list[dict] = []
+        for info in extracted:
+            twin = next(
+                (d for d in deduped
+                 if d.get("unit") == info.get("unit")
+                 and _same_amount_rel(d["eok_sum"], info["eok_sum"])),
+                None,
+            )
+            if twin is None:
+                deduped.append(info)
+            else:
+                warnings.append(
+                    f"표 '{(info.get('caption') or '무제')[:30]}'의 합계가 "
+                    f"'{(twin.get('caption') or '무제')[:30]}'와 같아 같은 내역을 "
+                    "요약·상세로 두 번 실은 것으로 보고 한 번만 셌습니다."
+                )
+        extracted = deduped
+
         # 통화가 섞이면 합칠 수 없다. 원화 표가 있으면 원화만 쓰고 외화 표는
         # 제외를 알린다. 원화가 없으면 외화 단위 그대로(환산하지 않고) 낸다.
         krw = [i for i in extracted if i.get("currency") == "KRW"]
@@ -233,6 +255,13 @@ def _same_amount(left: float, right: float) -> bool:
     return abs(left - right) <= max(0.01, abs(left) * 1e-9)
 
 
+def _same_amount_rel(left: float, right: float) -> bool:
+    """반올림 차이만 있는 같은 금액인가(요약표와 상세표는 끝자리가 다를 수 있다)."""
+    if left <= 0 or right <= 0:
+        return False
+    return abs(left - right) <= max(0.01, abs(left) * 1e-4)
+
+
 _ASSUMED_UNIT_WARNING = "표에 단위 표기가 없어 억원으로 가정했습니다. 원문 대조가 필요합니다."
 
 
@@ -356,6 +385,73 @@ def _identity_backlog_column(numeric_rows: list[dict]) -> int | None:
     return None, checked
 
 
+def _is_total_row(labels: list[str]) -> bool:
+    """라벨 칸 중 하나라도 합계를 뜻하면 합계행이다.
+
+    '합 계'(띄어쓴 것)·'국내합계'·'국내 / 해외 합계'·'계' 가 모두 해당한다.
+    """
+    for label in labels:
+        squeezed = label.replace(" ", "")
+        if squeezed in _TOTAL_LABELS:
+            return True
+        if squeezed.endswith("합계") or squeezed.endswith("총계"):
+            return True
+    return False
+
+
+def _grand_total(values: list[float]) -> float | None:
+    """합계행이 여럿일 때 '전체 합계' 하나를 고른다.
+
+    수주상황 표는 국내합계·해외합계·국내/해외 합계처럼 소계와 총계가 같이 있다.
+    가장 큰 값이 나머지의 합과 맞으면 그게 총계다(자가검증). 관계가 안 맞으면
+    어느 것이 총계인지 지어내지 않고 없음을 돌려준다.
+    """
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values, reverse=True)
+    biggest, rest = ordered[0], sum(ordered[1:])
+    if abs(biggest - rest) <= max(1.0, abs(biggest) * 0.01):
+        return biggest
+    return None
+
+
+def _is_scenario_twin(left: list[str], right: list[str]) -> bool:
+    """같은 계약을 '○○ 기준'으로 두 번 적은 행인가.
+
+    실측(삼성바이오로직스 2025 사업보고서 20260515001658): 같은 CDMO 항체의약품
+    계약이 '현 최소구매물량 기준'(수주잔고 10,704)과 '고객사 제품개발 성공시
+    예상 수요물량 기준'(13,432) 두 줄로 실린다. 사업부문·품목·수주일자·납기가
+    모두 같고 '기준' 칸 하나만 다르다. 더하면 24,136 백만달러가 되는데 그런
+    수주잔고는 없다 - 두 줄은 합이 아니라 가정이 다른 같은 계약이다.
+    """
+    if len(left) != len(right):
+        return False
+    differing = [(a, b) for a, b in zip(left, right) if a != b]
+    if len(differing) != 1:
+        return False
+    return all("기준" in value for value in differing[0])
+
+
+def _total_cell_is_broken(total: dict, detail_rows: list[dict], col: int) -> bool:
+    """합계행의 이 칸만 원문 표기가 깨졌는가.
+
+    합계는 세부행 합보다 작을 수 없다(기타·소계가 있으면 더 클 수는 있다). 같은
+    행의 다른 칸은 세부합과 맞는데 이 칸만 작으면 그 칸 표기가 깨진 것이다 -
+    실측(삼성중공업 2024 사업보고서 20250319000397): 수주잔고 합계가 콤마 대신
+    마침표로 '315.350' 이라 315,350억이 315.35억이 됐다. 같은 행의 수주총액
+    553,469 와 기납품액 238,119 는 세부합과 정확히 맞는다.
+    """
+    for column, value in total.items():
+        if column == col:
+            continue
+        detail_sum = sum(e["nums"][column] for e in detail_rows if column in e["nums"])
+        if detail_sum and abs(value - detail_sum) <= max(1.0, abs(value) * 0.01):
+            return True
+    return False
+
+
 def _contract_detail_extract(table: DocumentTable) -> dict | None:
     """계약별 상세표(품목|발주처|...|수주잔고|...)에서 수주잔고 열을 합산한다."""
     default_unit = _table_unit(table)
@@ -376,14 +472,35 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
                     if (v := _plain_number(cell)) is not None}
             if not nums:
                 continue      # 하위 헤더(금액/총액/대손충당금 등)
-            first = (drow[0] or "").strip()
-            entry = {"first": first, "nums": nums}
-            if first in _TOTAL_LABELS or first.startswith("합계"):
+            # 병합 칸을 편 뒤로는 합계행 라벨이 첫 칸이 아닐 수 있다. 실측
+            # (현대건설): 세로 병합된 '구분' 열 때문에 '국내합계'가 둘째 칸에
+            # 온다. 숫자가 아닌 칸을 전부 보고 판정한다.
+            labels = [cell.strip() for i, cell in enumerate(drow)
+                      if i not in nums and cell.strip()]
+            entry = {"labels": labels, "nums": nums,
+                     "first": labels[0] if labels else ""}
+            if _is_total_row(labels):
                 total_rows.append(entry)
-            elif first and not first.startswith("*"):
+            elif labels and not labels[0].startswith("*"):
                 detail_rows.append(entry)
         if not detail_rows and not total_rows:
             continue
+
+        pre_warnings: list[str] = []
+        kept: list[dict] = []
+        for entry in detail_rows:
+            twin = next((k for k in kept
+                         if _is_scenario_twin(k["labels"], entry["labels"])), None)
+            if twin is None:
+                kept.append(entry)
+            else:
+                dropped = next(a for a, b in zip(entry["labels"], twin["labels"])
+                               if a != b)
+                pre_warnings.append(
+                    f"표 '{(table.caption or '무제')[:30]}'에서 '{dropped[:30]}' 행은 "
+                    "같은 계약을 다른 기준으로 적은 줄이라 합계에 넣지 않았습니다."
+                )
+        detail_rows = kept
 
         col, checked = _identity_backlog_column(
             [e["nums"] for e in detail_rows] or [e["nums"] for e in total_rows]
@@ -401,14 +518,41 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
             "백만원": 0.01, "천원": 0.00001, "억원": 1.0, "원": 0.00000001,
         }.get(default_unit or "억원", 1.0)
         detail_vals = [e["nums"][col] for e in detail_rows if col in e["nums"]]
-        total_val = next((e["nums"][col] for e in total_rows if col in e["nums"]), None)
+        total_entries = [e for e in total_rows if col in e["nums"]]
+        total_val = _grand_total([e["nums"][col] for e in total_entries])
+        broken_total = None
+        if total_val is not None and detail_vals and total_val < sum(detail_vals) * 0.99:
+            grand = next(e for e in total_entries if e["nums"][col] == total_val)
+            if _total_cell_is_broken(grand["nums"], detail_rows, col):
+                broken_total, total_val = total_val, None
         if not detail_vals and total_val is None:
             continue
 
-        warnings: list[str] = []
+        warnings: list[str] = list(pre_warnings)
         detail_sum = sum(detail_vals)
+        if broken_total is not None:
+            warnings.append(
+                f"표 '{(table.caption or '무제')[:40]}'의 합계행에 적힌 수주잔고"
+                f"({_format_value(round(broken_total * factor, 2))}억원)가 세부행 합"
+                f"({_format_value(round(detail_sum * factor, 2))}억원)보다 작습니다. "
+                "같은 행의 다른 칸은 세부합과 맞아 그 칸 표기가 깨진 것으로 보고 "
+                "세부행 합을 사용합니다."
+            )
+        if total_val is None and total_rows and any(e["nums"] for e in total_rows):
+            warnings.append(
+                f"표 '{(table.caption or '무제')[:40]}'의 합계행이 여러 개인데 "
+                "어느 것이 전체 합계인지 확정하지 못해 세부행을 더했습니다."
+            )
         if total_val is not None and detail_vals:
-            if abs(total_val - detail_sum) > max(1.0, total_val * 0.01):
+            # 세부행에 '기타'로 뭉친 행이나 소계행이 있으면 합계행과 세부행 합이
+            # 다른 게 정상이다(실측 현대건설: 개별 공사 22.7조 + 기타 40.6조 =
+            # 합계 69.7조). 그런 행이 없는데도 어긋나면 열을 잘못 읽었다는 뜻이다.
+            has_breakdown = len(total_rows) > 1 or any(
+                any("기타" in label or "소계" in label for label in e["labels"])
+                for e in detail_rows
+            )
+            if (not has_breakdown
+                    and abs(total_val - detail_sum) > max(1.0, total_val * 0.01)):
                 warnings.append(
                     f"표 '{(table.caption or '무제')[:40]}'의 합계행"
                     f"({_format_value(round(total_val * factor, 2))}억원)과 세부행 합"
@@ -427,10 +571,11 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
             "basis": table.basis,
             "currency": "foreign" if foreign else "KRW",
             "source_rows": len(rows),
-            "rows_used": len(detail_vals) if total_val is None else len(detail_vals),
+            "rows_used": 1 if total_val is not None else len(detail_vals),
             "raw_sum": raw,
             "eok_sum": round(raw * factor, 2),
-            "method": "contract_detail(항등식 검증 열)",
+            "method": ("contract_detail(원문 합계행)" if total_val is not None
+                       else "contract_detail(항등식 검증 열)"),
             "_max_detail": max((v * factor for v in detail_vals), default=0.0),
             "_warnings": warnings,
         }
