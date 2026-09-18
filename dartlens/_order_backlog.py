@@ -793,26 +793,92 @@ def _is_header_backlog_value_row(rows: list[list[str]], row_index: int) -> bool:
 
 
 def _balance_value_from_row(rows: list[list[str]], row_index: int, *, default_unit: str | None) -> float | None:
+    """기말잔액 행에서 '전체' 값을 읽는다. 열 위치를 추측하지 않는다.
+
+    예전엔 합계 열을 못 찾으면 맨 오른쪽 칸으로 넘어갔다. 그 자리가 무엇인지는
+    표마다 다르다 - 실측(현대엘리베이터 2025 사업보고서 20260318001372):
+    연결 계약잔액 표는 합계 열 없이 부문 4개(물품취급장비·건설업·물류·IT)만
+    있어서 맨 오른쪽 IT사업부문 914,773천원(9.1억)이 회사 전체 수주잔고로
+    나갔다. 실제 합은 2,090,814,579천원(20,908억)이다. 같은 보고서의 별도 표는
+    '당기|전기' 구성이라 맨 오른쪽이 전기 - 한 해 묵은 값이 나갔다.
+
+    이제 머리글이 무엇인지 보고 정한다: 합계 열이 있으면 그 열, 기간 축이면
+    당기 열, 부문 축이면 전부 더한다. 셋 다 아니면 값을 만들지 않는다.
+    """
     row = rows[row_index]
     header = _nearest_header(rows, before=row_index)
-    preferred_index = _preferred_value_index(header, row) if header is not None else None
-    indexes = []
-    if preferred_index is not None:
-        indexes.append(preferred_index)
-    indexes.extend(range(len(row) - 1, 0, -1))
-    for index in indexes:
-        if index >= len(row):
-            continue
+    if header is None:
+        return None
+
+    index = _preferred_value_index(header, row)
+    if index is not None and index < len(row):
         try:
             return _amount_to_eok(row[index], default_unit=default_unit)
         except ValueError:
-            continue
+            pass
+
+    kind = _header_axis_kind(header)
+    if kind == "period":
+        index = _current_period_index(header)
+        if index is not None and index < len(row):
+            try:
+                return _amount_to_eok(row[index], default_unit=default_unit)
+            except ValueError:
+                return None
+        return None
+    if kind == "segment":
+        # 합계 열이 없는 부문별 표. 부문은 서로 겹치지 않으니 더한 값이 전체다.
+        values = []
+        for cell in row[1:]:
+            try:
+                values.append(_amount_to_eok(cell, default_unit=default_unit))
+            except ValueError:
+                continue
+        return round(sum(values), 6) if values else None
     return None
 
 
+_PERIOD_HEADER_WORDS = ("당기", "전기", "당반기", "전반기", "당분기", "전분기",
+                        "당해", "전년", "기초", "기말")
+
+
+def _header_axis_kind(header: list[str]) -> str | None:
+    """머리글의 값 열들이 기간인지 부문인지. 판정이 안 되면 None."""
+    cells = [cell.replace(" ", "") for cell in header[1:] if cell.strip()]
+    if not cells:
+        return None
+    if all(any(word in cell for word in _PERIOD_HEADER_WORDS)
+           or _normalize_period(cell) is not None for cell in cells):
+        return "period"
+    if all(_plain_number(cell) is None for cell in cells):
+        return "segment"
+    return None
+
+
+def _current_period_index(header: list[str]) -> int | None:
+    """기간 축 머리글에서 '당기' 열. 연도면 가장 최근 연도."""
+    normalized = [cell.replace(" ", "") for cell in header]
+    for index, cell in enumerate(normalized):
+        if index and any(word in cell for word in ("당기", "당반기", "당분기", "당해")):
+            return index
+    years = [(period, index) for index, cell in enumerate(normalized)
+             if index and (period := _normalize_period(cell)) is not None]
+    if years:
+        return max(years)[1]
+    return 1 if len(header) > 1 else None
+
+
 def _nearest_header(rows: list[list[str]], *, before: int) -> list[str] | None:
+    """이 행의 열 이름이 적힌 머리글 행.
+
+    예전엔 값이 든 행도 머리글로 잡았다 - '기초계약잔액 | 33,937,341 | ...' 은
+    계약잔액이라는 낱말이 들어 있어 통과했다. 그 행을 머리글로 보면 열 이름이
+    전부 숫자라 어느 열이 합계인지 알 수 없다. 숫자가 든 행은 건너뛴다.
+    """
     for index in range(before - 1, -1, -1):
         row = rows[index]
+        if not _is_label_row(row):
+            continue
         joined = "".join(row).replace(" ", "")
         if "구분" in joined or "합계" in joined or any(keyword in joined for keyword in BACKLOG_KEYWORDS):
             return row
@@ -820,7 +886,12 @@ def _nearest_header(rows: list[list[str]], *, before: int) -> list[str] | None:
 
 
 def _preferred_value_index(header: list[str], row: list[str]) -> int | None:
+    """머리글에서 '전체' 열을 찾는다 - 합계 열 또는 잔고 열."""
     normalized = [cell.replace(" ", "") for cell in header]
+    for index, cell in enumerate(normalized):
+        # '계'·'소 계'처럼 짧게 적은 합계 열도 합계다(_is_total_row 와 같은 판정).
+        if index and index < len(row) and _is_total_row([cell]):
+            return index
     for keyword in ("합계", "수주잔액", "수주잔고", "기말공사계약잔액", "기말계약잔액", "기말잔액"):
         for index, cell in enumerate(normalized):
             if keyword in cell and index < len(row):

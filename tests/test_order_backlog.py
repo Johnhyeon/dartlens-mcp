@@ -1163,3 +1163,83 @@ class ScenarioRowTests(unittest.TestCase):
         )
         snap = extract_order_backlog_snapshot([table], period="2025")
         self.assertAlmostEqual(snap.point.value, 210.0, places=2)
+
+
+# ---------------------------------------------------------------------------
+# 합계 열이 없는 표에서 맨 오른쪽 칸을 전체 값으로 읽던 회귀
+# (현대엘리베이터 2025 사업보고서 20260318001372)
+#
+# 실측: 연결 계약잔액 표는 합계 열 없이 부문 4개만 있다. 맨 오른쪽 IT사업부문
+# 914,773천원(9.1억)이 회사 전체 수주잔고로 나갔다(실제 합 20,908억). 같은
+# 보고서의 별도 표는 '당기|전기' 구성이라 맨 오른쪽이 전기 - 한 해 묵은 값이다.
+# ---------------------------------------------------------------------------
+
+
+class ValueColumnChoiceTests(unittest.TestCase):
+    CONSOLIDATED = DocumentTable(
+        caption="(단위: 천원)",
+        rows=[
+            ["구 분", "물품취급장비부문", "건설업부문", "물류사업부문", "IT사업부문"],
+            ["기초 계약잔액", "1,350,400,047", "144,805,080", "372,394,320", "614,552"],
+            ["증  감  액 (*)", "1,172,013,366", "418,458,121", "331,749,160", "3,131,793"],
+            ["수 익 인 식 액", "(1,221,151,952)", "(108,513,404)", "(370,254,932)", "(2,831,572)"],
+            ["기말 계약잔액", "1,301,261,461", "454,749,797", "333,888,548", "914,773"],
+        ],
+    )
+    SEPARATE = DocumentTable(
+        caption="(단위: 천원)",
+        rows=[
+            ["구 분", "당기", "전기"],
+            ["기초 계약잔액", "1,239,323,462", "1,378,426,538"],
+            ["기말 계약잔액", "1,200,865,507", "1,239,323,462"],
+        ],
+    )
+
+    def test_segment_columns_without_total_are_summed(self):
+        point = extract_order_backlog_point([self.CONSOLIDATED], period="2025")
+        self.assertIsNotNone(point)
+        # 1,301,261,461+454,749,797+333,888,548+914,773 = 2,090,814,579천원
+        self.assertAlmostEqual(point.value, 20908.15, places=2)
+
+    def test_last_segment_is_never_the_whole_backlog(self):
+        point = extract_order_backlog_point([self.CONSOLIDATED], period="2025")
+        self.assertNotAlmostEqual(point.value, 9.14773, places=2)   # IT사업부문만
+
+    def test_period_columns_pick_current_not_previous(self):
+        point = extract_order_backlog_point([self.SEPARATE], period="2025")
+        self.assertAlmostEqual(point.value, 12008.66, places=2)     # 당기
+        self.assertNotAlmostEqual(point.value, 12393.23, places=2)  # 전기
+
+    def test_total_column_still_wins(self):
+        table = DocumentTable(
+            caption="(단위:백만원)",
+            rows=[
+                ["구분", "조선", "해양플랜트", "기타", "합계"],
+                ["기말계약잔액", "44,350,193", "2,445,087", "9,586,022", "56,381,302"],
+            ],
+        )
+        point = extract_order_backlog_point([table], period="2025")
+        self.assertAlmostEqual(point.value, 563813.02, places=2)
+
+    def test_short_total_label_is_recognised_as_total_column(self):
+        table = DocumentTable(
+            caption="(단위:백만원)",
+            rows=[
+                ["구분", "조선", "해양", "계"],
+                ["기말계약잔액", "10,000", "20,000", "30,000"],
+            ],
+        )
+        point = extract_order_backlog_point([table], period="2025")
+        self.assertAlmostEqual(point.value, 300.0, places=2)   # 60,000 이 아니다
+
+    def test_data_row_is_not_mistaken_for_header(self):
+        """'기초계약잔액 | 33,937,341 | ...' 은 낱말이 맞아도 머리글이 아니다."""
+        from dartlens._order_backlog import _nearest_header
+
+        rows = [
+            ["(단위:백만원)"],
+            ["구분", "조선", "기타", "합계"],
+            ["기초계약잔액", "33,937,341", "9,355,847", "46,922,936"],
+            ["기말계약잔액", "44,350,193", "9,586,022", "56,381,302"],
+        ]
+        self.assertEqual(_nearest_header(rows, before=3), rows[1])
