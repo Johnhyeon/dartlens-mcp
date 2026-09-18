@@ -16,6 +16,7 @@ class DocumentTable:
     rows: list[list[str]]
     basis: str = ""    # "연결" / "별도" — 이 표가 실린 재무제표 기준. 모르면 ""
     unit_hint: str = ""  # 표 바로 앞에 따로 적힌 '(단위 : ...)' 쪽지
+    intro: str = ""      # 표를 소개하는 원문 문장(범위를 밝히는 자리다)
 
 
 def extract_document_tables(xml_bytes: bytes) -> list[DocumentTable]:
@@ -36,6 +37,7 @@ def extract_document_tables(xml_bytes: bytes) -> list[DocumentTable]:
                     rows=rows,
                     basis=_financial_basis(element, document_label),
                     unit_hint=_nearby_unit_note(element),
+                    intro=_intro_text(element),
                 ))
     return tables
 
@@ -65,6 +67,30 @@ def _nearby_unit_note(table) -> str:
         match = _UNIT_NOTE_RE.search(text)
         if match:
             return match.group(0)
+        if text:
+            checked += 1
+        previous = previous.getprevious()
+    return ""
+
+
+def _intro_text(table) -> str:
+    """표를 소개하는 바로 앞 문장.
+
+    수주 표가 회사 전체를 담는지 일부만 담는지는 표가 아니라 그 앞 문장이
+    말한다 - 실측(세아제강 20260312000989): "당기말 현재 진행중인 주요
+    수주사항은 아래와 같습니다." 우리가 읽은 1,085억은 그 표의 합계로는 맞지만
+    회사 전체 수주잔고가 아니다. 판정하지 않고 원문 문장을 그대로 들고 간다.
+    """
+    previous = table.getprevious()
+    checked = 0
+    while previous is not None and checked < 3:
+        if _holds_data_table(previous):
+            return ""
+        text = " ".join(part.strip() for part in previous.itertext()
+                        if part and part.strip())
+        stripped = _UNIT_NOTE_RE.sub("", text).strip()
+        if len(stripped) >= 8:
+            return stripped[:200]
         if text:
             checked += 1
         previous = previous.getprevious()

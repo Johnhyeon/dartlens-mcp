@@ -1557,3 +1557,56 @@ class NamedBacklogColumnTests(unittest.TestCase):
 
         info = _contract_detail_extract(table)
         self.assertTrue(info is None or info.get("_failed"))
+
+
+# ---------------------------------------------------------------------------
+# 표가 회사 전체인지 일부인지는 표가 아니라 그 앞 문장이 말한다
+# (세아제강 20260312000989)
+# ---------------------------------------------------------------------------
+
+_SCOPE_XML = """
+<DOCUMENT>
+  <P>마. 수주상황 수주 및 납품이 빈번하고 주문과 생산 제품 인도납기기간이 길지 않아
+     수주량과 매출량의 차이가 크지 않습니다. 당기말 현재 진행중인 주요 수주사항은 아래와 같습니다.</P>
+  <TABLE><TR><TD></TD><TD>(단위 : 백만원)</TD></TR></TABLE>
+  <TABLE>
+    <TR><TH>구분</TH><TH>품목</TH><TH>수주총액</TH><TH>기납품액</TH><TH>수주잔고</TH></TR>
+    <TR><TD>1</TD><TD>카타르 LNG</TD><TD>172,463</TD><TD>162,065</TD><TD>10,398</TD></TR>
+    <TR><TD>합 계</TD><TD></TD><TD>270,602</TD><TD>162,065</TD><TD>108,537</TD></TR>
+  </TABLE>
+</DOCUMENT>
+""".encode("utf-8")
+
+_FULL_XML = """
+<DOCUMENT>
+  <P>가. 당기와 전기 중 공사계약잔액의 변동내역은 다음과 같습니다.</P>
+  <TABLE><TR><TD></TD><TD>(단위 : 백만원)</TD></TR></TABLE>
+  <TABLE>
+    <TR><TH>구분</TH><TH>품목</TH><TH>수주총액</TH><TH>기납품액</TH><TH>수주잔고</TH></TR>
+    <TR><TD>1</TD><TD>카타르 LNG</TD><TD>172,463</TD><TD>162,065</TD><TD>10,398</TD></TR>
+    <TR><TD>합 계</TD><TD></TD><TD>270,602</TD><TD>162,065</TD><TD>108,537</TD></TR>
+  </TABLE>
+</DOCUMENT>
+""".encode("utf-8")
+
+
+class ScopeNoteTests(unittest.TestCase):
+    @staticmethod
+    def _snap(xml):
+        return extract_order_backlog_snapshot(
+            extract_document_tables(xml), period="2025")
+
+    def test_partial_scope_sentence_is_carried(self):
+        snap = self._snap(_SCOPE_XML)
+        self.assertAlmostEqual(snap.point.value, 1085.37, places=2)
+        self.assertIn("주요 수주사항", snap.tables[0]["scope_note"])
+
+    def test_full_scope_table_has_no_note(self):
+        snap = self._snap(_FULL_XML)
+        self.assertEqual(snap.tables[0]["scope_note"], "")
+
+    def test_intro_is_captured_past_the_unit_note(self):
+        tables = extract_document_tables(_SCOPE_XML)
+        data = [t for t in tables if len(t.rows) > 2][0]
+        self.assertIn("주요 수주사항", data.intro)
+        self.assertNotIn("단위", data.intro)

@@ -333,6 +333,7 @@ def _single_row_snapshot(
             "unit": unit_label,
             "unit_source": unit_source,
             "basis": table.basis,
+            "scope_note": _scope_note(table),
             # 캡션이 '(단위: 천원)' 한 줄뿐인 표가 많다. 어느 행을 읽었는지가
             # 사람이 원문과 맞춰볼 수 있는 진짜 근거다.
             "row_label": (row[0] if row else "")[:40],
@@ -679,6 +680,7 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
             "unit": default_unit or "표기 없음(억원 가정)",
             "unit_source": "declared" if default_unit else "assumed",
             "basis": table.basis,
+            "scope_note": _scope_note(table),
             "currency": "foreign" if foreign else "KRW",
             "source_rows": len(rows),
             "rows_used": 1 if total_val is not None else len(detail_vals),
@@ -812,6 +814,18 @@ def _metric_name(row: list[str]) -> str | None:
         if keyword in joined:
             return keyword
     return None
+
+
+# 원문이 스스로 '일부만 싣는다'고 말하는 표시. 판정하지 않고 그 문장을 전한다.
+_PARTIAL_SCOPE_MARKERS = ("주요수주", "주요계약", "주요공사", "주요도급",
+                          "주요사업", "5%이상", "5%이상인")
+
+
+def _scope_note(table: DocumentTable) -> str:
+    intro = table.intro or ""
+    if any(marker in intro.replace(" ", "") for marker in _PARTIAL_SCOPE_MARKERS):
+        return intro
+    return ""
 
 
 # '기말잔액' 한 단어로 걸려드는 다른 롤포워드 표들. 수주 키워드가 없으면 뺀다.

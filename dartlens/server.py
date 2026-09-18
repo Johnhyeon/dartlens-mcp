@@ -1994,6 +1994,14 @@ def _finish_order_backlog(
         for pd, why in sorted(failed_periods.items(), reverse=True):
             if pd not in missing:
                 lines.append(f"- {pd}: {why}")
+    # 원문이 스스로 '주요 계약만 싣는다'고 밝힌 표는 그 문장을 그대로 전한다.
+    # 값은 그 표의 합계로 맞아도 회사 전체 수주잔고가 아닐 수 있다.
+    for note in dict.fromkeys(
+            i["scope_note"] for i in table_provenance if i.get("scope_note")):
+        lines.append(
+            f"⚠️ 원문이 이 표를 이렇게 소개합니다 - \"{note[:120]}\" "
+            "회사 전체가 아니라 일부만 실린 표일 수 있습니다."
+        )
     for w in warnings:
         lines.append(f"⚠️ {w}")
 
