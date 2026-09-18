@@ -88,6 +88,8 @@ def extract_order_backlog_snapshot(
     seen: set[int] = set()
     failed_keys: set[int] = set()
     extracted: list[dict] = []
+    rollforward: list[dict] = []
+    rollforward_warnings: list[str] = []
     warnings: list[str] = []
     for table in tables:
         if not _table_has_backlog_context(table):
@@ -98,6 +100,15 @@ def extract_order_backlog_snapshot(
         if key in seen:
             continue
         info = _contract_detail_extract(table)
+        if info is not None and info.get("_failed"):
+            # 기초|신규계약|계약수익|기말 네 단계 표는 3항 항등식이 성립할 수가
+            # 없다. 검산 실패로 볼 게 아니라 다른 읽는 법이 필요한 표다.
+            roll = _contract_detail_extract(table, allow_rollforward=True)
+            if roll is not None and not roll.get("_failed"):
+                seen.add(key)
+                rollforward.append(roll)
+                rollforward_warnings.extend(roll.pop("_warnings", []))
+                continue
         if info is None:
             continue
         seen.add(key)
@@ -110,11 +121,26 @@ def extract_order_backlog_snapshot(
             continue
         extracted.append(info)
         warnings.extend(info.pop("_warnings"))
+
+    if not extracted and rollforward:
+        # 사업의 내용에 수주 표가 없고 주석 롤포워드 표만 있는 회사
+        # (아이에스동서 20260318001565). 이때만 롤포워드 표를 쓴다.
+        extracted = rollforward
+        warnings.extend(rollforward_warnings)
+
     if extracted:
         # 같은 수주잔고를 부문별 요약표와 계약별 상세표로 두 번 싣는 보고서가
         # 있다. 실측(한화에어로스페이스 2025 사업보고서 20260316001112): 요약표
         # 합계 116,800,729천원과 상세표 '계' 116,800,728천원이 같은 값인데, 그대로
         # 더해 168.8조가 나갔다(원문 116.8조). 명시 합계가 같은 표는 한 번만 센다.
+        # 같은 계약잔액 표가 연결 주석과 별도 주석에 두 벌 실린다. 더하면 두 배가
+        # 된다 - 실측(아이에스동서 20260318001565): 연결 2.67조 + 별도 2.40조.
+        # 단품 도구의 기본은 연결이다(step 1 의 표 고르기와 같은 기준).
+        if any(i.get("basis") == "연결" for i in extracted) and \
+                any(i.get("basis") == "별도" for i in extracted):
+            warnings.append("같은 표가 연결·별도로 두 벌 실려 연결 기준만 셌습니다.")
+            extracted = [i for i in extracted if i.get("basis") != "별도"]
+
         # 한 보고서가 같은 공사를 두 표에 싣는 경우가 있다.
         # - 금호건설 20240318000777: 전체 공사 145행 표(총계 7.1조) 옆에 주요
         #   공사 26건만 뽑은 표가 따로 있다.
@@ -191,6 +217,21 @@ def extract_order_backlog_snapshot(
                 + ")에 단위 표기가 없어 부문 합계를 만들지 않았습니다. "
                 "단위를 잘못 읽으면 100배·10만배 어긋납니다."
             )
+        # 부문별 표 여러 개와 그것들을 합친 표가 같이 잡히는 보고서가 있다 -
+        # 실측(금호건설 20240318000777): 도급건축 46,171 + 도급토목 23,752 +
+        # 해외도급 1,002 억이 총계 표 70,925억과 같다. 둘 다 세면 두 배가 된다.
+        # 한 표가 나머지 전부의 합이면 그 표가 합계표다(자가검증).
+        if len(extracted) >= 3:
+            biggest = max(extracted, key=lambda i: i["eok_sum"])
+            rest = sum(i["eok_sum"] for i in extracted if i is not biggest)
+            if rest > 0 and abs(biggest["eok_sum"] - rest) <= max(
+                    1.0, abs(biggest["eok_sum"]) * 0.01):
+                warnings.append(
+                    f"표 '{(biggest.get('caption') or '무제')[:30]}'가 나머지 표들의 "
+                    "합과 같아 그 표들을 합친 표로 보고 한 번만 셌습니다."
+                )
+                extracted = [biggest]
+
         units = sorted({i["unit"] for i in extracted if i.get("currency") != "KRW"})
         value_unit = units[0] if units else "억원"
         value = round(sum(i["eok_sum"] for i in extracted), 2)
@@ -541,6 +582,29 @@ def _is_rollforward_header(normalized: list[str]) -> bool:
     return stages >= 2
 
 
+_ENDING_COLUMN_KEYWORDS = ("당기말계약잔액", "기말계약잔액", "기말공사계약잔액",
+                           "이월계약잔액", "기말계약잔고", "기말잔액", "이월잔액")
+
+
+def _ending_column_index(header: list[str]) -> int | None:
+    """기초→기말로 도는 표에서 '기말 잔액' 열. '전기말'은 지난 기간이라 제외한다.
+
+    기초 열이 같이 있을 때만 쓴다. 이 이름만 보고 넓게 잡으면 공사별 상세표와
+    부문별 요약표가 같이 잡혀 이중으로 더해진다(실측: 건설사 여러 곳에서
+    수주잔고가 2~4배가 됐다). 여기서 노리는 건 3항 항등식이 성립할 수 없는
+    네 단계 표 하나다 - 기초|신규계약|계약수익|기말(아이에스동서).
+    """
+    if not any("기초" in cell.replace(" ", "") for cell in header):
+        return None
+    for index, cell in enumerate(header):
+        normalized = cell.replace(" ", "")
+        if normalized.startswith("전기말") or normalized.startswith("전반기말"):
+            continue
+        if any(keyword in normalized for keyword in _ENDING_COLUMN_KEYWORDS):
+            return index
+    return None
+
+
 def _named_backlog_column(header: list[str], index: int,
                           detail_rows: list[dict]) -> int | None:
     """머리글이 '수주잔고'라고 적은 칸을 그대로 쓴다 - 칸 수가 맞을 때만.
@@ -559,8 +623,15 @@ def _named_backlog_column(header: list[str], index: int,
     return index
 
 
-def _contract_detail_extract(table: DocumentTable) -> dict | None:
-    """계약별 상세표(품목|발주처|...|수주잔고|...)에서 수주잔고 열을 합산한다."""
+def _contract_detail_extract(table: DocumentTable, *,
+                            allow_rollforward: bool = False) -> dict | None:
+    """계약별 상세표(품목|발주처|...|수주잔고|...)에서 수주잔고 열을 합산한다.
+
+    allow_rollforward 는 기초→기말로 도는 표까지 읽을지다. 기본은 끈다 - 같은
+    수주잔고를 사업의 내용 상세표와 재무제표 주석 롤포워드 표로 두 번 싣는
+    보고서가 있어(태영건설·코오롱글로벌) 같이 세면 두 배가 된다. 다른 표가
+    하나도 없을 때만 켠다.
+    """
     default_unit = _table_unit(table)
     rows = table.rows
     for hi, hrow in enumerate(rows):
@@ -622,13 +693,20 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
         col, checked = _identity_backlog_column(
             [e["nums"] for e in detail_rows] or [e["nums"] for e in total_rows]
         )
-        if col is None and not checked:
-            # 항등식을 세울 숫자가 모자란 표(기납품액 없이 수주총액|수주잔고 두
-            # 칸뿐). 그래도 머리글이 어느 칸이 잔고인지 이름으로 말해 준다.
-            # 실측(씨에스윈드 20260318001110): '구분|수주총액|수주잔고' 3칸 표라
-            # 검산이 못 돌아 단일 값 경로로 새고 첫 줄(1,147)만 읽혀 해상풍력
-            # 31 백만달러가 빠졌다. 머리글과 행의 칸 수가 맞을 때만 이름을 믿는다.
-            col = _named_backlog_column(hrow, k, detail_rows)
+        if col is None:
+            # 머리글이 '기말(당기말·이월)계약잔액' 이라고 콕 집어 말하는 표는
+            # 항등식이 성립하지 않아도 그 칸을 믿는다. 기초|신규계약|계약수익|
+            # 기말 네 단계로 도는 표는 3항 항등식이 성립할 수가 없다 - 실측
+            # (아이에스동서 20260318001565): 그래서 검산 실패로 막혀 2.67조가
+            # 통째로 빠졌다. '전기말'은 지난해 것이라 잔고 열로 보지 않는다.
+            ending = _ending_column_index(hrow) if allow_rollforward else None
+            if ending is not None:
+                col = _named_backlog_column(hrow, ending, detail_rows)
+            elif not checked:
+                # 항등식을 세울 숫자가 모자란 표(기납품액 없이 수주총액|수주잔고
+                # 두 칸뿐). 실측(씨에스윈드 20260318001110): 검산이 못 돌아
+                # 단일 값 경로로 새고 첫 줄(1,147)만 읽혀 해상풍력 31이 빠졌다.
+                col = _named_backlog_column(hrow, k, detail_rows)
         if col is None:
             # 항등식을 세울 수 있는 표(행마다 숫자 3개 이상)인데 검산이 안 맞으면
             # 추측하지 않는다. 진행률·충당금 열을 금액으로 합산한 것이 예전

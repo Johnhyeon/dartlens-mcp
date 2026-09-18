@@ -1692,3 +1692,96 @@ class NoBacklogTableMessageTests(unittest.IsolatedAsyncioTestCase):
             text = await server.get_order_backlog("01032486", years=3)
         body = text.split("RESULT_META_JSON_START")[0]
         self.assertIn("수주잔고를 공시하지 않는 회사", body)
+
+
+# ---------------------------------------------------------------------------
+# 기초|신규계약|계약수익|기말 네 단계 롤포워드 표 (아이에스동서 20260318001565)
+# 와, 그 표를 다른 표와 같이 세면 두 배가 되는 문제
+# ---------------------------------------------------------------------------
+
+
+def _rollforward_table(basis="연결", ending="당기말계약잔액"):
+    return DocumentTable(
+        caption="(단위 : 천원)",
+        basis=basis,
+        rows=[
+            ["구  분", "", "공사유형", "기초계약잔액", "신규/변경계약액",
+             "당기계약수익(주1)", ending],
+            ["도급공사", "건설부문", "건축", "983,331,553", "493,281,120",
+             "389,487", "1,476,223,186"],
+            ["도급공사", "콘크리트부문", "건축", "119,978,078", "122,455,739",
+             "182,790,547", "59,643,270"],
+            ["도급공사", "소  계", "", "1,103,309,631", "615,736,859",
+             "183,180,034", "1,535,866,456"],
+            ["분양공사", "건설부문", "건축", "829,686,189", "433,349,211",
+             "444,216,412", "818,818,989"],
+            ["합  계", "", "", "1,932,995,820", "1,049,086,070",
+             "627,396,446", "2,354,685,445"],
+        ],
+    )
+
+
+class RollforwardColumnTests(unittest.TestCase):
+    def test_four_stage_rollforward_is_read(self):
+        snap = extract_order_backlog_snapshot([_rollforward_table()], period="2025")
+        self.assertIsNotNone(snap)
+        # 합계 2,354,685,445천원 = 23,546.85억
+        self.assertAlmostEqual(snap.point.value, 23546.85, places=2)
+
+    def test_prior_period_column_is_not_used(self):
+        snap = extract_order_backlog_snapshot(
+            [_rollforward_table(ending="전기말계약잔액")], period="2025")
+        self.assertIsNone(snap)
+
+    def test_consolidated_wins_over_separate(self):
+        snap = extract_order_backlog_snapshot(
+            [_rollforward_table(basis="연결"), _rollforward_table(basis="별도")],
+            period="2025")
+        self.assertEqual(snap.basis, "연결")
+        self.assertAlmostEqual(snap.point.value, 23546.85, places=2)
+
+    def test_rollforward_is_skipped_when_a_normal_table_exists(self):
+        """사업의 내용 상세표와 주석 롤포워드 표는 같은 잔고다. 더하면 두 배."""
+        normal = DocumentTable(
+            caption="(단위 : 백만원)",
+            rows=[
+                ["구분", "공사명", "발주처", "수주총액", "완성공사액", "계약잔액"],
+                ["국내", "A현장", "발주처", "100,000", "40,000", "60,000"],
+                ["합 계", "", "", "100,000", "40,000", "60,000"],
+            ],
+        )
+        snap = extract_order_backlog_snapshot(
+            [normal, _rollforward_table()], period="2025")
+        self.assertAlmostEqual(snap.point.value, 600.0, places=2)
+        self.assertEqual(len(snap.tables), 1)
+
+
+class ComponentTablesTests(unittest.TestCase):
+    """부문별 표들과 그걸 합친 표가 같이 잡히면 합친 표만 센다(금호건설)."""
+
+    @staticmethod
+    def _table(caption, left):
+        return DocumentTable(caption=f"{caption} (단위 : 백만원)", rows=[
+            ["구분", "공사명", "발주처", "수주총액", "완성공사액", "계약잔액"],
+            ["국내", "현장", "발주처", f"{left * 2:,}", f"{left:,}", f"{left:,}"],
+            ["합 계", "", "", f"{left * 2:,}", f"{left:,}", f"{left:,}"],
+        ])
+
+    def test_total_table_wins_over_its_parts(self):
+        snap = extract_order_backlog_snapshot(
+            [self._table("(1) 도급건축공사", 4617143),
+             self._table("(2) 도급토목공사", 2375225),
+             self._table("(3) 해외도급공사", 100177),
+             self._table("총계", 7092545)],
+            period="2023")
+        self.assertAlmostEqual(snap.point.value, 70925.45, places=2)
+        self.assertEqual(len(snap.tables), 1)
+
+    def test_unrelated_tables_are_still_summed(self):
+        snap = extract_order_backlog_snapshot(
+            [self._table("(1) 조선", 1000000),
+             self._table("(2) 해양", 500000),
+             self._table("(3) 플랜트", 250000)],
+            period="2023")
+        self.assertAlmostEqual(snap.point.value, 17500.0, places=2)
+        self.assertEqual(len(snap.tables), 3)

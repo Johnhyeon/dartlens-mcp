@@ -2191,30 +2191,35 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
                 failed_periods[period] = f"원문 파일 없음(DART {e.status})"
             continue
         tables = extract_document_tables(raw)
-        series = extract_order_backlog_series(tables, limit=years)
-        if series is not None and len(series.points) >= 2:
-            return _finish_order_backlog(
-                body=format_order_backlog_series(
-                    corp_code=cc, report_name=report_name,
-                    rcept_no=rcept_no, series=series,
-                ),
-                corp_code=cc, years=years,
-                periods=[pt.period for pt in series.points],
-                source_filings=[{"rcept_no": rcept_no, "report": report_name}],
-                table_provenance=[{"caption": series.table_caption[:80],
-                                   "unit": series.source_unit or (
-                                       "표기 없음(억원 가정)"
-                                       if series.unit_source == "assumed" else "셀 표기"),
-                                   "unit_source": series.unit_source,
-                                   "basis": series.basis,
-                                   "method": "trend_table"}],
-                warnings=[], failed_periods={}, reports=[report],
-                unit=series.unit,
-            )
-        if period is None:
-            continue
-        snapshot = extract_order_backlog_snapshot(tables, period=period)
+        snapshot = (extract_order_backlog_snapshot(tables, period=period)
+                    if period is not None else None)
         if snapshot is None:
+            # 연도가 열로 늘어선 추이 표는 마지막 수단이다. 한 표에서 시계열
+            # 전체를 읽어 다른 경로를 통째로 건너뛰는데, 표본 40개 종목(원문
+            # 20건)에서 이 모양의 표는 한 번도 나오지 않았다 - 검증된 적 없는
+            # 경로가 검증된 경로를 가로채지 않도록 뒤로 내린다.
+            series = extract_order_backlog_series(tables, limit=years)
+            if series is not None and len(series.points) >= 2:
+                return _finish_order_backlog(
+                    body=format_order_backlog_series(
+                        corp_code=cc, report_name=report_name,
+                        rcept_no=rcept_no, series=series,
+                    ),
+                    corp_code=cc, years=years,
+                    periods=[pt.period for pt in series.points],
+                    source_filings=[{"rcept_no": rcept_no, "report": report_name}],
+                    table_provenance=[{"caption": series.table_caption[:80],
+                                       "unit": series.source_unit or (
+                                           "표기 없음(억원 가정)"
+                                           if series.unit_source == "assumed" else "셀 표기"),
+                                       "unit_source": series.unit_source,
+                                       "basis": series.basis,
+                                       "method": "trend_table"}],
+                    warnings=[], failed_periods={}, reports=[report],
+                    unit=series.unit,
+                )
+            if period is None:
+                continue
             failed_periods[period] = _NO_BACKLOG_TABLE
             continue
         if snapshot.anomalous:
