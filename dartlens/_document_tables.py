@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 from dataclasses import dataclass
 
@@ -14,6 +15,7 @@ class DocumentTable:
     caption: str
     rows: list[list[str]]
     basis: str = ""    # "연결" / "별도" — 이 표가 실린 재무제표 기준. 모르면 ""
+    unit_hint: str = ""  # 표 바로 앞에 따로 적힌 '(단위 : ...)' 쪽지
 
 
 def extract_document_tables(xml_bytes: bytes) -> list[DocumentTable]:
@@ -33,8 +35,50 @@ def extract_document_tables(xml_bytes: bytes) -> list[DocumentTable]:
                     caption=_table_caption(element),
                     rows=rows,
                     basis=_financial_basis(element, document_label),
+                    unit_hint=_nearby_unit_note(element),
                 ))
     return tables
+
+
+_UNIT_NOTE_RE = re.compile(r"\(\s*단위\s*[:：][^)]{0,40}\)")
+
+
+def _nearby_unit_note(table) -> str:
+    """표 바로 앞에 따로 적힌 '(단위 : ...)' 쪽지.
+
+    DART 원문은 단위를 본 표에 안 쓰고 바로 위에 한 줄짜리 표로 따로 얹는 일이
+    잦다. 실측(일진전기 2025 사업보고서 20260311004216): '다. 수주상황' 아래
+    '(단위 : 천USD )' 만 든 1행 표가 있고 그 다음이 데이터 표다. 캡션은 중첩
+    표를 읽지 않으므로(다른 표 글자가 섞이면 안 되니까) 이 쪽지를 놓쳤고,
+    단위 미상으로 여덟 기간이 통째로 빠졌다.
+
+    앞 표의 본문까지 거슬러 올라가지는 않는다 - 남의 표 단위를 물려받으면
+    100배 어긋난다.
+    """
+    previous = table.getprevious()
+    checked = 0
+    while previous is not None and checked < 2:
+        if _holds_data_table(previous):
+            return ""
+        text = " ".join(part.strip() for part in previous.itertext()
+                        if part and part.strip())
+        match = _UNIT_NOTE_RE.search(text)
+        if match:
+            return match.group(0)
+        if text:
+            checked += 1
+        previous = previous.getprevious()
+    return ""
+
+
+def _holds_data_table(element) -> bool:
+    """이 요소가 (단위 쪽지가 아니라) 실제 데이터 표를 품고 있는가."""
+    for node in element.iter():
+        if _tag_name(node) != "table":
+            continue
+        if sum(1 for child in node.iter() if _tag_name(child) == "tr") > 3:
+            return True
+    return False
 
 
 def _document_label(root) -> str:

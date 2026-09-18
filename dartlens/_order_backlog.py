@@ -1094,8 +1094,17 @@ _FOREIGN_UNITS = (
 
 
 def _table_unit(table: DocumentTable) -> str | None:
-    haystack = table.caption + " " + " ".join(" ".join(row) for row in table.rows[:3])
-    normalized = haystack.replace(" ", "")
+    unit = _unit_from_text(
+        table.caption + " " + " ".join(" ".join(row) for row in table.rows[:3]))
+    if unit is not None:
+        return unit
+    # 표 자체에 표기가 없을 때만, 바로 앞에 따로 얹힌 단위 쪽지를 본다.
+    # 표에 표기가 있으면 그게 우선이다 - 남의 쪽지가 이겨선 안 된다.
+    return _unit_from_text(table.unit_hint)
+
+
+def _unit_from_text(haystack: str) -> str | None:
+    normalized = (haystack or "").replace(" ", "")
     # 외화가 먼저다 - "백만달러"에서 "원"을 찾으면 안 되고, 실측(삼성바이오로직스)
     # 에서 '(단위: 백만 달러)' 표가 단위 미인식 -> 억원 가정으로 나가
     # 12,355 백만달러(약 18조원)가 12,355억원으로 읽혔다.

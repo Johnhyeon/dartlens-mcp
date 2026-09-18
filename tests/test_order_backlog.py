@@ -1406,3 +1406,62 @@ class ForeignUnitSpellingTests(unittest.TestCase):
 
         table = DocumentTable(caption="(단위 : USD)", rows=[["구분", "수주잔고"]])
         self.assertEqual(_table_unit(table), "달러")
+
+
+# ---------------------------------------------------------------------------
+# 표 바로 앞에 따로 얹힌 '(단위 : ...)' 쪽지를 놓쳐 여덟 기간이 빠지던 회귀
+# (일진전기 2025 사업보고서 20260311004216)
+# ---------------------------------------------------------------------------
+
+
+def _unit_note_xml(note_table: str, own_unit: str = "") -> bytes:
+    return f"""
+    <DOCUMENT>
+      <LIBRARY>
+        <P>다. 수주상황</P>
+        {note_table}
+      </LIBRARY>
+      <TABLE>
+        <TR><TH>품목</TH><TH>구분</TH><TH>수주총액</TH><TH>기납품액</TH><TH>수주잔고</TH></TR>
+        <TR><TD>전력선 등</TD><TD>국내{own_unit}</TD><TD>420,835</TD><TD>213,081</TD><TD>207,753</TD></TR>
+        <TR><TD>합 계</TD><TD></TD><TD>420,835</TD><TD>213,081</TD><TD>207,753</TD></TR>
+      </TABLE>
+    </DOCUMENT>
+    """.encode("utf-8")
+
+
+_NOTE = """<TABLE><TR><TD></TD><TD>(단위 : 천USD )</TD></TR></TABLE>"""
+
+
+class NearbyUnitNoteTests(unittest.TestCase):
+    def test_unit_note_in_its_own_tiny_table_is_found(self):
+        tables = extract_document_tables(_unit_note_xml(_NOTE))
+        data = [t for t in tables if len(t.rows) > 2][0]
+        from dartlens._order_backlog import _table_unit
+
+        self.assertEqual(data.unit_hint, "(단위 : 천USD )")
+        self.assertEqual(_table_unit(data), "천달러")
+
+    def test_value_is_reported_instead_of_being_refused(self):
+        snap = extract_order_backlog_snapshot(
+            extract_document_tables(_unit_note_xml(_NOTE)), period="2025")
+        self.assertIsNotNone(snap)
+        self.assertFalse(snap.unit_unknown)
+        self.assertEqual(snap.value_unit, "천달러")
+        self.assertEqual(snap.point.value, 207753.0)
+
+    def test_own_unit_beats_the_neighbour_note(self):
+        tables = extract_document_tables(_unit_note_xml(_NOTE, own_unit=" (단위: 백만원)"))
+        data = [t for t in tables if len(t.rows) > 2][0]
+        from dartlens._order_backlog import _table_unit
+
+        self.assertEqual(_table_unit(data), "백만원")
+
+    def test_previous_data_table_is_not_borrowed_from(self):
+        """앞 표의 본문까지 거슬러 올라가면 남의 단위를 물려받는다."""
+        big = "<TABLE>" + "".join(
+            f"<TR><TD>공사{i}</TD><TD>(단위 : 백만달러)</TD></TR>" for i in range(6)
+        ) + "</TABLE>"
+        tables = extract_document_tables(_unit_note_xml(big))
+        data = [t for t in tables if len(t.rows) > 2][0]
+        self.assertEqual(data.unit_hint, "")
