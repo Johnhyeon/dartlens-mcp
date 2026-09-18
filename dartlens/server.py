@@ -1974,11 +1974,14 @@ def _finish_order_backlog(
     if table_provenance:
         lines.append("")
         lines.append("원문 표 근거:")
-        for info in table_provenance:
+        for info in sorted(table_provenance,
+                           key=lambda i: _period_key(i.get("period") or "")):
             pd = info.get("period")
             lines.append(
                 "- " + (f"{pd}: " if pd else "")
                 + f"'{(info.get('caption') or '무제')[:40]}' 단위={info.get('unit')}"
+                + (f" 기준={info['basis']}" if info.get("basis") else "")
+                + (f" 행='{info['row_label']}'" if info.get("row_label") else "")
                 + (f" 원문 {info['source_rows']}행 중 {info['rows_used']}행 사용"
                    if info.get("source_rows") else "")
                 + f" [{info.get('method')}]"
@@ -2030,6 +2033,29 @@ def _finish_order_backlog(
     )
     return rmeta.append_meta("\n".join(lines), meta)
 
+
+def _period_key(period: str) -> tuple[int, int]:
+    """기간 라벨을 시간순으로 세운다.
+
+    사업보고서의 "2025"는 2025년 12월말이다. 문자열로 정렬하면 "2025" 가
+    "2025.06" 앞에 와서, 6월말 잔고가 연말 뒤에 붙는다. 늘어난 것처럼 읽히지만
+    실제로는 그 반대다.
+    """
+    year, _, month = period.partition(".")
+    if not year.isdigit():
+        return (0, 0)
+    return (int(year), int(month) if month.isdigit() else 12)
+
+
+def _backlog_period_key(point) -> tuple[int, int]:
+    return _period_key(point.period)
+
+
+_BACKLOG_METHOD_LABELS = {
+    "ending_balance": "계약잔액 주석",
+    "contract_detail": "수주 상세표",
+    "single_value": "단일 값 표",
+}
 
 _ORDER_BACKLOG_SCAN_LIMIT = 50
 _ORDER_BACKLOG_MAX_REPORTS = 10
@@ -2131,6 +2157,8 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
     failed_periods: dict[str, str] = {}
     used_reports: list[dict] = []
     point_unit = "억원"
+    point_basis = ""
+    point_method = ""
     unit_assumed = False
     for report in candidates[:_ORDER_BACKLOG_MAX_REPORTS]:
         rcept_no = normalize_rcept_no(str(report.get("rcept_no") or ""))
@@ -2168,6 +2196,7 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
                                        "표기 없음(억원 가정)"
                                        if series.unit_source == "assumed" else "셀 표기"),
                                    "unit_source": series.unit_source,
+                                   "basis": series.basis,
                                    "method": "trend_table"}],
                 warnings=[], failed_periods={}, reports=[report],
                 unit=series.unit,
@@ -2188,7 +2217,26 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
                 f"단위 상이({snapshot.value_unit} vs {point_unit}) - 한 시계열로 묶지 않음"
             )
             continue
+        # 연결과 별도를 한 줄에 섞으면 있지도 않은 증감이 생긴다. 실측
+        # (현대무벡스): 2024년은 연결 3,791억, 2025년은 별도 3,213억이 한
+        # 시계열로 나가 -15% 감소처럼 읽혔다. 실제는 연결 -10.7%, 별도 -2.9%다.
+        if yearly_points and snapshot.basis and point_basis and snapshot.basis != point_basis:
+            failed_periods[period] = (
+                f"재무기준 상이({snapshot.basis} vs {point_basis}) - 한 시계열로 묶지 않음"
+            )
+            continue
+        # 회계 주석의 계약잔액과 '사업의 내용'의 수주잔고는 정의가 다르다.
+        # 한 시계열에 섞으면 정의가 바뀐 자리가 증감으로 보인다.
+        if yearly_points and snapshot.method and point_method and snapshot.method != point_method:
+            failed_periods[period] = (
+                f"산출 방식 상이({_BACKLOG_METHOD_LABELS.get(snapshot.method, snapshot.method)}"
+                f" vs {_BACKLOG_METHOD_LABELS.get(point_method, point_method)})"
+                " - 한 시계열로 묶지 않음"
+            )
+            continue
         point_unit = snapshot.value_unit
+        point_basis = point_basis or snapshot.basis
+        point_method = point_method or snapshot.method
         unit_assumed = unit_assumed or snapshot.unit_source == "assumed"
         seen_periods.add(period)
         # 앞선 보고서(원본)에서 실패했어도 정정본에서 읽었으면 빠진 기간이 아니다.
@@ -2205,7 +2253,12 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
             break
 
     if yearly_points:
-        yearly_points = sorted(yearly_points, key=lambda point: point.period)[-years:]
+        yearly_points = sorted(yearly_points, key=_backlog_period_key)[-years:]
+        kept = {point.period for point in yearly_points}
+        sources = sorted(
+            (line for line in sources if line.split(":", 1)[0] in kept),
+            key=lambda line: _period_key(line.split(":", 1)[0]),
+        )
         body = format_order_backlog_series(
             corp_code=cc,
             report_name="복수 정기보고서",
@@ -2214,6 +2267,7 @@ async def get_order_backlog(corp_code: str, years: int = 3, days: int = 1200) ->
                 metric="수주잔고", unit=point_unit, points=yearly_points,
                 # 한 점이라도 단위를 가정했으면 '원문 표기 기준'이라 적지 않는다.
                 unit_source="assumed" if unit_assumed else "declared",
+                basis=point_basis,
             ),
             sources=sources[-len(yearly_points):],
         )

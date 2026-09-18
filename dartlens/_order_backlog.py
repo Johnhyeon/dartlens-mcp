@@ -36,6 +36,8 @@ class BacklogSnapshot:
     anomalous: bool = False
     value_unit: str = "억원"    # 외화 표는 원문 단위 그대로(환산하지 않는다)
     unit_source: str = "declared"  # "declared" = 원문에 단위 표기 있음 / "assumed" = 억원 가정
+    basis: str = ""             # "연결"/"별도" — 섞으면 없던 증감이 생긴다
+    method: str = ""            # ending_balance / contract_detail / single_value
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class OrderBacklogSeries:
     table_caption: str = ""
     unit_source: str = "declared"  # "declared" = 표에 단위 표기 있음 / "assumed" = 없음
     source_unit: str | None = None  # 원문 표의 단위 표기(없으면 None)
+    basis: str = ""                 # "연결"/"별도" — 모르면 빈 문자열
 
 
 def extract_order_backlog_series(tables: list[DocumentTable], *, limit: int = 3) -> OrderBacklogSeries | None:
@@ -71,11 +74,11 @@ def extract_order_backlog_snapshot(
     한 번만 센다.
     """
     # 1) 기말계약잔액 - 원문이 스스로 합계를 말해주는 가장 신뢰되는 형태
-    for table in tables:
-        found = _ending_value_from_table(table)
-        if found is not None:
-            return _single_row_snapshot(
-                table, found, period=period, method="ending_balance")
+    chosen = _choose_ending_table(tables)
+    if chosen is not None:
+        table, found = chosen
+        return _single_row_snapshot(
+            table, found, period=period, method="ending_balance")
 
     # 2) 계약별 상세표 - 부문별 표를 전부 합친다 (동일 표 dedup)
     seen: set[int] = set()
@@ -128,6 +131,7 @@ def extract_order_backlog_snapshot(
                 f"최대값({_format_value(round(max_detail, 2))}억원)보다 작습니다. "
                 "표 범위·단위·행 선택 오류 가능성이 있어 전체 잔고로 확정하지 않습니다."
             )
+        bases = {i.get("basis") or "" for i in extracted}
         return BacklogSnapshot(
             point=OrderBacklogPoint(period=period, value=value),
             tables=extracted,
@@ -139,6 +143,8 @@ def extract_order_backlog_snapshot(
                 "assumed" if any(i.get("unit_source") == "assumed" for i in extracted)
                 else "declared"
             ),
+            basis=bases.pop() if len(bases) == 1 else "",
+            method="contract_detail",
         )
 
     # 3) 단일 값 표 - 검산에 실패한 상세표는 여기서도 쓰지 않는다
@@ -150,6 +156,61 @@ def extract_order_backlog_snapshot(
             return _single_row_snapshot(
                 table, found, period=period, method="single_value")
     return None
+
+
+def _choose_ending_table(
+    tables: list[DocumentTable],
+) -> tuple[DocumentTable, tuple[float, list[str]]] | None:
+    """기말계약잔액 표가 여러 벌일 때 어느 것을 읽을지 정한다.
+
+    한 보고서에 같은 표가 연결·별도 x 당기·전기로 최대 네 벌 실린다. 원문
+    순서는 믿을 수 없다 - 첨부(감사보고서·연결감사보고서)가 본문보다 앞에
+    오는 해가 있어서, 그냥 첫 표를 쓰면 2024년은 연결·2025년은 별도가 한
+    시계열에 섞인다(실측: 현대무벡스 2024·2025 사업보고서).
+
+    - 기준: 연결 우선(DART 재무 도구 기본값 CFS 와 같다). 없으면 별도.
+    - 기간: 당기. 전기 표의 기말은 당기 표의 기초와 같으므로, 내 기말이 다른
+      표의 기초로 쓰였다면 내가 전기다. 판정이 안 되면 원문 순서를 따른다.
+    """
+    candidates = []
+    for table in tables:
+        found = _ending_value_from_table(table)
+        if found is None:
+            continue
+        candidates.append((table, found, _opening_value_from_table(table)))
+    if not candidates:
+        return None
+
+    same = candidates
+    for basis in ("연결", "별도"):
+        picked = [c for c in candidates if c[0].basis == basis]
+        if picked:
+            same = picked
+            break
+
+    openings = [c[2] for c in same if c[2] is not None]
+    for table, found, _opening in same:
+        if not any(_same_amount(found[0], opening) for opening in openings):
+            return table, found
+    return same[0][0], same[0][1]
+
+
+def _opening_value_from_table(table: DocumentTable) -> float | None:
+    """롤포워드 표의 기초 잔액. 당기/전기 판정에만 쓴다."""
+    if not _table_has_backlog_context(table):
+        return None
+    if _is_intangible_backlog_table(table):
+        return None
+    default_unit = _table_unit(table)
+    for index, row in enumerate(table.rows):
+        if _is_opening_balance_row(row) and _metric_name(row) is not None:
+            return _balance_value_from_row(
+                table.rows, index, default_unit=default_unit)
+    return None
+
+
+def _same_amount(left: float, right: float) -> bool:
+    return abs(left - right) <= max(0.01, abs(left) * 1e-9)
 
 
 _ASSUMED_UNIT_WARNING = "표에 단위 표기가 없어 억원으로 가정했습니다. 원문 대조가 필요합니다."
@@ -189,6 +250,10 @@ def _single_row_snapshot(
             "caption": table.caption[:80],
             "unit": unit_label,
             "unit_source": unit_source,
+            "basis": table.basis,
+            # 캡션이 '(단위: 천원)' 한 줄뿐인 표가 많다. 어느 행을 읽었는지가
+            # 사람이 원문과 맞춰볼 수 있는 진짜 근거다.
+            "row_label": (row[0] if row else "")[:40],
             "source_rows": len(table.rows),
             "rows_used": 1,
             "raw_sum": None,
@@ -199,6 +264,8 @@ def _single_row_snapshot(
         max_single_detail=value,
         value_unit=value_unit,
         unit_source=unit_source,
+        basis=table.basis,
+        method=method,
     )
 
 
@@ -319,6 +386,7 @@ def _contract_detail_extract(table: DocumentTable) -> dict | None:
             "caption": table.caption[:80],
             "unit": default_unit or "표기 없음(억원 가정)",
             "unit_source": "declared" if default_unit else "assumed",
+            "basis": table.basis,
             "currency": "foreign" if foreign else "KRW",
             "source_rows": len(rows),
             "rows_used": len(detail_vals) if total_val is None else len(detail_vals),
@@ -349,6 +417,8 @@ def format_order_backlog_series(
         )
     else:
         lines.append(f"단위: {series.unit} (원문 표기 기준)")
+    if series.basis:
+        lines.append(f"재무기준: {series.basis}재무제표")
     if sources:
         lines.append("출처:")
         lines.extend(f"- {source}" for source in sources)
@@ -372,6 +442,8 @@ def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeri
         metric = _metric_name(row)
         if metric is None:
             continue
+        if _is_opening_balance_row(row):
+            continue
         header = _nearest_period_header(table.rows, before=index)
         if header is None:
             continue
@@ -391,6 +463,7 @@ def _extract_from_table(table: DocumentTable, *, limit: int) -> OrderBacklogSeri
                     else "assumed"
                 ),
                 source_unit=default_unit,
+                basis=table.basis,
             )
     return None
 
@@ -448,15 +521,43 @@ def _metric_name(row: list[str]) -> str | None:
     return None
 
 
+# '기말잔액' 한 단어로 걸려드는 다른 롤포워드 표들. 수주 키워드가 없으면 뺀다.
+_ROLLFORWARD_NOISE = (
+    "손실충당금", "대손충당금", "충당부채", "이연법인세", "상각누계액",
+    "감가상각", "손상차손", "사용권자산", "리스부채", "주식선택권",
+)
+
+
 def _table_has_backlog_context(table: DocumentTable) -> bool:
     text = table.caption + " " + " ".join(" ".join(row) for row in table.rows[:4])
-    return any(keyword in text.replace(" ", "") for keyword in BACKLOG_KEYWORDS + ENDING_BALANCE_KEYWORDS)
+    normalized = text.replace(" ", "")
+    if any(keyword in normalized for keyword in BACKLOG_KEYWORDS):
+        return True
+    if not any(keyword in normalized for keyword in ENDING_BALANCE_KEYWORDS):
+        return False
+    # 여기부터는 '기말잔액'만 보고 들어온 표다. 충당금·이연법인세 롤포워드는
+    # 기초→증감→기말 모양이 같아 그대로 통과하고, 그 기말 잔액이 수주잔고로
+    # 나갈 수 있다. 수주 키워드가 없는 롤포워드 표는 받지 않는다.
+    return not any(keyword in normalized for keyword in _ROLLFORWARD_NOISE)
 
 
 def _is_intangible_backlog_table(table: DocumentTable) -> bool:
     text = " ".join(" ".join(row) for row in table.rows[:3])
     normalized = text.replace(" ", "")
     return "수주잔고" in normalized and any(keyword in normalized for keyword in ("영업권", "고객관계", "무형자산", "상각누계액"))
+
+
+_OPENING_BALANCE_KEYWORDS = ("기초", "전기이월", "기초잔액")
+
+
+def _is_opening_balance_row(row: list[str]) -> bool:
+    """롤포워드 표의 기초 행. 기초 잔액은 '그 기간의 잔고'가 아니라 직전 기말이다.
+
+    '기초 계약잔액 | 6,616,650 | ...' 을 2025년 잔고로 내보내면 한 해 밀린
+    값이 나간다. 기말 행이 같은 표에 있으니 기초 행은 건너뛴다.
+    """
+    first = (row[0] if row else "").replace(" ", "")
+    return any(keyword in first for keyword in _OPENING_BALANCE_KEYWORDS)
 
 
 def _is_ending_balance_row(row: list[str]) -> bool:
@@ -554,15 +655,61 @@ def _looks_numeric(value: str) -> bool:
     return True
 
 
+_HEADER_SEARCH_DEPTH = 6
+
+
 def _nearest_period_header(rows: list[list[str]], *, before: int) -> list[str] | None:
-    for index in range(before - 1, -1, -1):
+    """이 행의 열을 지배하는 머리글이 '기간 축'일 때만 돌려준다.
+
+    예전엔 위로 끝까지 거슬러 올라가며 네 자리 연도(20xx)가 하나라도 걸리는
+    행을 머리글로 삼았다. 실측(현대무벡스)에서 '기초 계약잔액' 행이 102행 위
+    주식선택권 '행사가능시점' 행을 머리글로 잡아 부문(IT/물류/합계) 값에
+    연도(2025/2026/2027) 라벨이 붙었다.
+
+    규칙: 가장 가까운 머리글 한 줄만 본다. 그게 기간 축이 아니면 더 올라가지
+    않고 없음을 돌려준다 - 연도를 지어내지 않는다.
+    """
+    for index in range(before - 1, max(-1, before - 1 - _HEADER_SEARCH_DEPTH), -1):
         row = rows[index]
-        if any(_normalize_period(cell) is not None for cell in row):
-            return row
+        if len(row) < 2:
+            continue                     # '(단위: 천원)' 같은 한 칸짜리 주기
+        if not _is_label_row(row):
+            continue                     # 숫자가 든 데이터 행
+        return row if _is_period_axis(row) else None
     return None
 
 
+def _is_label_row(row: list[str]) -> bool:
+    """열 머리글 후보 - 첫 칸을 뺀 나머지에 '값' 숫자가 없는 행.
+
+    연도 칸('2024')도 콤마 없는 숫자라 값처럼 보인다. 기간으로 읽히는 칸은
+    라벨로 친다.
+    """
+    return all(
+        _plain_number(cell) is None or _normalize_period(cell) is not None
+        for cell in row[1:]
+    )
+
+
+def _is_period_axis(header: list[str]) -> bool:
+    """머리글의 값 열들이 실제로 기간을 가리키는가.
+
+    '구분 | IT사업부 | 물류사업부 | 합계' 는 기간 축이 아니다(0/3).
+    '구분 | 2022 | 2023 | 2024' 는 기간 축이다(3/3).
+    """
+    cells = [cell for cell in header[1:] if cell.strip()]
+    if not cells:
+        return False
+    periods = sum(1 for cell in cells if _normalize_period(cell) is not None)
+    return periods >= 1 and periods * 2 > len(cells)
+
+
 def _points_from_row(header: list[str], row: list[str], *, default_unit: str | None) -> list[OrderBacklogPoint]:
+    # 칸 수가 다르면 zip 이 열을 한 칸씩 밀어 붙인다. 병합 셀·빈 칸 때문에
+    # 흔한 일이고, 밀린 라벨은 숫자가 진짜라서 검산으로 안 걸린다. 맞출 수
+    # 없으면 기간을 붙이지 않는다.
+    if len(header) != len(row):
+        return []
     points: list[OrderBacklogPoint] = []
     for period_cell, value_cell in zip(header, row):
         period = _normalize_period(period_cell)

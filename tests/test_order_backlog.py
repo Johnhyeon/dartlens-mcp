@@ -9,6 +9,7 @@ from dartlens._document_tables import DocumentTable
 from dartlens._order_backlog import (
     extract_order_backlog_point,
     extract_order_backlog_series,
+    extract_order_backlog_snapshot,
     format_order_backlog_series,
 )
 
@@ -605,3 +606,267 @@ class BacklogToolMetaTests(unittest.IsolatedAsyncioTestCase):
             meta["data_completeness"] in ("none", "partial"), meta["data_completeness"])
         self.assertTrue(any("단일" in w or "작" in w for w in meta["warnings"]),
                         meta["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# 부문 열을 연도로 읽던 회귀 방지 (현대무벡스 2025 사업보고서 20260318001359)
+#
+# 실측: '기초 계약잔액 | 6,616,650 | 324,404,036 | 331,020,686' 한 행이
+# '2025=66.2 | 2026=3,244.0 | 2027=3,310.2' 으로 나갔다. 숫자는 원문에 있는
+# 진짜 값(IT사업부·물류사업부·합계)이고 틀린 건 이름표뿐이라, 검산으로도
+# 안 걸리고 읽는 사람은 미래 수주 전망으로 오해한다.
+#
+# 원인 세 겹:
+#   1) DART 원문의 껍데기 <TABLE> 안에 실제 표 224개가 들어 있는데 파서가
+#      그걸 947행짜리 한 표로 뭉쳤다.
+#   2) 그래서 머리글을 102행 위 주식선택권 '행사가능시점' 행에서 찾았다.
+#   3) 롤포워드 표의 기초 행을 그 기간의 잔고로 내보냈다.
+# ---------------------------------------------------------------------------
+
+_MOVEX_STOCK_OPTION = """
+        <TABLE>
+          <TR><TD>행사가능시점</TD><TD>2025년 11월 03일</TD>
+              <TD>2026년 09월 23일</TD><TD>2027년 03월 25일</TD></TR>
+          <TR><TD>부여수량</TD><TD>550,166주</TD><TD>96,500주</TD><TD>229,928주</TD></TR>
+        </TABLE>
+"""
+
+
+def _movex_balance_table(opening: tuple[str, str, str], ending: tuple[str, str, str]) -> str:
+    return f"""
+        <P>(단위: 천원)</P>
+        <TABLE>
+          <TR><TH>구분</TH><TH>IT사업부</TH><TH>물류사업부</TH><TH>합계</TH></TR>
+          <TR><TD>기초 계약잔액</TD><TD>{opening[0]}</TD><TD>{opening[1]}</TD><TD>{opening[2]}</TD></TR>
+          <TR><TD>증감액(*)</TD><TD>21,880,530</TD><TD>323,913,227</TD><TD>345,793,757</TD></TR>
+          <TR><TD>수익 인식액</TD><TD>(23,685,708)</TD><TD>(331,788,916)</TD><TD>(355,474,624)</TD></TR>
+          <TR><TD>기말 계약잔액</TD><TD>{ending[0]}</TD><TD>{ending[1]}</TD><TD>{ending[2]}</TD></TR>
+        </TABLE>
+"""
+
+
+def _movex_xml(document_name: str, *, current: str, prior: str) -> bytes:
+    """껍데기 <TABLE> 안에 주석 표들이 들어앉은 실제 DART 구조."""
+    return f"""
+    <DOCUMENT>
+      <DOCUMENT-NAME>{document_name}</DOCUMENT-NAME>
+      <SECTION-2>
+        <TABLE BORDER="0" ACLASS="NORMAL">
+          <TR><TD>
+            <TITLE>주석</TITLE>
+            {_MOVEX_STOCK_OPTION}
+            <P>21. 주요 도급공사</P>
+            {current}
+            {prior}
+          </TD></TR>
+        </TABLE>
+      </SECTION-2>
+    </DOCUMENT>
+    """.encode("utf-8")
+
+
+# 별도(감사보고서) / 연결(연결감사보고서) 실측값 - 2025 사업보고서 기준
+_MOVEX_SEPARATE = _movex_xml(
+    "감사보고서",
+    current=_movex_balance_table(
+        ("6,616,650", "324,404,036", "331,020,686"),
+        ("4,811,472", "316,528,347", "321,339,819")),
+    prior=_movex_balance_table(
+        ("5,983,455", "183,624,302", "189,607,757"),
+        ("6,616,650", "324,404,036", "331,020,686")),
+)
+_MOVEX_CONSOLIDATED = _movex_xml(
+    "연결감사보고서",
+    current=_movex_balance_table(
+        ("6,616,650", "372,543,997", "379,160,647"),
+        ("4,811,472", "333,888,547", "338,700,019")),
+    prior=_movex_balance_table(
+        ("5,983,455", "193,124,273", "199,107,728"),
+        ("6,616,650", "372,543,997", "379,160,647")),
+)
+
+
+class SegmentColumnsAreNotYearsTests(unittest.TestCase):
+    def test_nested_tables_are_not_merged_into_one_table(self):
+        tables = extract_document_tables(_MOVEX_SEPARATE)
+        balance = [t for t in tables if any("기말 계약잔액" in "".join(r) for r in t.rows)]
+        self.assertEqual(len(balance), 2)              # 당기·전기 두 벌
+        for table in balance:
+            self.assertEqual(len(table.rows), 5)       # 947행짜리 뭉텅이가 아니다
+        self.assertTrue(
+            all("행사가능시점" not in "".join("".join(r) for r in t.rows) for t in balance),
+            "남의 표(주식선택권) 행이 섞여 들어왔다",
+        )
+
+    def test_segment_columns_are_never_labelled_as_years(self):
+        tables = extract_document_tables(_MOVEX_SEPARATE)
+        series = extract_order_backlog_series(tables, limit=4)
+        self.assertIsNone(series, "부문 열을 기간 축으로 읽으면 안 된다")
+
+    def test_ending_balance_of_current_period_is_reported(self):
+        tables = extract_document_tables(_MOVEX_SEPARATE)
+        snap = extract_order_backlog_snapshot(tables, period="2025")
+        self.assertIsNotNone(snap)
+        # 321,339,819천원 = 3,213.4억원. 기초(3,310.2억)도, 부문값(66.2억)도 아니다.
+        self.assertAlmostEqual(snap.point.value, 3213.4, places=1)
+        self.assertEqual(snap.tables[0]["row_label"], "기말 계약잔액")
+        self.assertEqual(snap.value_unit, "억원")
+        self.assertEqual(snap.tables[0]["unit"], "천원")
+
+    def test_prior_period_table_is_not_mistaken_for_current(self):
+        """전기 표의 기말은 당기 표의 기초와 같다 - 그걸로 당기를 가려낸다."""
+        tables = extract_document_tables(_MOVEX_SEPARATE)
+        snap = extract_order_backlog_snapshot(tables, period="2025")
+        self.assertNotAlmostEqual(snap.point.value, 3310.2, places=1)
+
+    def test_caption_comes_from_this_table_not_a_distant_one(self):
+        tables = extract_document_tables(_MOVEX_SEPARATE)
+        snap = extract_order_backlog_snapshot(tables, period="2025")
+        self.assertIn("단위", snap.tables[0]["caption"])
+
+    def test_consolidated_is_preferred_and_labelled(self):
+        tables = (extract_document_tables(_MOVEX_SEPARATE)
+                  + extract_document_tables(_MOVEX_CONSOLIDATED))
+        snap = extract_order_backlog_snapshot(tables, period="2025")
+        self.assertEqual(snap.basis, "연결")
+        self.assertAlmostEqual(snap.point.value, 3387.0, places=1)
+
+    def test_separate_only_report_still_works(self):
+        snap = extract_order_backlog_snapshot(
+            extract_document_tables(_MOVEX_SEPARATE), period="2025")
+        self.assertEqual(snap.basis, "별도")
+
+
+class PeriodAxisHeaderTests(unittest.TestCase):
+    """머리글이 기간 축일 때만 연도를 붙인다."""
+
+    def test_segment_header_yields_no_series(self):
+        table = DocumentTable(
+            caption="(단위: 천원)",
+            rows=[
+                ["구분", "IT사업부", "물류사업부", "합계"],
+                ["기말 계약잔액", "4,811,472", "316,528,347", "321,339,819"],
+            ],
+        )
+        self.assertIsNone(extract_order_backlog_series([table], limit=3))
+
+    def test_distant_date_row_is_not_borrowed_as_header(self):
+        """같은 표 안이어도 몇 행 위 날짜 행을 머리글로 끌어오지 않는다."""
+        rows = [["행사가능시점", "2025년 11월 03일", "2026년 09월 23일", "2027년 03월 25일"]]
+        rows += [[f"항목{i}", "1", "2", "3"] for i in range(8)]
+        rows += [
+            ["구분", "IT사업부", "물류사업부", "합계"],
+            ["기말 계약잔액", "4,811,472", "316,528,347", "321,339,819"],
+        ]
+        self.assertIsNone(
+            extract_order_backlog_series([DocumentTable(caption="", rows=rows)], limit=3))
+
+    def test_year_header_still_works(self):
+        table = DocumentTable(
+            caption="(단위: 억원)",
+            rows=[["구분", "2023", "2024", "2025"],
+                  ["수주잔고", "1,000", "1,200", "1,500"]],
+        )
+        series = extract_order_backlog_series([table], limit=3)
+        self.assertIsNotNone(series)
+        self.assertEqual([p.period for p in series.points], ["2023", "2024", "2025"])
+
+    def test_opening_balance_row_is_skipped_even_with_year_header(self):
+        """연도 축이 맞아도 기초 잔액은 그 해의 잔고가 아니다."""
+        table = DocumentTable(
+            caption="(단위: 억원)",
+            rows=[["구분", "2024", "2025"],
+                  ["기초 수주잔고", "1,000", "1,200"],
+                  ["기말 수주잔고", "1,200", "1,500"]],
+        )
+        series = extract_order_backlog_series([table], limit=3)
+        self.assertEqual([p.value for p in series.points], [1200.0, 1500.0])
+
+    def test_misaligned_header_is_refused(self):
+        """머리글과 데이터 행의 칸 수가 다르면 밀어서 붙이지 않는다."""
+        table = DocumentTable(
+            caption="(단위: 억원)",
+            rows=[["구분", "2023", "2024", "2025"],
+                  ["수주잔고", "1,000", "1,200"]],
+        )
+        self.assertIsNone(extract_order_backlog_series([table], limit=3))
+
+
+class RollforwardNoiseTests(unittest.TestCase):
+    def test_allowance_rollforward_is_not_read_as_backlog(self):
+        """손실충당금 롤포워드도 기초→기말 모양이라 '기말잔액'만 보면 통과했다."""
+        table = DocumentTable(
+            caption="보고기간종료일 현재 매출채권에 대한 손실충당금은 다음과 같습니다.",
+            rows=[
+                ["(단위: 천원)"],
+                ["구분", "기초잔액", "설정액", "기말잔액"],
+                ["매출채권", "212,324", "4,334,143", "4,764,458"],
+            ],
+        )
+        self.assertIsNone(extract_order_backlog_point([table], period="2025"))
+
+    def test_deferred_tax_rollforward_is_not_read_as_backlog(self):
+        table = DocumentTable(
+            caption="이연법인세자산과 부채의 변동",
+            rows=[
+                ["(단위: 천원)"],
+                ["구분", "기초잔액", "손익계산서", "기말잔액"],
+                ["합계", "710,777", "1,793,871", "3,433,634"],
+            ],
+        )
+        self.assertIsNone(extract_order_backlog_point([table], period="2025"))
+
+
+class SeriesConsistencyTests(unittest.IsolatedAsyncioTestCase):
+    """한 시계열에 서로 다른 기준·방식·순서를 섞지 않는다."""
+
+    @staticmethod
+    def _zip(xml: bytes) -> bytes:
+        out = BytesIO()
+        with zipfile.ZipFile(out, "w") as zf:
+            zf.writestr("report.xml", xml)
+        return out.getvalue()
+
+    async def _run(self, docs, reports, years=3):
+        fetch_doc = AsyncMock(side_effect=lambda rcept_no: docs[rcept_no])
+        with (
+            patch("dartlens._safe.is_licensed", return_value=True),
+            patch.object(server, "_fetch_disclosure_list",
+                         AsyncMock(return_value={"list": reports})),
+            patch.object(server, "_fetch_document_zip", fetch_doc),
+        ):
+            text = await server.get_order_backlog("01358463", years=years)
+        return text.split("RESULT_META_JSON_START")[0]
+
+    async def test_consolidated_and_separate_are_not_mixed(self):
+        """실측: 2024는 연결 3,791.6억, 2025는 별도 3,213.4억이 한 줄에 섞였다."""
+        docs = {
+            "20260318001359": self._zip(_MOVEX_SEPARATE),      # 별도만 실린 해
+            "20250318001331": self._zip(_MOVEX_CONSOLIDATED),  # 연결만 실린 해
+        }
+        reports = [
+            {"report_nm": "사업보고서 (2025.12)", "rcept_no": "20260318001359",
+             "rcept_dt": "20260318"},
+            {"report_nm": "사업보고서 (2024.12)", "rcept_no": "20250318001331",
+             "rcept_dt": "20250318"},
+        ]
+        body = await self._run(docs, reports)
+        self.assertIn("재무기준: 별도재무제표", body)
+        self.assertNotIn("3,791.6", body)
+        self.assertIn("재무기준 상이", body)
+
+    async def test_half_year_point_sorts_before_year_end(self):
+        """'2025'는 2025년 12월말이다. 문자열 정렬이면 2025.06 뒤로 간다."""
+        docs = {
+            "20260318001359": self._zip(_MOVEX_SEPARATE),
+            "20250813001630": self._zip(_MOVEX_SEPARATE),
+        }
+        reports = [
+            {"report_nm": "사업보고서 (2025.12)", "rcept_no": "20260318001359",
+             "rcept_dt": "20260318"},
+            {"report_nm": "반기보고서 (2025.06)", "rcept_no": "20250813001630",
+             "rcept_dt": "20250813"},
+        ]
+        body = await self._run(docs, reports)
+        self.assertLess(body.index("2025.06="), body.index("| 2025="),
+                        "6월말 잔고가 연말 뒤에 놓였다")
