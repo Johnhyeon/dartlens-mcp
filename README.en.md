@@ -52,7 +52,7 @@ List companies whose operating profit jumped this earnings season and save it to
 - **Ownership:** 5% major-holder changes and insider holdings, money moves that price data does not show
 - **Earnings season scan:** sweep the companies that reported, tabulate, save to Excel
 
-11 tools in all.
+11 tools in all. The tool list and result metadata spec are in the [tool guide](https://github.com/Johnhyeon/dartlens-mcp/blob/main/guides/TOOLS.md) (Korean).
 
 ## Labels come first
 
