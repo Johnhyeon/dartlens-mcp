@@ -97,12 +97,15 @@ get_insider_trades(corp_code, limit=10) → 임원·주요주주 자사주 매�
   "keyword": "배당",
   "total_matches": 165,
   "displayed_matches": 5,
+  "displayed_excerpts": 3,
   "truncated": true,
   "coverage_complete": false
 }
 ```
 
-매치는 최대 5건까지 발췌합니다. 전체 건수는 따로 세어 싣습니다. 0건이면
+발췌는 최대 5개입니다. 가까이 붙은 매치(앞뒤 300자 범위가 겹치거나 맞닿는 매치)는 한 발췌로
+묶고, 발췌마다 매치 수를 함께 표시합니다. `displayed_matches`는 표시된 발췌에 들어 있는 매치 수,
+`displayed_excerpts`는 발췌 개수입니다. 전체 건수는 따로 집계해 싣습니다. 0건이면
 `absence_confirmed=false`가 함께 붙습니다 - 표 안 텍스트나 다른 표기(현금배당 등)면
 실제로 있어도 0건이 나오므로 부정 결론을 내리면 안 됩니다.
 
