@@ -72,7 +72,7 @@ AI 앱 이용료는 LeetKit과 따로입니다.
 ## 설치와 가격
 
 - **설치:** LeetKit Manager에서 버튼을 눌러 설치하고 받은 키를 붙여 넣습니다. 명령어를 칠 일은 없습니다.
-- **DART 인증키 (무료):** [opendart.fss.or.kr](https://opendart.fss.or.kr)에서 무료로 받아 Manager의 DartLens 카드 [활성화]에 붙여 넣습니다. 분당 1,000건, 하루 20,000건까지 조회할 수 있습니다. 키는 PC의 보안 저장소(Windows 자격 증명, macOS 키체인)에 보관합니다.
+- **DART 인증키 (무료):** [opendart.fss.or.kr](https://opendart.fss.or.kr)에서 무료로 받아 Manager의 DartLens 카드 [키 입력]에 붙여 넣습니다. 분당 1,000건, 하루 20,000건까지 조회할 수 있습니다. 키는 PC의 보안 저장소(Windows 자격 증명, macOS 키체인)에 보관합니다.
 - **체험:** 14일 무료 체험으로 Lens 3개를 전부 써 볼 수 있습니다. 카드 등록 없이 이메일만 있으면 됩니다.
 - **가격:** 한 번 결제, 월 구독 없음. DartLens는 단품으로 팔지 않고 LeetKit FULL Package에 들어 있습니다.
 
