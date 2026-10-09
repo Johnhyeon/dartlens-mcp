@@ -50,9 +50,10 @@ List companies whose operating profit jumped this earnings season and save it to
 - **Financial statements:** key accounts (revenue, operating profit, net income, assets, liabilities, equity) across three periods, plus full statements when needed
 - **Order backlog:** backlog and contract balance trends from annual, quarterly and half-year reports
 - **Ownership:** 5% major-holder changes and insider holdings, money moves that price data does not show
+- **Dividend history:** dividend per share, payout ratio and total dividends by fiscal year, plus quarterly and year-end dividend decisions
 - **Earnings season scan:** sweep the companies that reported, tabulate, save to Excel
 
-11 tools in all. The tool list and result metadata spec are in the [tool guide](https://github.com/Johnhyeon/dartlens-mcp/blob/main/guides/TOOLS.md) (Korean).
+12 tools in all. The tool list and result metadata spec are in the [tool guide](https://github.com/Johnhyeon/dartlens-mcp/blob/main/guides/TOOLS.md) (Korean).
 
 ## Labels come first
 

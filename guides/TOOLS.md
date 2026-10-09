@@ -6,7 +6,7 @@ DartLens 도구와 응답에 붙는 결과 메타 규약입니다. 제품 소개
 
 | 도구 | 목적 |
 |---|---|
-| `search_company` | 종목명/종목코드 → corp_code + 기업개황 |
+| `search_company` | 종목명/종목코드 → corp_code + 기업개황. 다른 도구의 `corp_code` 에는 회사명·6자리 종목코드를 그대로 입력해도 된다(여러 회사면 후보 표시) |
 | `list_disclosures` | 기간·유형별 공시 목록 (rcept_no 반환) |
 | `get_disclosure_detail` | 짧은 공시는 본문 발췌, 긴 보고서는 인덱스 + viewer URL. `find="키워드"`로 본문 검색 |
 | `get_major_accounts` | 정기보고서 핵심 재무 (매출/영업이익/순이익/자산/부채/자본). 분기·반기 손익은 3개월/누적 컬럼 분리 |
@@ -14,6 +14,7 @@ DartLens 도구와 응답에 붙는 결과 메타 규약입니다. 제품 소개
 | `get_order_backlog` | 사업/분기/반기보고서 표에서 수주잔고·계약잔액 추이를 구조화 |
 | `get_major_holders` | 5%룰 대량보유 변동 — 외인/펀드/행동주의 진입 추적 |
 | `get_insider_trades` | 임원·주요주주 특정증권 소유 — 내부자 매매 시그널 |
+| `get_dividend_history` | 사업보고서 배당 사항 연도별 이어 붙이기 + 현금ㆍ현물배당결정 공시(분기·결산·감액배당) |
 | `scan_earnings_season` | 어닝 시즌 전체/시장별 실적 스캔 — 채팅용 Top N Markdown |
 | `export_earnings_scan` | 실적 스캔 결과를 `.xlsx`/`.csv` 파일로 저장. 한국 Excel은 `.xlsx` 권장 |
 
